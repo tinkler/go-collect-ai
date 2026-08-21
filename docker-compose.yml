@@ -1,0 +1,84 @@
+# collect-ai 全栈: 后端 + PostgreSQL + cube-agent-server
+# 用法:
+#   docker compose up -d
+#   curl http://localhost:8089/api/v1/health
+
+services:
+  # ============= PostgreSQL =============
+  pg:
+    image: postgres:17-alpine
+    container_name: collectai-pg
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: collectai
+    volumes:
+      - collectai-pg-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  # ============= Go 后端 (collect-ai-server) =============
+  server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: collectai-server
+    environment:
+      # PG (同 compose 内网, 用服务名)
+      PG_HOST: pg
+      PG_PORT: 5432
+      PG_USER: postgres
+      PG_PASSWORD: postgres
+      PG_DATABASE: collectai
+      # BigModel (智谱) — 必填, 用户填
+      BIGMODEL_API_KEY: ${BIGMODEL_API_KEY:?请在 .env 里填 BIGMODEL_API_KEY}
+      BIGMODEL_BASE: https://open.bigmodel.cn/api/paas/v4
+      OCR_MODEL: hand_write
+      LLM_MODEL: glm-4-flash
+      # Agent (同 compose 内网)
+      AGENT_URL: http://cube-agent:8088
+      # 服务
+      PORT: 8089
+      UPLOAD_DIR: /app/uploads
+      PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-}
+      # 行为
+      OCR_TIMEOUT_SEC: 60
+      LLM_TIMEOUT_SEC: 180
+      USE_LLM: "true"
+      FUZZY_DISTANCE: 2
+      MAX_CONCURRENT_PARSE: 4
+      RATE_LIMIT_WAIT_SEC: 30
+    volumes:
+      - collectai-uploads:/app/uploads
+    depends_on:
+      pg:
+        condition: service_healthy
+      cube-agent:
+        condition: service_started
+    ports:
+      - "8089:8089"
+    restart: unless-stopped
+
+  # ============= cube-agent-server (SKU 库) =============
+  cube-agent:
+    # 公开镜像 (用户自建) 或 build
+    image: ghcr.io/tinkler/cube-agent-server:latest
+    # 如果没有公开镜像, 改为:
+    # build:
+    #   context: ../cube-agent-server
+    #   dockerfile: Dockerfile
+    container_name: collectai-cube-agent
+    volumes:
+      - collectai-agent-data:/app/data
+    ports:
+      - "8088:8088"   # 也可选择不暴露, 只给同 compose 内的 server 访问
+    restart: unless-stopped
+
+volumes:
+  collectai-pg-data:
+  collectai-uploads:
+  collectai-agent-data:

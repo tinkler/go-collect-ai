@@ -1,0 +1,64 @@
+# ===== Go =====
+# 编译产物
+bin/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# 测试产物
+*.test
+*.out
+coverage.out
+coverage.html
+
+# vendor (如果以后用 go mod vendor)
+vendor/
+
+# ===== 运行时产物 =====
+# 上传图片 (用户数据,可能很大)
+uploads/
+
+# 运行日志 (server.err / server.out / server.log)
+*.log
+*.err
+*.out
+server.*
+win7.*
+csharp.*
+
+# ===== 配置 / 密钥 =====
+# 真实 .env (含 BIGMODEL_API_KEY / PG_PASSWORD)
+.env
+.env.local
+.env.*.local
+
+# 但保留 .env.example / .env.test (无密钥或测试用)
+!.env.example
+!.env.test
+
+# ===== IDE / 编辑器 =====
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# ===== 操作系统 =====
+.DS_Store
+Thumbs.db
+desktop.ini
+$RECYCLE.BIN/
+
+# ===== 临时文件 =====
+*.tmp
+*.bak
+*.swp
+*.orig
+
+# ===== 跨平台编译临时输出 =====
+collect-ai-server-linux-amd64
+collect-ai-server-darwin-arm64
+*.zip
+*.tar.gz
