@@ -57,19 +57,21 @@ func main() {
 	llmClient := bigmodel.NewLlmClient(cfg.BigModelAPIKey, cfg.BigModelBase, cfg.LlmTimeoutSec)
 	agentClient := agent.NewClient(cfg.AgentURL, cfg.AgentToken, 30)
 
-	psr := parser.New(ocrClient, llmClient, agentClient, cfg.UseLlm, cfg.FuzzyDistance)
+	psr := parser.New(ocrClient, llmClient, agentClient)
 
 	h := &handler.Handler{
-		UploadDir:       cfg.UploadDir,
-		PublicBase:      cfg.PublicBaseURL,
-		MaxUpload:       int64(cfg.MaxUploadMB) * 1024 * 1024,
-		Parser:          psr,
-		Agent:           agentClient,
-		Sessions:        sessionRepo,
-		Templates:       templateRepo,
-		FuzzyDistance:   cfg.FuzzyDistance,
-		DefaultOcrModel: cfg.OCRModel,
-		DefaultLlmModel: cfg.LLMModel,
+		UploadDir:        cfg.UploadDir,
+		PublicBase:       cfg.PublicBaseURL,
+		MaxUpload:        int64(cfg.MaxUploadMB) * 1024 * 1024,
+		Parser:           psr,
+		Agent:            agentClient,
+		Sessions:         sessionRepo,
+		Templates:        templateRepo,
+		FuzzyDistance:    cfg.FuzzyDistance,
+		DefaultOcrModel:  cfg.OCRModel,
+		DefaultLlmModel:  cfg.LLMModel,
+		DefaultUseLlm:    cfg.UseLlm,
+		DefaultFuzzyDist: cfg.FuzzyDistance,
 	}
 
 	gin.SetMode(gin.ReleaseMode)

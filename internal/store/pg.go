@@ -80,9 +80,10 @@ func Migrate(ctx context.Context, pool *pgxpool.Pool) error {
 			supplier_name   TEXT NOT NULL DEFAULT '',
 			mode            TEXT NOT NULL,
 			llm_prompt      TEXT NOT NULL DEFAULT '',
-			use_glm_ocr     BOOLEAN NOT NULL DEFAULT FALSE,
 			ocr_model       TEXT NOT NULL DEFAULT '',
 			llm_model       TEXT NOT NULL DEFAULT '',
+			use_llm         BOOLEAN,
+			fuzzy_distance  INT,
 			header_keywords JSONB NOT NULL DEFAULT '[]'::jsonb,
 			footer_keywords JSONB NOT NULL DEFAULT '[]'::jsonb,
 			subtitle_keywords JSONB NOT NULL DEFAULT '[]'::jsonb,
@@ -90,9 +91,13 @@ func Migrate(ctx context.Context, pool *pgxpool.Pool) error {
 			updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 			note            TEXT NOT NULL DEFAULT ''
 		)`,
-		// 兼容老库 (CREATE TABLE IF NOT EXISTS 不会加新列)
+		// 兼容老库
 		`ALTER TABLE template ADD COLUMN IF NOT EXISTS ocr_model TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE template ADD COLUMN IF NOT EXISTS llm_model TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE template ADD COLUMN IF NOT EXISTS use_llm BOOLEAN`,
+		`ALTER TABLE template ADD COLUMN IF NOT EXISTS fuzzy_distance INT`,
+		// 删历史死代码字段
+		`ALTER TABLE template DROP COLUMN IF EXISTS use_glm_ocr`,
 		`CREATE INDEX IF NOT EXISTS idx_template_supplier ON template(supplier_name)`,
 		`CREATE INDEX IF NOT EXISTS idx_template_default ON template(is_default)`,
 	}

@@ -95,12 +95,53 @@ AGENT_TOKEN=                     # 可选,无则空
 # --- 解析行为 ---
 OCR_TIMEOUT_SEC=60               # OCR HTTP 超时
 LLM_TIMEOUT_SEC=180              # LLM HTTP 超时 (30+ 行盘点单要 60-90s)
-USE_LLM=true                     # 走 LLM 解析 (false=纯 OCR)
-FUZZY_DISTANCE=2                 # SkuMatcher 模糊匹配编辑距离
+USE_LLM=true                     # 默认是否走 LLM 解析 (per-template 可覆盖)
+FUZZY_DISTANCE=2                 # SkuMatcher 模糊匹配编辑距离 (per-template 可覆盖)
 
 # --- 并发限流 ---
 MAX_CONCURRENT_PARSE=4           # 同时解析上限 (0=不限流)
 RATE_LIMIT_WAIT_SEC=30           # 客户端等 semaphore 超时
+```
+
+### Template 级别覆盖
+
+下列 4 个字段在解析时**按 template 决议**:
+- `template_id` 由 C# 端 / 飞书端传过来
+- 模板表里有就用模板的, 没有就用 env 默认
+
+| 字段 | 模板表列 | 兜底 | 说明 |
+|------|----------|------|------|
+| OCR tool_type | `template.ocr_model` | `OCR_MODEL` env | `hand_write` (手写) / `layout_parsing` (印刷) |
+| LLM model | `template.llm_model` | `LLM_MODEL` env | `glm-4-flash` / `glm-4-plus` |
+| 走 LLM 还是启发式 | `template.use_llm` (nullable) | `USE_LLM` env | NULL=用 env / 显式 true / 显式 false |
+| 模糊匹配距离 | `template.fuzzy_distance` (nullable) | `FUZZY_DISTANCE` env | NULL=用 env / 0=禁用模糊 |
+
+**C# 端 templates.json 同步示例**:
+```json
+{
+  "templates": [
+    {
+      "id": "supplier-A-purchase",
+      "name": "供应商 A 采购单",
+      "mode": "purchase",
+      "llm_prompt": "...",
+      "ocr_model": "layout_parsing",
+      "llm_model": "glm-4-flash",
+      "use_llm": true,
+      "fuzzy_distance": 1
+    },
+    {
+      "id": "supplier-A-inventory",
+      "name": "供应商 A 盘点单",
+      "mode": "inventory",
+      "llm_prompt": "...",
+      "ocr_model": "hand_write",
+      "llm_model": "glm-4-plus",
+      "use_llm": null,
+      "fuzzy_distance": 3
+    }
+  ]
+}
 ```
 
 ### 环境变量覆盖示例

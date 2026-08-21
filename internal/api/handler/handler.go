@@ -27,18 +27,23 @@ type Handler struct {
 	Agent         *agent.Client
 	Sessions      *store.SessionRepo
 	Templates     *store.TemplateRepo
-	FuzzyDistance int // 模糊距离 (rematch 用)
-	// 模型兜底 (per-template 没配时, 用这两个)
-	DefaultOcrModel string
-	DefaultLlmModel string
+	FuzzyDistance int // rematch 用 (旧接口保留)
+	// 兜底值 (per-template 没配时, 用这几个)
+	DefaultOcrModel  string
+	DefaultLlmModel  string
+	DefaultUseLlm    bool
+	DefaultFuzzyDist int
 }
 
 // resolveTemplateConfig 根据 template_id 查 PG, 合并兜底值
-//   - 优先顺序: 显式 override (customPrompt) > template.X > env default
+//   - 优先顺序: 显式 override (customPrompt) > template.X > handler 兜底 (env)
 //   - template 不存在 / template_id 为空 → 直接用兜底
-func (h *Handler) resolveTemplateConfig(ctx context.Context, templateID, customPrompt string) (effectivePrompt, effectiveOcrModel, effectiveLlmModel string, tpl *model.Template) {
+//   - use_llm / fuzzy_distance 是 nullable (DB NULL / Go nil) → 区分"未配"和"显式 false / 0"
+func (h *Handler) resolveTemplateConfig(ctx context.Context, templateID, customPrompt string) (effectivePrompt, effectiveOcrModel, effectiveLlmModel string, useLlm bool, fuzzyDist int, tpl *model.Template) {
 	effectiveOcrModel = h.DefaultOcrModel
 	effectiveLlmModel = h.DefaultLlmModel
+	useLlm = h.DefaultUseLlm
+	fuzzyDist = h.DefaultFuzzyDist
 	if templateID == "" {
 		return
 	}
@@ -52,6 +57,12 @@ func (h *Handler) resolveTemplateConfig(ctx context.Context, templateID, customP
 	}
 	if t.LlmModel != "" {
 		effectiveLlmModel = t.LlmModel
+	}
+	if t.UseLlm != nil {
+		useLlm = *t.UseLlm
+	}
+	if t.FuzzyDistance != nil {
+		fuzzyDist = *t.FuzzyDistance
 	}
 	if customPrompt == "" {
 		customPrompt = t.LlmPrompt
@@ -143,7 +154,7 @@ func (h *Handler) Parse(c *gin.Context) {
 	customPrompt := c.Query("prompt")
 	templateID := c.Query("template_id")
 
-	effectivePrompt, effectiveOcrModel, effectiveLlmModel, _ :=
+	effectivePrompt, effectiveOcrModel, effectiveLlmModel, useLlm, fuzzyDist, _ :=
 		h.resolveTemplateConfig(c.Request.Context(), templateID, customPrompt)
 
 	file, header, err := c.Request.FormFile("file")
@@ -159,18 +170,20 @@ func (h *Handler) Parse(c *gin.Context) {
 	}
 
 	rows, lines, _, err := h.Parser.ParseImageBytes(c.Request.Context(), imgBytes, header.Filename,
-		supplier, mode, effectivePrompt, effectiveOcrModel, effectiveLlmModel)
+		supplier, mode, effectivePrompt, effectiveOcrModel, effectiveLlmModel, useLlm, fuzzyDist)
 	if err != nil {
 		c.JSON(500, gin.H{"error": err.Error()})
 		return
 	}
 	c.JSON(200, gin.H{
-		"supplier":  supplier,
-		"mode":      mode,
-		"ocr_lines": len(lines),
-		"ocr_model": effectiveOcrModel,
-		"llm_model": effectiveLlmModel,
-		"rows":      rows,
+		"supplier":       supplier,
+		"mode":           mode,
+		"ocr_lines":      len(lines),
+		"ocr_model":      effectiveOcrModel,
+		"llm_model":      effectiveLlmModel,
+		"use_llm":        useLlm,
+		"fuzzy_distance": fuzzyDist,
+		"rows":           rows,
 	})
 }
 
@@ -271,7 +284,7 @@ func (h *Handler) CreateSession(c *gin.Context) {
 		return
 	}
 
-	effectivePrompt, effectiveOcrModel, effectiveLlmModel, _ :=
+	effectivePrompt, effectiveOcrModel, effectiveLlmModel, useLlm, fuzzyDist, _ :=
 		h.resolveTemplateConfig(c.Request.Context(), templateID, customPrompt)
 
 	file, header, err := c.Request.FormFile("file")
@@ -287,7 +300,7 @@ func (h *Handler) CreateSession(c *gin.Context) {
 	}
 
 	rows, _, _, err := h.Parser.ParseImageBytes(c.Request.Context(), imgBytes, header.Filename,
-		supplier, mode, effectivePrompt, effectiveOcrModel, effectiveLlmModel)
+		supplier, mode, effectivePrompt, effectiveOcrModel, effectiveLlmModel, useLlm, fuzzyDist)
 	if err != nil {
 		c.JSON(500, gin.H{"error": err.Error()})
 		return

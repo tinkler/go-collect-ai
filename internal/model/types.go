@@ -76,11 +76,16 @@ type Template struct {
 	SupplierName    string       `json:"supplier_name"`
 	Mode            TemplateMode `json:"mode"`
 	LlmPrompt       string       `json:"llm_prompt"`
-	UseGlmOcr       bool         `json:"use_glm_ocr"`
 	// OcrModel BigModel OCR tool_type: hand_write (手写) / layout_parsing (印刷) / "" (用 env 默认)
 	OcrModel string `json:"ocr_model"`
 	// LlmModel BigModel LLM model: glm-4-flash / glm-4-plus / "" (用 env 默认)
 	LlmModel string `json:"llm_model"`
+	// UseLlm 走 LLM 解析 (true) / 纯启发式 (false) / nil=用 env 默认
+	//   指针是为了区分"未设置"和"显式 false"
+	UseLlm *bool `json:"use_llm,omitempty"`
+	// FuzzyDistance SkuMatcher 模糊匹配 Levenshtein 距离, nil=用 env 默认
+	//   0 合法 (禁用模糊匹配), 所以必须用指针
+	FuzzyDistance *int `json:"fuzzy_distance,omitempty"`
 	HeaderKeywords  []string     `json:"header_keywords"`
 	FooterKeywords  []string     `json:"footer_keywords"`
 	SubtitleKeywords []string    `json:"subtitle_keywords"`

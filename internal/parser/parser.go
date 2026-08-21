@@ -13,16 +13,15 @@ import (
 )
 
 // Parser OCR + LLM + 匹配 完整流程
+//   - useLlm / fuzzy 每次调用传, 不存在 client 上 (per-template 切换)
 type Parser struct {
-	ocr    *bigmodel.OcrClient
-	llm    *bigmodel.LlmClient
-	agt    *agent.Client
-	useLlm bool
-	fuzzy  int
+	ocr *bigmodel.OcrClient
+	llm *bigmodel.LlmClient
+	agt *agent.Client
 }
 
-func New(ocr *bigmodel.OcrClient, llm *bigmodel.LlmClient, agt *agent.Client, useLlm bool, fuzzy int) *Parser {
-	return &Parser{ocr: ocr, llm: llm, agt: agt, useLlm: useLlm, fuzzy: fuzzy}
+func New(ocr *bigmodel.OcrClient, llm *bigmodel.LlmClient, agt *agent.Client) *Parser {
+	return &Parser{ocr: ocr, llm: llm, agt: agt}
 }
 
 // ParseImageBytes 收图 bytes → 返回已匹配的 SkuRow 列表
@@ -31,8 +30,10 @@ func New(ocr *bigmodel.OcrClient, llm *bigmodel.LlmClient, agt *agent.Client, us
 //   customPrompt: 可选, 模板自带 LLM 提示词 (空 = 用 default prompt)
 //   ocrModel:     BigModel OCR tool_type (空 = client 兜底 "hand_write")
 //   llmModel:     BigModel LLM model (空 = client 兜底 "glm-4-flash")
-//   → 两个 model 字段都允许 per-template 覆盖, 解析时由 handler 按 template 决议后传入
-func (p *Parser) ParseImageBytes(ctx context.Context, imgBytes []byte, fileName, supplier, mode, customPrompt, ocrModel, llmModel string) ([]model.SkuRow, []model.OcrLine, []byte, error) {
+//   useLlm:       true=LLM / false=纯启发式
+//   fuzzy:        SkuMatcher 模糊匹配距离
+//   → 这 4 个字段都允许 per-template 覆盖, 解析时由 handler 按 template 决议后传入
+func (p *Parser) ParseImageBytes(ctx context.Context, imgBytes []byte, fileName, supplier, mode, customPrompt, ocrModel, llmModel string, useLlm bool, fuzzy int) ([]model.SkuRow, []model.OcrLine, []byte, error) {
 	if p == nil {
 		return nil, nil, nil, fmt.Errorf("parser 未初始化")
 	}
@@ -44,11 +45,11 @@ func (p *Parser) ParseImageBytes(ctx context.Context, imgBytes []byte, fileName,
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("OCR 失败: %w", err)
 	}
-	return p.parseAfterOcr(ctx, raw, imgBytes, supplier, mode, customPrompt, llmModel)
+	return p.parseAfterOcr(ctx, raw, imgBytes, supplier, mode, customPrompt, llmModel, useLlm, fuzzy)
 }
 
 // ParseFile 同上, 但从文件读
-func (p *Parser) ParseFile(ctx context.Context, path, supplier, mode, customPrompt, ocrModel, llmModel string) ([]model.SkuRow, []model.OcrLine, []byte, error) {
+func (p *Parser) ParseFile(ctx context.Context, path, supplier, mode, customPrompt, ocrModel, llmModel string, useLlm bool, fuzzy int) ([]model.SkuRow, []model.OcrLine, []byte, error) {
 	imgBytes, err := readFileBytes(path)
 	if err != nil {
 		return nil, nil, nil, err
@@ -57,20 +58,20 @@ func (p *Parser) ParseFile(ctx context.Context, path, supplier, mode, customProm
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("OCR 失败: %w", err)
 	}
-	return p.parseAfterOcr(ctx, raw, imgBytes, supplier, mode, customPrompt, llmModel)
+	return p.parseAfterOcr(ctx, raw, imgBytes, supplier, mode, customPrompt, llmModel, useLlm, fuzzy)
 }
 
-func (p *Parser) parseAfterOcr(ctx context.Context, rawBlocks []model.OcrWordBlock, imgBytes []byte, supplier, mode, customPrompt, llmModel string) ([]model.SkuRow, []model.OcrLine, []byte, error) {
+func (p *Parser) parseAfterOcr(ctx context.Context, rawBlocks []model.OcrWordBlock, imgBytes []byte, supplier, mode, customPrompt, llmModel string, useLlm bool, fuzzy int) ([]model.SkuRow, []model.OcrLine, []byte, error) {
 	// 2) 按 top 分行 + 拆合并行
 	lines := ParseOcrResponse(rawBlocks)
 	log.Printf("[parser] OCR → %d 行", len(lines))
 
 	// 3) 解析行 (LLM 优先, 失败回退启发式)
-	parsed, err := p.parseLines(ctx, lines, mode, customPrompt, llmModel)
+	parsed, err := p.parseLines(ctx, lines, mode, customPrompt, llmModel, useLlm)
 	if err != nil {
 		return nil, lines, imgBytes, fmt.Errorf("解析行失败: %w", err)
 	}
-	log.Printf("[parser] 解析 → %d 条 (raw %d 行)", len(parsed), len(lines))
+	log.Printf("[parser] 解析 → %d 条 (raw %d 行, use_llm=%v)", len(parsed), len(lines), useLlm)
 
 	// 4) 加载供应商 SKU
 	skus, err := p.agt.LoadSupplierSkus(supplier, 5000)
@@ -80,7 +81,7 @@ func (p *Parser) parseAfterOcr(ctx context.Context, rawBlocks []model.OcrWordBlo
 	log.Printf("[parser] 供应商 [%s] → %d 条 SKU", supplier, len(skus))
 
 	// 5) 级联匹配
-	m := matcher.New(skus, p.fuzzy)
+	m := matcher.New(skus, fuzzy)
 	rows := make([]model.SkuRow, 0, len(parsed))
 	for i, ocr := range parsed {
 		rows = append(rows, m.Match(ocr, i+1))
@@ -102,8 +103,8 @@ func (p *Parser) parseAfterOcr(ctx context.Context, rawBlocks []model.OcrWordBlo
 	return rows, lines, imgBytes, nil
 }
 
-func (p *Parser) parseLines(ctx context.Context, lines []model.OcrLine, mode, customPrompt, llmModel string) ([]model.ParsedOcrRow, error) {
-	if !p.useLlm {
+func (p *Parser) parseLines(ctx context.Context, lines []model.OcrLine, mode, customPrompt, llmModel string, useLlm bool) ([]model.ParsedOcrRow, error) {
+	if !useLlm {
 		return heuristicParse(lines), nil
 	}
 	modeEnum := model.ModeInventory

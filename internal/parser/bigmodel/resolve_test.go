@@ -6,10 +6,10 @@ func TestResolveOcrModel(t *testing.T) {
 	cases := []struct {
 		in, want string
 	}{
-		{"", "hand_write"},            // 空 → 兜底
-		{"hand_write", "hand_write"},  // 显式
-		{"layout_parsing", "layout_parsing"}, // 印刷
-		{"unknown_thing", "unknown_thing"},   // 客户端不强制白名单, 透传给 API
+		{"", "hand_write"},
+		{"hand_write", "hand_write"},
+		{"layout_parsing", "layout_parsing"},
+		{"unknown_thing", "unknown_thing"}, // 客户端不强制白名单, 透传给 API
 	}
 	for _, c := range cases {
 		if got := resolveOcrModel(c.in); got != c.want {
@@ -33,7 +33,6 @@ func TestResolveLlmModel(t *testing.T) {
 	}
 }
 
-// NewOcrClient 签名变了, 不再带 model, 但 apiKey/timeout 还要支持
 func TestNewOcrClient_Default(t *testing.T) {
 	c := NewOcrClient("sk-test", "https://x", 30)
 	if c.apiKey != "sk-test" {

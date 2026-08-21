@@ -21,8 +21,9 @@ func NewTemplateRepo(pool *pgxpool.Pool) *TemplateRepo {
 }
 
 // templateColumns 统一所有 SELECT 子句, 避免增列时漏掉
-const templateColumns = `id, name, supplier_name, mode, COALESCE(llm_prompt,''), COALESCE(use_glm_ocr,false),
-		COALESCE(ocr_model,''), COALESCE(llm_model,''),
+//   use_llm / fuzzy_distance 用 COALESCE 转 nil 语义 (DB NULL → Go nil)
+const templateColumns = `id, name, supplier_name, mode, COALESCE(llm_prompt,''), COALESCE(ocr_model,''), COALESCE(llm_model,''),
+		use_llm, fuzzy_distance,
 		header_keywords, footer_keywords, subtitle_keywords,
 		COALESCE(is_default,false), updated_at, COALESCE(note,'')`
 
@@ -30,8 +31,8 @@ const templateColumns = `id, name, supplier_name, mode, COALESCE(llm_prompt,''),
 func scanTemplate(row pgx.Row, t *model.Template) error {
 	var mode, hdr, foot, sub []byte
 	if err := row.Scan(&t.ID, &t.Name, &t.SupplierName, &mode,
-		&t.LlmPrompt, &t.UseGlmOcr,
-		&t.OcrModel, &t.LlmModel,
+		&t.LlmPrompt, &t.OcrModel, &t.LlmModel,
+		&t.UseLlm, &t.FuzzyDistance,
 		&hdr, &foot, &sub,
 		&t.IsDefault, &t.UpdatedAt, &t.Note); err != nil {
 		return err
@@ -44,6 +45,7 @@ func scanTemplate(row pgx.Row, t *model.Template) error {
 }
 
 // Upsert 插入/更新
+//   use_llm / fuzzy_distance 用 COALESCE: nil=NULL(未设置) / 非 nil=值
 func (r *TemplateRepo) Upsert(ctx context.Context, t *model.Template) error {
 	if t.UpdatedAt.IsZero() {
 		t.UpdatedAt = time.Now()
@@ -52,17 +54,19 @@ func (r *TemplateRepo) Upsert(ctx context.Context, t *model.Template) error {
 	foot, _ := json.Marshal(t.FooterKeywords)
 	sub, _ := json.Marshal(t.SubtitleKeywords)
 	_, err := r.pool.Exec(ctx, `
-		INSERT INTO template (id, name, supplier_name, mode, llm_prompt, use_glm_ocr, ocr_model, llm_model,
+		INSERT INTO template (id, name, supplier_name, mode, llm_prompt, ocr_model, llm_model,
+			use_llm, fuzzy_distance,
 			header_keywords, footer_keywords, subtitle_keywords, is_default, updated_at, note)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
 		ON CONFLICT (id) DO UPDATE SET
 			name = EXCLUDED.name,
 			supplier_name = EXCLUDED.supplier_name,
 			mode = EXCLUDED.mode,
 			llm_prompt = EXCLUDED.llm_prompt,
-			use_glm_ocr = EXCLUDED.use_glm_ocr,
 			ocr_model = EXCLUDED.ocr_model,
 			llm_model = EXCLUDED.llm_model,
+			use_llm = EXCLUDED.use_llm,
+			fuzzy_distance = EXCLUDED.fuzzy_distance,
 			header_keywords = EXCLUDED.header_keywords,
 			footer_keywords = EXCLUDED.footer_keywords,
 			subtitle_keywords = EXCLUDED.subtitle_keywords,
@@ -71,7 +75,8 @@ func (r *TemplateRepo) Upsert(ctx context.Context, t *model.Template) error {
 			note = EXCLUDED.note
 	`,
 		t.ID, t.Name, t.SupplierName, string(t.Mode),
-		t.LlmPrompt, t.UseGlmOcr, t.OcrModel, t.LlmModel,
+		t.LlmPrompt, t.OcrModel, t.LlmModel,
+		t.UseLlm, t.FuzzyDistance,
 		hdr, foot, sub, t.IsDefault, t.UpdatedAt, t.Note)
 	return err
 }
@@ -101,7 +106,6 @@ func (r *TemplateRepo) GetByID(ctx context.Context, id string) (*model.Template,
 }
 
 // ListForSupplier 列某供应商的模板 (供飞书端)
-//   飞书端只关心 Purchase 模式 + C# 标记 IsDefault=true
 func (r *TemplateRepo) ListForSupplier(ctx context.Context, supplierName, mode string, onlyDefault, purchaseOnly bool) ([]model.Template, error) {
 	q := `SELECT ` + templateColumns + ` FROM template WHERE 1=1`
 	args := []any{}
