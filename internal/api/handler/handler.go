@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"os"
@@ -27,6 +28,36 @@ type Handler struct {
 	Sessions      *store.SessionRepo
 	Templates     *store.TemplateRepo
 	FuzzyDistance int // 模糊距离 (rematch 用)
+	// 模型兜底 (per-template 没配时, 用这两个)
+	DefaultOcrModel string
+	DefaultLlmModel string
+}
+
+// resolveTemplateConfig 根据 template_id 查 PG, 合并兜底值
+//   - 优先顺序: 显式 override (customPrompt) > template.X > env default
+//   - template 不存在 / template_id 为空 → 直接用兜底
+func (h *Handler) resolveTemplateConfig(ctx context.Context, templateID, customPrompt string) (effectivePrompt, effectiveOcrModel, effectiveLlmModel string, tpl *model.Template) {
+	effectiveOcrModel = h.DefaultOcrModel
+	effectiveLlmModel = h.DefaultLlmModel
+	if templateID == "" {
+		return
+	}
+	t, err := h.Templates.GetByID(ctx, templateID)
+	if err != nil || t == nil {
+		return // 查不到也别报错, 走兜底
+	}
+	tpl = t
+	if t.OcrModel != "" {
+		effectiveOcrModel = t.OcrModel
+	}
+	if t.LlmModel != "" {
+		effectiveLlmModel = t.LlmModel
+	}
+	if customPrompt == "" {
+		customPrompt = t.LlmPrompt
+	}
+	effectivePrompt = customPrompt
+	return
 }
 
 // ============== Health ==============
@@ -110,6 +141,10 @@ func (h *Handler) Parse(c *gin.Context) {
 		return
 	}
 	customPrompt := c.Query("prompt")
+	templateID := c.Query("template_id")
+
+	effectivePrompt, effectiveOcrModel, effectiveLlmModel, _ :=
+		h.resolveTemplateConfig(c.Request.Context(), templateID, customPrompt)
 
 	file, header, err := c.Request.FormFile("file")
 	if err != nil {
@@ -123,16 +158,19 @@ func (h *Handler) Parse(c *gin.Context) {
 		return
 	}
 
-	rows, lines, _, err := h.Parser.ParseImageBytes(c.Request.Context(), imgBytes, header.Filename, supplier, mode, customPrompt)
+	rows, lines, _, err := h.Parser.ParseImageBytes(c.Request.Context(), imgBytes, header.Filename,
+		supplier, mode, effectivePrompt, effectiveOcrModel, effectiveLlmModel)
 	if err != nil {
 		c.JSON(500, gin.H{"error": err.Error()})
 		return
 	}
 	c.JSON(200, gin.H{
-		"supplier": supplier,
-		"mode":     mode,
+		"supplier":  supplier,
+		"mode":      mode,
 		"ocr_lines": len(lines),
-		"rows":     rows,
+		"ocr_model": effectiveOcrModel,
+		"llm_model": effectiveLlmModel,
+		"rows":      rows,
 	})
 }
 
@@ -233,6 +271,9 @@ func (h *Handler) CreateSession(c *gin.Context) {
 		return
 	}
 
+	effectivePrompt, effectiveOcrModel, effectiveLlmModel, _ :=
+		h.resolveTemplateConfig(c.Request.Context(), templateID, customPrompt)
+
 	file, header, err := c.Request.FormFile("file")
 	if err != nil {
 		c.JSON(400, gin.H{"error": "未收到 file: " + err.Error()})
@@ -245,7 +286,8 @@ func (h *Handler) CreateSession(c *gin.Context) {
 		return
 	}
 
-	rows, _, _, err := h.Parser.ParseImageBytes(c.Request.Context(), imgBytes, header.Filename, supplier, mode, customPrompt)
+	rows, _, _, err := h.Parser.ParseImageBytes(c.Request.Context(), imgBytes, header.Filename,
+		supplier, mode, effectivePrompt, effectiveOcrModel, effectiveLlmModel)
 	if err != nil {
 		c.JSON(500, gin.H{"error": err.Error()})
 		return

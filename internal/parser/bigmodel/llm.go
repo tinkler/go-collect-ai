@@ -17,32 +17,39 @@ import (
 const chatEndpoint = "https://open.bigmodel.cn/api/paas/v4/chat/completions"
 
 // LlmClient BigModel GLM-4 chat completions
+//   - model 是每次调用传的, 不存在 client 上, 便于 per-template 切换
+//   - 合法值: "glm-4-flash" / "glm-4-plus" 等
+//   - 空字符串时 client 自动回退到 "glm-4-flash"
 type LlmClient struct {
 	apiKey  string
 	baseURL string
-	model   string
 	timeout time.Duration
 }
 
-func NewLlmClient(apiKey, baseURL, modelName string, timeoutSec int) *LlmClient {
+func NewLlmClient(apiKey, baseURL string, timeoutSec int) *LlmClient {
 	if baseURL == "" {
 		baseURL = "https://open.bigmodel.cn/api/paas/v4"
-	}
-	if modelName == "" {
-		modelName = "glm-4-flash"
 	}
 	return &LlmClient{
 		apiKey:  apiKey,
 		baseURL: baseURL,
-		model:   modelName,
 		timeout: time.Duration(timeoutSec) * time.Second,
 	}
 }
 
+// resolveLlmModel 空值回退到 glm-4-flash
+func resolveLlmModel(model string) string {
+	if model == "" {
+		return "glm-4-flash"
+	}
+	return model
+}
+
 // ChatCompletion 调 LLM, 返回 choices[0].message.content
-func (c *LlmClient) ChatCompletion(sysPrompt, userPrompt string) (string, error) {
+//   model: "glm-4-flash" / "glm-4-plus" / "" (回退 glm-4-flash)
+func (c *LlmClient) ChatCompletion(sysPrompt, userPrompt, model string) (string, error) {
 	payload := map[string]any{
-		"model": c.model,
+		"model": resolveLlmModel(model),
 		"messages": []map[string]string{
 			{"role": "system", "content": sysPrompt},
 			{"role": "user", "content": userPrompt},

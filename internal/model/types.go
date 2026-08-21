@@ -77,6 +77,10 @@ type Template struct {
 	Mode            TemplateMode `json:"mode"`
 	LlmPrompt       string       `json:"llm_prompt"`
 	UseGlmOcr       bool         `json:"use_glm_ocr"`
+	// OcrModel BigModel OCR tool_type: hand_write (手写) / layout_parsing (印刷) / "" (用 env 默认)
+	OcrModel string `json:"ocr_model"`
+	// LlmModel BigModel LLM model: glm-4-flash / glm-4-plus / "" (用 env 默认)
+	LlmModel string `json:"llm_model"`
 	HeaderKeywords  []string     `json:"header_keywords"`
 	FooterKeywords  []string     `json:"footer_keywords"`
 	SubtitleKeywords []string    `json:"subtitle_keywords"`

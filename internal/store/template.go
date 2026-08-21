@@ -20,6 +20,29 @@ func NewTemplateRepo(pool *pgxpool.Pool) *TemplateRepo {
 	return &TemplateRepo{pool: pool}
 }
 
+// templateColumns 统一所有 SELECT 子句, 避免增列时漏掉
+const templateColumns = `id, name, supplier_name, mode, COALESCE(llm_prompt,''), COALESCE(use_glm_ocr,false),
+		COALESCE(ocr_model,''), COALESCE(llm_model,''),
+		header_keywords, footer_keywords, subtitle_keywords,
+		COALESCE(is_default,false), updated_at, COALESCE(note,'')`
+
+// scanTemplate 从 pgx.Row 扫描到 Template
+func scanTemplate(row pgx.Row, t *model.Template) error {
+	var mode, hdr, foot, sub []byte
+	if err := row.Scan(&t.ID, &t.Name, &t.SupplierName, &mode,
+		&t.LlmPrompt, &t.UseGlmOcr,
+		&t.OcrModel, &t.LlmModel,
+		&hdr, &foot, &sub,
+		&t.IsDefault, &t.UpdatedAt, &t.Note); err != nil {
+		return err
+	}
+	t.Mode = model.TemplateMode(mode)
+	_ = json.Unmarshal(hdr, &t.HeaderKeywords)
+	_ = json.Unmarshal(foot, &t.FooterKeywords)
+	_ = json.Unmarshal(sub, &t.SubtitleKeywords)
+	return nil
+}
+
 // Upsert 插入/更新
 func (r *TemplateRepo) Upsert(ctx context.Context, t *model.Template) error {
 	if t.UpdatedAt.IsZero() {
@@ -29,14 +52,17 @@ func (r *TemplateRepo) Upsert(ctx context.Context, t *model.Template) error {
 	foot, _ := json.Marshal(t.FooterKeywords)
 	sub, _ := json.Marshal(t.SubtitleKeywords)
 	_, err := r.pool.Exec(ctx, `
-		INSERT INTO template (id, name, supplier_name, mode, llm_prompt, use_glm_ocr, header_keywords, footer_keywords, subtitle_keywords, is_default, updated_at, note)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+		INSERT INTO template (id, name, supplier_name, mode, llm_prompt, use_glm_ocr, ocr_model, llm_model,
+			header_keywords, footer_keywords, subtitle_keywords, is_default, updated_at, note)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
 		ON CONFLICT (id) DO UPDATE SET
 			name = EXCLUDED.name,
 			supplier_name = EXCLUDED.supplier_name,
 			mode = EXCLUDED.mode,
 			llm_prompt = EXCLUDED.llm_prompt,
 			use_glm_ocr = EXCLUDED.use_glm_ocr,
+			ocr_model = EXCLUDED.ocr_model,
+			llm_model = EXCLUDED.llm_model,
 			header_keywords = EXCLUDED.header_keywords,
 			footer_keywords = EXCLUDED.footer_keywords,
 			subtitle_keywords = EXCLUDED.subtitle_keywords,
@@ -44,7 +70,9 @@ func (r *TemplateRepo) Upsert(ctx context.Context, t *model.Template) error {
 			updated_at = EXCLUDED.updated_at,
 			note = EXCLUDED.note
 	`,
-		t.ID, t.Name, t.SupplierName, string(t.Mode), t.LlmPrompt, t.UseGlmOcr, hdr, foot, sub, t.IsDefault, t.UpdatedAt, t.Note)
+		t.ID, t.Name, t.SupplierName, string(t.Mode),
+		t.LlmPrompt, t.UseGlmOcr, t.OcrModel, t.LlmModel,
+		hdr, foot, sub, t.IsDefault, t.UpdatedAt, t.Note)
 	return err
 }
 
@@ -58,11 +86,24 @@ func (r *TemplateRepo) UpsertAll(ctx context.Context, ts []model.Template) error
 	return nil
 }
 
+// GetByID 单条查询 (解析时根据 template_id 拿配置)
+func (r *TemplateRepo) GetByID(ctx context.Context, id string) (*model.Template, error) {
+	q := `SELECT ` + templateColumns + ` FROM template WHERE id = $1`
+	row := r.pool.QueryRow(ctx, q, id)
+	var t model.Template
+	if err := scanTemplate(row, &t); err != nil {
+		if err == pgx.ErrNoRows {
+			return nil, nil
+		}
+		return nil, err
+	}
+	return &t, nil
+}
+
 // ListForSupplier 列某供应商的模板 (供飞书端)
 //   飞书端只关心 Purchase 模式 + C# 标记 IsDefault=true
 func (r *TemplateRepo) ListForSupplier(ctx context.Context, supplierName, mode string, onlyDefault, purchaseOnly bool) ([]model.Template, error) {
-	q := `SELECT id, name, supplier_name, mode, COALESCE(llm_prompt,''), COALESCE(use_glm_ocr,false), header_keywords, footer_keywords, subtitle_keywords, COALESCE(is_default,false), updated_at, COALESCE(note,'')
-		FROM template WHERE 1=1`
+	q := `SELECT ` + templateColumns + ` FROM template WHERE 1=1`
 	args := []any{}
 	if purchaseOnly {
 		q += " AND mode = 'purchase'"
@@ -85,14 +126,9 @@ func (r *TemplateRepo) ListForSupplier(ctx context.Context, supplierName, mode s
 	var out []model.Template
 	for rows.Next() {
 		var t model.Template
-		var mode, hdr, foot, sub []byte
-		if err := rows.Scan(&t.ID, &t.Name, &t.SupplierName, &mode, &t.LlmPrompt, &t.UseGlmOcr, &hdr, &foot, &sub, &t.IsDefault, &t.UpdatedAt, &t.Note); err != nil {
+		if err := scanTemplate(rows, &t); err != nil {
 			return nil, err
 		}
-		t.Mode = model.TemplateMode(mode)
-		_ = json.Unmarshal(hdr, &t.HeaderKeywords)
-		_ = json.Unmarshal(foot, &t.FooterKeywords)
-		_ = json.Unmarshal(sub, &t.SubtitleKeywords)
 		out = append(out, t)
 	}
 	return out, rows.Err()
@@ -100,8 +136,7 @@ func (r *TemplateRepo) ListForSupplier(ctx context.Context, supplierName, mode s
 
 // ListAll 全部 (供 C# 端管理界面)
 func (r *TemplateRepo) ListAll(ctx context.Context) ([]model.Template, error) {
-	q := `SELECT id, name, supplier_name, mode, COALESCE(llm_prompt,''), COALESCE(use_glm_ocr,false), header_keywords, footer_keywords, subtitle_keywords, COALESCE(is_default,false), updated_at, COALESCE(note,'')
-		FROM template ORDER BY supplier_name, is_default DESC, name`
+	q := `SELECT ` + templateColumns + ` FROM template ORDER BY supplier_name, is_default DESC, name`
 	rows, err := r.pool.Query(ctx, q)
 	if err != nil {
 		return nil, err
@@ -110,14 +145,9 @@ func (r *TemplateRepo) ListAll(ctx context.Context) ([]model.Template, error) {
 	var out []model.Template
 	for rows.Next() {
 		var t model.Template
-		var mode, hdr, foot, sub []byte
-		if err := rows.Scan(&t.ID, &t.Name, &t.SupplierName, &mode, &t.LlmPrompt, &t.UseGlmOcr, &hdr, &foot, &sub, &t.IsDefault, &t.UpdatedAt, &t.Note); err != nil {
+		if err := scanTemplate(rows, &t); err != nil {
 			return nil, err
 		}
-		t.Mode = model.TemplateMode(mode)
-		_ = json.Unmarshal(hdr, &t.HeaderKeywords)
-		_ = json.Unmarshal(foot, &t.FooterKeywords)
-		_ = json.Unmarshal(sub, &t.SubtitleKeywords)
 		out = append(out, t)
 	}
 	return out, rows.Err()

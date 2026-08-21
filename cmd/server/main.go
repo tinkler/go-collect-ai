@@ -26,7 +26,10 @@ func main() {
 		log.Fatalf("load config: %v", err)
 	}
 
-	log.Printf("[main] BigModel key len=%d, OCR=%s, LLM=%s", len(cfg.BigModelAPIKey), cfg.OCRModel, cfg.LLMModel)
+	// OCR_MODEL / LLM_MODEL 现在是 env 兜底值
+	// per-template 覆盖存在 template 表里, 解析时由 handler 按 template_id 解析
+	log.Printf("[main] BigModel key len=%d, OCR default=%s, LLM default=%s",
+		len(cfg.BigModelAPIKey), cfg.OCRModel, cfg.LLMModel)
 	log.Printf("[main] PG=%s:%d/%s, Agent=%s", cfg.PGHost, cfg.PGPort, cfg.PGDatabase, cfg.AgentURL)
 	log.Printf("[main] Upload dir=%s, MaxUploadMB=%d", cfg.UploadDir, cfg.MaxUploadMB)
 
@@ -50,21 +53,23 @@ func main() {
 	sessionRepo := store.NewSessionRepo(pool)
 	templateRepo := store.NewTemplateRepo(pool)
 
-	ocrClient := bigmodel.NewOcrClient(cfg.BigModelAPIKey, cfg.BigModelBase, cfg.OCRModel, cfg.OcrTimeoutSec)
-	llmClient := bigmodel.NewLlmClient(cfg.BigModelAPIKey, cfg.BigModelBase, cfg.LLMModel, cfg.LlmTimeoutSec)
+	ocrClient := bigmodel.NewOcrClient(cfg.BigModelAPIKey, cfg.BigModelBase, cfg.OcrTimeoutSec)
+	llmClient := bigmodel.NewLlmClient(cfg.BigModelAPIKey, cfg.BigModelBase, cfg.LlmTimeoutSec)
 	agentClient := agent.NewClient(cfg.AgentURL, cfg.AgentToken, 30)
 
 	psr := parser.New(ocrClient, llmClient, agentClient, cfg.UseLlm, cfg.FuzzyDistance)
 
 	h := &handler.Handler{
-		UploadDir:     cfg.UploadDir,
-		PublicBase:    cfg.PublicBaseURL,
-		MaxUpload:     int64(cfg.MaxUploadMB) * 1024 * 1024,
-		Parser:        psr,
-		Agent:         agentClient,
-		Sessions:      sessionRepo,
-		Templates:     templateRepo,
-		FuzzyDistance: cfg.FuzzyDistance,
+		UploadDir:       cfg.UploadDir,
+		PublicBase:      cfg.PublicBaseURL,
+		MaxUpload:       int64(cfg.MaxUploadMB) * 1024 * 1024,
+		Parser:          psr,
+		Agent:           agentClient,
+		Sessions:        sessionRepo,
+		Templates:       templateRepo,
+		FuzzyDistance:   cfg.FuzzyDistance,
+		DefaultOcrModel: cfg.OCRModel,
+		DefaultLlmModel: cfg.LLMModel,
 	}
 
 	gin.SetMode(gin.ReleaseMode)

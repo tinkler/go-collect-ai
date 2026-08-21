@@ -14,11 +14,11 @@ import (
 
 // Parser OCR + LLM + 匹配 完整流程
 type Parser struct {
-	ocr  *bigmodel.OcrClient
-	llm  *bigmodel.LlmClient
-	agt  *agent.Client
+	ocr    *bigmodel.OcrClient
+	llm    *bigmodel.LlmClient
+	agt    *agent.Client
 	useLlm bool
-	fuzzy int
+	fuzzy  int
 }
 
 func New(ocr *bigmodel.OcrClient, llm *bigmodel.LlmClient, agt *agent.Client, useLlm bool, fuzzy int) *Parser {
@@ -26,10 +26,13 @@ func New(ocr *bigmodel.OcrClient, llm *bigmodel.LlmClient, agt *agent.Client, us
 }
 
 // ParseImageBytes 收图 bytes → 返回已匹配的 SkuRow 列表
-//   supplier: 必填, 用于加载 SKU 库
-//   mode:    "inventory" (默认) / "purchase"
-//   customPrompt: 可选, 模板自带 prompt
-func (p *Parser) ParseImageBytes(ctx context.Context, imgBytes []byte, fileName, supplier, mode, customPrompt string) ([]model.SkuRow, []model.OcrLine, []byte, error) {
+//   supplier:     必填, 用于加载 SKU 库
+//   mode:         "inventory" (默认) / "purchase"
+//   customPrompt: 可选, 模板自带 LLM 提示词 (空 = 用 default prompt)
+//   ocrModel:     BigModel OCR tool_type (空 = client 兜底 "hand_write")
+//   llmModel:     BigModel LLM model (空 = client 兜底 "glm-4-flash")
+//   → 两个 model 字段都允许 per-template 覆盖, 解析时由 handler 按 template 决议后传入
+func (p *Parser) ParseImageBytes(ctx context.Context, imgBytes []byte, fileName, supplier, mode, customPrompt, ocrModel, llmModel string) ([]model.SkuRow, []model.OcrLine, []byte, error) {
 	if p == nil {
 		return nil, nil, nil, fmt.Errorf("parser 未初始化")
 	}
@@ -37,33 +40,33 @@ func (p *Parser) ParseImageBytes(ctx context.Context, imgBytes []byte, fileName,
 		return nil, nil, nil, fmt.Errorf("supplier 必填")
 	}
 	// 1) OCR
-	raw, err := p.ocr.RecognizeBytes(fileName, imgBytes)
+	raw, err := p.ocr.RecognizeBytes(fileName, imgBytes, ocrModel)
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("OCR 失败: %w", err)
 	}
-	return p.parseAfterOcr(ctx, raw, imgBytes, supplier, mode, customPrompt)
+	return p.parseAfterOcr(ctx, raw, imgBytes, supplier, mode, customPrompt, llmModel)
 }
 
 // ParseFile 同上, 但从文件读
-func (p *Parser) ParseFile(ctx context.Context, path, supplier, mode, customPrompt string) ([]model.SkuRow, []model.OcrLine, []byte, error) {
+func (p *Parser) ParseFile(ctx context.Context, path, supplier, mode, customPrompt, ocrModel, llmModel string) ([]model.SkuRow, []model.OcrLine, []byte, error) {
 	imgBytes, err := readFileBytes(path)
 	if err != nil {
 		return nil, nil, nil, err
 	}
-	raw, err := p.ocr.RecognizeFile(path)
+	raw, err := p.ocr.RecognizeFile(path, ocrModel)
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("OCR 失败: %w", err)
 	}
-	return p.parseAfterOcr(ctx, raw, imgBytes, supplier, mode, customPrompt)
+	return p.parseAfterOcr(ctx, raw, imgBytes, supplier, mode, customPrompt, llmModel)
 }
 
-func (p *Parser) parseAfterOcr(ctx context.Context, rawBlocks []model.OcrWordBlock, imgBytes []byte, supplier, mode, customPrompt string) ([]model.SkuRow, []model.OcrLine, []byte, error) {
+func (p *Parser) parseAfterOcr(ctx context.Context, rawBlocks []model.OcrWordBlock, imgBytes []byte, supplier, mode, customPrompt, llmModel string) ([]model.SkuRow, []model.OcrLine, []byte, error) {
 	// 2) 按 top 分行 + 拆合并行
 	lines := ParseOcrResponse(rawBlocks)
 	log.Printf("[parser] OCR → %d 行", len(lines))
 
 	// 3) 解析行 (LLM 优先, 失败回退启发式)
-	parsed, err := p.parseLines(ctx, lines, mode, customPrompt)
+	parsed, err := p.parseLines(ctx, lines, mode, customPrompt, llmModel)
 	if err != nil {
 		return nil, lines, imgBytes, fmt.Errorf("解析行失败: %w", err)
 	}
@@ -99,7 +102,7 @@ func (p *Parser) parseAfterOcr(ctx context.Context, rawBlocks []model.OcrWordBlo
 	return rows, lines, imgBytes, nil
 }
 
-func (p *Parser) parseLines(ctx context.Context, lines []model.OcrLine, mode, customPrompt string) ([]model.ParsedOcrRow, error) {
+func (p *Parser) parseLines(ctx context.Context, lines []model.OcrLine, mode, customPrompt, llmModel string) ([]model.ParsedOcrRow, error) {
 	if !p.useLlm {
 		return heuristicParse(lines), nil
 	}
@@ -112,7 +115,7 @@ func (p *Parser) parseLines(ctx context.Context, lines []model.OcrLine, mode, cu
 		sysPrompt = bigmodel.DefaultSystemPrompt(modeEnum)
 	}
 	userPrompt := buildUserPrompt(lines)
-	content, err := p.llm.ChatCompletion(sysPrompt, userPrompt)
+	content, err := p.llm.ChatCompletion(sysPrompt, userPrompt, llmModel)
 	if err != nil {
 		log.Printf("[parser] LLM 失败, fallback 启发式: %v", err)
 		return heuristicParse(lines), nil

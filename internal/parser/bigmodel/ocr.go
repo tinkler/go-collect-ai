@@ -17,35 +17,42 @@ import (
 
 const ocrEndpoint = "https://open.bigmodel.cn/api/paas/v4/files/ocr"
 
-// OcrClient 智谱 BigModel OCR (hand_write)
+// OcrClient 智谱 BigModel OCR
+//   - model (tool_type) 是每次调用传的, 不存在 client 上, 便于 per-template 切换
+//   - 合法值: "hand_write" (手写) / "layout_parsing" (印刷)
+//   - 空字符串时 client 自动回退到 "hand_write"
 type OcrClient struct {
-	apiKey    string
-	baseURL   string
-	model     string // hand_write / layout_parsing
-	timeout   time.Duration
-	language  string
-	prob      string
+	apiKey   string
+	baseURL  string
+	timeout  time.Duration
+	language string
+	prob     string
 }
 
-func NewOcrClient(apiKey, baseURL, modelName string, timeoutSec int) *OcrClient {
+func NewOcrClient(apiKey, baseURL string, timeoutSec int) *OcrClient {
 	if baseURL == "" {
 		baseURL = "https://open.bigmodel.cn/api/paas/v4"
-	}
-	if modelName == "" {
-		modelName = "hand_write"
 	}
 	return &OcrClient{
 		apiKey:   apiKey,
 		baseURL:  baseURL,
-		model:    modelName,
 		timeout:  time.Duration(timeoutSec) * time.Second,
 		language: "CHN_ENG",
 		prob:     "true",
 	}
 }
 
+// resolveOcrModel 空值回退到 hand_write
+func resolveOcrModel(model string) string {
+	if model == "" {
+		return "hand_write"
+	}
+	return model
+}
+
 // RecognizeFile 上传文件 → OCR 原始 words_result (未分行)
-func (c *OcrClient) RecognizeFile(filePath string) ([]model.OcrWordBlock, error) {
+//   toolType: "hand_write" / "layout_parsing" / "" (回退 hand_write)
+func (c *OcrClient) RecognizeFile(filePath, toolType string) ([]model.OcrWordBlock, error) {
 	f, err := os.Open(filePath)
 	if err != nil {
 		return nil, err
@@ -61,7 +68,7 @@ func (c *OcrClient) RecognizeFile(filePath string) ([]model.OcrWordBlock, error)
 	if _, err = io.Copy(part, f); err != nil {
 		return nil, err
 	}
-	_ = w.WriteField("tool_type", c.model)
+	_ = w.WriteField("tool_type", resolveOcrModel(toolType))
 	_ = w.WriteField("language_type", c.language)
 	_ = w.WriteField("probability", c.prob)
 	if err = w.Close(); err != nil {
@@ -105,7 +112,8 @@ func (c *OcrClient) RecognizeFile(filePath string) ([]model.OcrWordBlock, error)
 }
 
 // RecognizeBytes 收 bytes (png/jpg) → OCR words_result
-func (c *OcrClient) RecognizeBytes(name string, data []byte) ([]model.OcrWordBlock, error) {
+//   toolType: "hand_write" / "layout_parsing" / "" (回退 hand_write)
+func (c *OcrClient) RecognizeBytes(name string, data []byte, toolType string) ([]model.OcrWordBlock, error) {
 	body := &bytes.Buffer{}
 	w := multipart.NewWriter(body)
 	part, err := w.CreateFormFile("file", name)
@@ -115,7 +123,7 @@ func (c *OcrClient) RecognizeBytes(name string, data []byte) ([]model.OcrWordBlo
 	if _, err = part.Write(data); err != nil {
 		return nil, err
 	}
-	_ = w.WriteField("tool_type", c.model)
+	_ = w.WriteField("tool_type", resolveOcrModel(toolType))
 	_ = w.WriteField("language_type", c.language)
 	_ = w.WriteField("probability", c.prob)
 	if err = w.Close(); err != nil {
