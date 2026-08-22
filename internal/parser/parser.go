@@ -81,7 +81,7 @@ func (p *Parser) parseAfterOcr(ctx context.Context, rawBlocks []model.OcrWordBlo
 	log.Printf("[parser] 供应商 [%s] → %d 条 SKU", supplier, len(skus))
 
 	// 5) 级联匹配
-	m := matcher.New(skus, fuzzy)
+	m := matcher.New(toSkuRecords(skus), fuzzy)
 	rows := make([]model.SkuRow, 0, len(parsed))
 	for i, ocr := range parsed {
 		rows = append(rows, m.Match(ocr, i+1))

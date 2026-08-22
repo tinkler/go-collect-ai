@@ -46,6 +46,10 @@ type Config struct {
 	// cube-agent-server
 	AgentURL   string `mapstructure:"AGENT_URL"`
 	AgentToken string `mapstructure:"AGENT_TOKEN"` // 可选
+	// 统一数据源(默认 erp,可选 hbpos)
+	//   透传到 cube-agent-server 的 ?datasource= 参数
+	//   运行时可通过 /api/v1/datasource 切换
+	DataSource string `mapstructure:"DATA_SOURCE"`
 
 	// 解析行为
 	OcrTimeoutSec int  `mapstructure:"OCR_TIMEOUT_SEC"`
@@ -65,7 +69,7 @@ var leaves = []string{
 	"PORT", "UPLOAD_DIR", "MAX_UPLOAD_MB", "PUBLIC_BASE_URL",
 	"PG_HOST", "PG_PORT", "PG_USER", "PG_PASSWORD", "PG_DATABASE",
 	"BIGMODEL_API_KEY", "BIGMODEL_BASE", "OCR_MODEL", "LLM_MODEL",
-	"AGENT_URL", "AGENT_TOKEN",
+	"AGENT_URL", "AGENT_TOKEN", "DATA_SOURCE",
 	"OCR_TIMEOUT_SEC", "LLM_TIMEOUT_SEC", "USE_LLM", "FUZZY_DISTANCE",
 	"MAX_CONCURRENT_PARSE", "RATE_LIMIT_WAIT_SEC",
 }

@@ -6,11 +6,14 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
+	"github.com/tinkler/collect-ai/internal/business"
 	"github.com/tinkler/collect-ai/internal/model"
 	"github.com/tinkler/collect-ai/internal/parser"
 	"github.com/tinkler/collect-ai/internal/parser/agent"
@@ -25,6 +28,7 @@ type Handler struct {
 	MaxUpload     int64 // bytes
 	Parser        *parser.Parser
 	Agent         *agent.Client
+	BusinessReg   *business.Registry // 业务字段映射(products / suppliers 跨数据源)
 	Sessions      *store.SessionRepo
 	Templates     *store.TemplateRepo
 	FuzzyDistance int // rematch 用 (旧接口保留)
@@ -79,6 +83,9 @@ func (h *Handler) Health(c *gin.Context) {
 
 // ============== Suppliers ==============
 
+// ListSuppliers 拉所有 distinct 供应商(业务字段名)
+//   ?datasource=erp|hbpos  不传则用当前 agent client 的数据源
+//   返回:{"suppliers": [...], "count": N, "datasource": "..."}
 func (h *Handler) ListSuppliers(c *gin.Context) {
 	if err := h.Agent.Ping(); err != nil {
 		c.JSON(503, gin.H{"error": "agent 不可达: " + err.Error()})
@@ -88,12 +95,223 @@ func (h *Handler) ListSuppliers(c *gin.Context) {
 	if limit == 0 {
 		limit = 20000
 	}
-	list, err := h.Agent.GetDistinctSuppliers(limit)
-	if err != nil {
-		c.JSON(500, gin.H{"error": err.Error()})
+	ds := c.Query("datasource")
+	if ds == "" {
+		ds = h.Agent.GetDataSource()
+	}
+	if h.BusinessReg == nil {
+		c.JSON(500, gin.H{"error": "business registry not configured"})
 		return
 	}
-	c.JSON(200, gin.H{"suppliers": list, "count": len(list)})
+	ent, ok := h.BusinessReg.Get("suppliers")
+	if !ok {
+		c.JSON(500, gin.H{"error": "suppliers entity not found"})
+		return
+	}
+	src, ok := ent.Sources[ds]
+	if !ok {
+		c.JSON(400, gin.H{"error": "suppliers entity has no mapping for datasource " + ds})
+		return
+	}
+	if src.Cube == "" {
+		c.JSON(400, gin.H{"error": "suppliers " + ds + " has no cube"})
+		return
+	}
+	supplierNameRef := src.FieldRefs["supplier_name"]
+	if supplierNameRef == "" {
+		c.JSON(400, gin.H{"error": "supplier_name field not mapped for " + ds})
+		return
+	}
+	measures := []string{}
+	if ds == "erp" {
+		if r, ok := src.FieldRefs["stock_qty"]; ok && r != "" {
+			measures = []string{r}
+		}
+	} else {
+		measures = []string{"suppliers.count"}
+	}
+
+	rows, err := h.Agent.Execute(src.Cube, measures, []string{supplierNameRef}, nil, []string{"sup_only"}, limit)
+	if err != nil {
+		c.JSON(500, gin.H{"error": "agent query: " + err.Error()})
+		return
+	}
+	bizRows, err := h.BusinessReg.ToBusinessResponse("suppliers", ds, rows, []string{"supplier_name"})
+	if err != nil {
+		c.JSON(500, gin.H{"error": "translate response: " + err.Error()})
+		return
+	}
+	set := make(map[string]struct{})
+	for _, br := range bizRows {
+		if s, ok := br["supplier_name"].(string); ok {
+			s = strings.TrimSpace(s)
+			if s != "" {
+				set[s] = struct{}{}
+			}
+		}
+	}
+	out := make([]string, 0, len(set))
+	for k := range set {
+		out = append(out, k)
+	}
+	sortStrings(out)
+	c.JSON(200, gin.H{
+		"suppliers":  out,
+		"count":      len(out),
+		"datasource": ds,
+	})
+}
+
+// sortStrings 内部 helper (避免引入 sort 包循环依赖)
+func sortStrings(s []string) {
+	for i := 1; i < len(s); i++ {
+		for j := i; j > 0 && s[j-1] > s[j]; j-- {
+			s[j-1], s[j] = s[j], s[j-1]
+		}
+	}
+}
+
+// ListSuppliersByBrand GET /api/v1/suppliers/by-brand?brand=xxx&datasource=xxx&limit=N
+//   按品牌(产品名 contains brand)反查供应商, 按 product_count 降序
+//   业务字段名 → 物理字段名由 business registry 翻译
+//   返回:
+//     {
+//       "brand": "蒙牛",
+//       "datasource": "erp",
+//       "suppliers": [{"supplier_name": "汇一", "product_count": 47}, ...],
+//       "count": 2
+//     }
+func (h *Handler) ListSuppliersByBrand(c *gin.Context) {
+	brand := strings.TrimSpace(c.Query("brand"))
+	if brand == "" {
+		c.JSON(400, gin.H{"error": "brand 必填 (query ?brand=蒙牛)"})
+		return
+	}
+	if err := h.Agent.Ping(); err != nil {
+		c.JSON(503, gin.H{"error": "agent 不可达: " + err.Error()})
+		return
+	}
+	if h.BusinessReg == nil {
+		c.JSON(500, gin.H{"error": "business registry not configured"})
+		return
+	}
+	ds := c.Query("datasource")
+	if ds == "" {
+		ds = h.Agent.GetDataSource()
+	}
+	limit, _ := strconv.Atoi(c.Query("limit"))
+	if limit == 0 {
+		limit = 50000
+	}
+
+	ent, ok := h.BusinessReg.Get("products")
+	if !ok {
+		c.JSON(500, gin.H{"error": "products entity not found"})
+		return
+	}
+	src, ok := ent.Sources[ds]
+	if !ok {
+		c.JSON(400, gin.H{"error": "products has no mapping for datasource " + ds})
+		return
+	}
+	if src.Cube == "" {
+		c.JSON(400, gin.H{"error": "products " + ds + " has no cube"})
+		return
+	}
+
+	productNameRef := src.FieldRefs["product_name"]
+	supplierNameRef := src.FieldRefs["supplier_name"]
+	if supplierNameRef == "" {
+		c.JSON(400, gin.H{"error": "supplier_name not mapped for " + ds})
+		return
+	}
+	if productNameRef == "" {
+		c.JSON(400, gin.H{"error": "product_name not mapped for " + ds})
+		return
+	}
+
+	// 业务字段 → 物理 measures/dimensions
+	//   dimensions 用 product_name + supplier_name (按 product 粒度取, 再 distinct supplier)
+	measures := []string{}
+	dimensions := []string{}
+	for _, bf := range []string{"product_name", "supplier_name"} {
+		ref, ok := src.FieldRefs[bf]
+		if !ok || ref == "" {
+			continue
+		}
+		if ent.Fields[bf].Type == business.FieldTypeMeasure {
+			measures = append(measures, ref)
+		} else {
+			dimensions = append(dimensions, ref)
+		}
+	}
+	if len(dimensions) == 0 {
+		c.JSON(400, gin.H{"error": "no dimensions resolved for brand query (datasource " + ds + ")"})
+		return
+	}
+
+	// 按 product_name contains XXX 过滤
+	//   注意: agent 数据里 brand 字段经常是空的,所以"按品牌反查"实际语义是
+	//         "商品名包含这个关键词的产品归属于哪些供应商"
+	//   t_bd_item_info cube SQL 已加 supcust_flag='1' 过滤,排除客户
+	filters := []map[string]any{
+		{"member": productNameRef, "operator": "contains", "values": []string{brand}},
+	}
+
+	rows, err := h.Agent.Execute(src.Cube, measures, dimensions, filters, []string{"sup_only"}, limit)
+	if err != nil {
+		c.JSON(500, gin.H{"error": "agent query: " + err.Error()})
+		return
+	}
+
+	// 内存聚合: supplier -> distinct products -> count
+	type supplierAgg struct {
+		Products map[string]struct{}
+		Count    int
+	}
+	agg := make(map[string]*supplierAgg)
+	for _, r := range rows {
+		supplier := asAnyString(r[supplierNameRef])
+		if supplier == "" {
+			continue
+		}
+		product := asAnyString(r[productNameRef])
+		a, ok := agg[supplier]
+		if !ok {
+			a = &supplierAgg{Products: make(map[string]struct{})}
+			agg[supplier] = a
+		}
+		if product != "" {
+			if _, exists := a.Products[product]; !exists {
+				a.Products[product] = struct{}{}
+				a.Count++
+			}
+		}
+	}
+
+	// 转 list, 按 product_count 降序
+	out := make([]gin.H, 0, len(agg))
+	for name, a := range agg {
+		out = append(out, gin.H{
+			"supplier_name": name,
+			"product_count": a.Count,
+		})
+	}
+	sort.Slice(out, func(i, j int) bool {
+		ci, _ := out[i]["product_count"].(int)
+		cj, _ := out[j]["product_count"].(int)
+		if ci != cj {
+			return ci > cj
+		}
+		return out[i]["supplier_name"].(string) < out[j]["supplier_name"].(string)
+	})
+
+	c.JSON(200, gin.H{
+		"brand":      brand,
+		"datasource": ds,
+		"suppliers":  out,
+		"count":      len(out),
+	})
 }
 
 // ============== Templates ==============
@@ -211,8 +429,8 @@ func (h *Handler) Rematch(c *gin.Context) {
 		return
 	}
 
-	// 加载新 supplier 的 SKU
-	skus, err := h.Agent.LoadSupplierSkus(supplier, 5000)
+	// 加载新 supplier 的 SKU(走业务层,business mapping 翻译)
+	skus, err := h.loadSupplierSkusBiz(supplier, 5000)
 	if err != nil {
 		c.JSON(500, gin.H{"error": "加载 SKU 失败: " + err.Error()})
 		return
@@ -519,3 +737,316 @@ func (s *stringBuilder) WriteString(str string) {
 	s.buf = append(s.buf, str...)
 }
 func (s *stringBuilder) String() string { return string(s.buf) }
+
+// ============== 数据源切换 (unified cube) ==============
+
+// GetDataSource GET /api/v1/datasource
+//   返回当前数据源名(erp / hbpos)
+func (h *Handler) GetDataSource(c *gin.Context) {
+	if h.Agent == nil {
+		c.JSON(503, gin.H{"error": "agent client not configured"})
+		return
+	}
+	c.JSON(200, gin.H{
+		"datasource": h.Agent.GetDataSource(),
+	})
+}
+
+// SetDataSource POST /api/v1/datasource
+//   body: {"datasource": "erp" | "hbpos"}
+//   切换 agent client 的数据源(下次 /v1/load 自动用新 ds)
+func (h *Handler) SetDataSource(c *gin.Context) {
+	if h.Agent == nil {
+		c.JSON(503, gin.H{"error": "agent client not configured"})
+		return
+	}
+	var body struct {
+		DataSource string `json:"datasource"`
+	}
+	if err := c.BindJSON(&body); err != nil {
+		c.JSON(400, gin.H{"error": "invalid body: " + err.Error()})
+		return
+	}
+	ds := strings.ToLower(strings.TrimSpace(body.DataSource))
+	if ds == "" {
+		// 允许空 = 重置默认
+		ds = "erp"
+	}
+	if ds != "erp" && ds != "hbpos" {
+		c.JSON(400, gin.H{
+			"error": "datasource must be 'erp' or 'hbpos'",
+			"got":   body.DataSource,
+		})
+		return
+	}
+	h.Agent.SetDataSource(ds)
+	c.JSON(200, gin.H{
+		"datasource": ds,
+		"status":     "ok",
+	})
+}
+
+// ============== 业务层(业务字段 ↔ 物理字段 翻译) ==============
+
+// loadSupplierSkusBiz 用 business mapping 翻译
+//   前端/parser 给业务字段名(supplier_name, barcode, ...)
+//   内部翻译为物理字段,调 agent,响应再翻回业务字段名
+//   返回 []model.SkuRecord 业务字段模型(供 SkuMatcher 用)
+func (h *Handler) loadSupplierSkusBiz(supplierKeyword string, limit int) ([]model.SkuRecord, error) {
+	if h.BusinessReg == nil {
+		return nil, fmt.Errorf("business registry not configured")
+	}
+	ds := h.Agent.GetDataSource()
+	ent, ok := h.BusinessReg.Get("products")
+	if !ok {
+		return nil, fmt.Errorf("products entity not found")
+	}
+	src, ok := ent.Sources[ds]
+	if !ok {
+		return nil, fmt.Errorf("products entity has no mapping for datasource %s", ds)
+	}
+	// 业务字段清单(只取该 ds 支持的)
+	bizFields := []string{"barcode", "product_name", "supplier_id", "supplier_name", "category", "brand", "stock_qty"}
+	// 物理字段清单
+	measures := []string{}
+	dimensions := []string{}
+	for _, bf := range bizFields {
+		ref, ok := src.FieldRefs[bf]
+		if !ok || ref == "" {
+			continue
+		}
+		if ent.Fields[bf].Type == business.FieldTypeMeasure {
+			measures = append(measures, ref)
+		} else {
+			dimensions = append(dimensions, ref)
+		}
+	}
+	// supplier_name filter
+	supplierNameRef := src.FieldRefs["supplier_name"]
+	if supplierNameRef == "" {
+		return nil, fmt.Errorf("supplier_name not mapped for datasource %s", ds)
+	}
+	// 多关键词
+	keywords := splitAndTrim(supplierKeyword, ";,\n\r\t ")
+	if len(keywords) == 0 {
+		return nil, fmt.Errorf("supplier keyword empty")
+	}
+	seen := make(map[string]struct{})
+	var merged []model.SkuRecord
+	for _, kw := range keywords {
+		filters := []map[string]any{
+			{"member": supplierNameRef, "operator": "contains", "values": []string{kw}},
+		}
+		rows, err := h.Agent.Execute(src.Cube, measures, dimensions, filters, []string{"sup_only"}, limit)
+		if err != nil {
+			return nil, err
+		}
+		// 翻回业务字段名
+		bizRows, err := h.BusinessReg.ToBusinessResponse("products", ds, rows, bizFields)
+		if err != nil {
+			return nil, err
+		}
+		for _, br := range bizRows {
+			r := mapToSkuRecord(br)
+			if r.Barcode == "" && r.Name == "" {
+				continue
+			}
+			key := ""
+			if r.Barcode != "" {
+				key = "bc:" + r.Barcode
+			} else {
+				key = "sn:" + r.MainSuppName + "|" + r.Name
+			}
+			if _, ok := seen[key]; !ok {
+				seen[key] = struct{}{}
+				merged = append(merged, r)
+			}
+		}
+	}
+	return merged, nil
+}
+
+// mapToSkuRecord 业务字段 map → model.SkuRecord
+func mapToSkuRecord(br map[string]any) model.SkuRecord {
+	r := model.SkuRecord{
+		Barcode:      asAnyString(br["barcode"]),
+		Name:         asAnyString(br["product_name"]),
+		MainSuppId:   asAnyString(br["supplier_id"]),
+		MainSuppName: asAnyString(br["supplier_name"]),
+		// SrcSheet 暂存 category(原有 model 字段复用)
+		SrcSheet: asAnyString(br["category"]),
+		StockQty: asAnyFloat(br["stock_qty"]),
+	}
+	return r
+}
+
+func asAnyString(v any) string {
+	if v == nil {
+		return ""
+	}
+	if s, ok := v.(string); ok {
+		return s
+	}
+	return fmt.Sprintf("%v", v)
+}
+
+func asAnyFloat(v any) *float64 {
+	if v == nil {
+		return nil
+	}
+	var f float64
+	switch x := v.(type) {
+	case float64:
+		f = x
+	case float32:
+		f = float64(x)
+	case int:
+		f = float64(x)
+	case int64:
+		f = float64(x)
+	case string:
+		if _, err := fmt.Sscanf(x, "%f", &f); err != nil {
+			return nil
+		}
+	default:
+		if _, err := fmt.Sscanf(fmt.Sprintf("%v", v), "%f", &f); err != nil {
+			return nil
+		}
+	}
+	return &f
+}
+
+// splitAndTrim 按多个分隔符切字符串并去重 trim
+func splitAndTrim(s string, seps string) []string {
+	parts := strings.FieldsFunc(s, func(r rune) bool {
+		for _, s := range seps {
+			if r == s {
+				return true
+			}
+		}
+		return false
+	})
+	seen := make(map[string]struct{})
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		if _, ok := seen[p]; ok {
+			continue
+		}
+		seen[p] = struct{}{}
+		out = append(out, p)
+	}
+	return out
+}
+
+// ============== 业务 API(供前端直接调用) ==============
+
+// ListDatasources GET /api/v1/datasources
+//   返回 collect-ai 当前支持的所有 (entity, datasource) 组合
+//   供前端做数据源选择下拉
+func (h *Handler) ListDatasources(c *gin.Context) {
+	if h.BusinessReg == nil {
+		c.JSON(500, gin.H{"error": "business registry not configured"})
+		return
+	}
+	out := []gin.H{}
+	for _, entName := range h.BusinessReg.List() {
+		ent, _ := h.BusinessReg.Get(entName)
+		dsList := h.BusinessReg.AvailableDataSources(entName)
+		fields := h.BusinessReg.AvailableFields(entName)
+		out = append(out, gin.H{
+			"entity":        entName,
+			"description":   ent.Description,
+			"datasources":   dsList,
+			"fields":        fields,
+		})
+	}
+	c.JSON(200, gin.H{
+		"entities":      out,
+		"current_ds":    h.Agent.GetDataSource(),
+	})
+}
+
+// SearchProducts GET /api/v1/products/search?datasource=xxx&supplier=xxx&limit=100
+//   业务字段查询(前端直接调)
+//   业务字段:barcode/product_name/supplier_id/supplier_name/category/brand/stock_qty
+func (h *Handler) SearchProducts(c *gin.Context) {
+	if err := h.Agent.Ping(); err != nil {
+		c.JSON(503, gin.H{"error": "agent 不可达: " + err.Error()})
+		return
+	}
+	if h.BusinessReg == nil {
+		c.JSON(500, gin.H{"error": "business registry not configured"})
+		return
+	}
+	ds := c.Query("datasource")
+	if ds == "" {
+		ds = h.Agent.GetDataSource()
+	}
+	supplier := c.Query("supplier")
+	limit, _ := strconv.Atoi(c.Query("limit"))
+	if limit == 0 {
+		limit = 100
+	}
+
+	// 业务字段 → 物理 query
+	ent, ok := h.BusinessReg.Get("products")
+	if !ok {
+		c.JSON(500, gin.H{"error": "products entity not found"})
+		return
+	}
+	src, ok := ent.Sources[ds]
+	if !ok {
+		c.JSON(400, gin.H{"error": "products entity has no mapping for datasource " + ds})
+		return
+	}
+	if src.Cube == "" {
+		c.JSON(400, gin.H{"error": "products " + ds + " has no cube"})
+		return
+	}
+
+	// 默认拉所有可用业务字段
+	bizFields := []string{"barcode", "product_name", "supplier_id", "supplier_name", "category", "brand", "stock_qty"}
+	measures := []string{}
+	dimensions := []string{}
+	for _, bf := range bizFields {
+		ref, ok := src.FieldRefs[bf]
+		if !ok || ref == "" {
+			continue
+		}
+		if ent.Fields[bf].Type == business.FieldTypeMeasure {
+			measures = append(measures, ref)
+		} else {
+			dimensions = append(dimensions, ref)
+		}
+	}
+	filters := []map[string]any{}
+	if supplier != "" {
+		supplierNameRef := src.FieldRefs["supplier_name"]
+		if supplierNameRef != "" {
+			filters = append(filters, map[string]any{
+				"member": supplierNameRef, "operator": "contains", "values": []string{supplier},
+			})
+		}
+	}
+
+	rows, err := h.Agent.Execute(src.Cube, measures, dimensions, filters, []string{"sup_only"}, limit)
+	if err != nil {
+		c.JSON(500, gin.H{"error": "agent query: " + err.Error()})
+		return
+	}
+	bizRows, err := h.BusinessReg.ToBusinessResponse("products", ds, rows, bizFields)
+	if err != nil {
+		c.JSON(500, gin.H{"error": "translate response: " + err.Error()})
+		return
+	}
+	c.JSON(200, gin.H{
+		"products":   bizRows,
+		"count":      len(bizRows),
+		"datasource": ds,
+		"cube":       src.Cube,
+	})
+}

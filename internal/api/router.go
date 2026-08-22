@@ -43,6 +43,7 @@ func NewRouter(h *handler.Handler, cfg *config.Config) *gin.Engine {
 
 		// suppliers
 		api.GET("/suppliers", h.ListSuppliers)
+		api.GET("/suppliers/by-brand", h.ListSuppliersByBrand)
 
 		// templates
 		api.GET("/templates", h.ListTemplates)         // 飞书: 只看 purchase + default
@@ -68,6 +69,18 @@ func NewRouter(h *handler.Handler, cfg *config.Config) *gin.Engine {
 		api.GET("/sessions/:id/export", h.ExportSession)
 		api.PUT("/sessions/:id/rows/:rowId", h.UpdateRow)
 		api.DELETE("/sessions/:id/rows/:rowId", h.DeleteRow)
+
+		// 数据源切换(unified cube)
+		//   GET  /datasource              → 当前数据源
+		//   POST /datasource {name:"..."} → 切换数据源
+		api.GET("/datasource", h.GetDataSource)
+		api.POST("/datasource", h.SetDataSource)
+
+		// 业务层 API
+		//   GET  /datasources                   → 列出所有 (entity, datasource) 组合
+		//   GET  /products/search?datasource=&supplier=&limit= → 业务字段名商品搜索
+		api.GET("/datasources", h.ListDatasources)
+		api.GET("/products/search", h.SearchProducts)
 	}
 
 	r.GET("/", func(c *gin.Context) {

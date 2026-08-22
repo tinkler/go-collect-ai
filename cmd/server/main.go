@@ -11,6 +11,7 @@ import (
 
 	"github.com/tinkler/collect-ai/internal/api"
 	"github.com/tinkler/collect-ai/internal/api/handler"
+	"github.com/tinkler/collect-ai/internal/business"
 	"github.com/tinkler/collect-ai/internal/config"
 	"github.com/tinkler/collect-ai/internal/parser"
 	"github.com/tinkler/collect-ai/internal/parser/agent"
@@ -55,7 +56,8 @@ func main() {
 
 	ocrClient := bigmodel.NewOcrClient(cfg.BigModelAPIKey, cfg.BigModelBase, cfg.OcrTimeoutSec)
 	llmClient := bigmodel.NewLlmClient(cfg.BigModelAPIKey, cfg.BigModelBase, cfg.LlmTimeoutSec)
-	agentClient := agent.NewClient(cfg.AgentURL, cfg.AgentToken, 30)
+	agentClient := agent.NewClient(cfg.AgentURL, cfg.AgentToken, 30, cfg.DataSource)
+	businessReg := business.NewDefaultRegistry()
 
 	psr := parser.New(ocrClient, llmClient, agentClient)
 
@@ -65,6 +67,7 @@ func main() {
 		MaxUpload:        int64(cfg.MaxUploadMB) * 1024 * 1024,
 		Parser:           psr,
 		Agent:            agentClient,
+		BusinessReg:      businessReg,
 		Sessions:         sessionRepo,
 		Templates:        templateRepo,
 		FuzzyDistance:    cfg.FuzzyDistance,
