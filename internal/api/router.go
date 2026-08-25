@@ -10,9 +10,10 @@ import (
 	"github.com/tinkler/collect-ai/internal/api/handler"
 	"github.com/tinkler/collect-ai/internal/api/middleware"
 	"github.com/tinkler/collect-ai/internal/config"
+	"github.com/tinkler/collect-ai/internal/restock"
 )
 
-func NewRouter(h *handler.Handler, cfg *config.Config) *gin.Engine {
+func NewRouter(h *handler.Handler, cfg *config.Config, restockH *restock.CallbackHandler, restockSvc *restock.Service) *gin.Engine {
 	r := gin.New()
 	r.Use(gin.Recovery(), gin.Logger())
 
@@ -81,6 +82,22 @@ func NewRouter(h *handler.Handler, cfg *config.Config) *gin.Engine {
 		//   GET  /products/search?datasource=&supplier=&limit= → 业务字段名商品搜索
 		api.GET("/datasources", h.ListDatasources)
 		api.GET("/products/search", h.SearchProducts)
+
+		// ============== restock 模块 ==============
+		// 管理类(GET 列表 / POST 手动触发)
+		api.GET("/restock/tasks", restock.RestockTasksList(restockSvc))
+		api.GET("/restock/need-purchase", restock.RestockNeedPurchaseList(restockSvc))
+		api.POST("/restock/cron/tick", restock.RestockManualTick(restockSvc))
+		api.GET("/restock/llm/plan", restock.RestockLlmPlanNow(restockSvc))
+	}
+
+	// ============== 企微回调(不走 /api/v1 前缀,企微后台固定) ==============
+	if restockH != nil {
+		wecom := r.Group("/wecom")
+		{
+			wecom.GET("/callback", restockH.VerifyURL)
+			wecom.POST("/callback", restockH.OnEvent)
+		}
 	}
 
 	r.GET("/", func(c *gin.Context) {

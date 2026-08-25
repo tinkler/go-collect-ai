@@ -60,6 +60,53 @@ type Config struct {
 	// 并发限流
 	MaxConcurrentParse int `mapstructure:"MAX_CONCURRENT_PARSE"` // 解析并发上限 (0=不限流, 默认 4)
 	RateLimitWaitSec   int `mapstructure:"RATE_LIMIT_WAIT_SEC"`  // 客户端等待 semaphore 超时 (默认 30)
+
+	// ============== 补货模块 (restock) ==============
+	// 触发 / 水位
+	RestockBranchNo       string  `mapstructure:"RESTOCK_BRANCH_NO"`
+	RestockROPFactor      float64 `mapstructure:"RESTOCK_ROP_FACTOR"`
+	RestockOUTDays        int     `mapstructure:"RESTOCK_OUT_DAYS"`
+	RestockOUTPromoBoost  float64 `mapstructure:"RESTOCK_OUT_PROMO_BOOST"`
+	RestockSafetyMin      int     `mapstructure:"RESTOCK_SAFETY_MIN"`
+	RestockWYesterday     float64 `mapstructure:"RESTOCK_DAILY_AVG_W_OLD"`
+	RestockWSevenDay      float64 `mapstructure:"RESTOCK_DAILY_AVG_W_7D"`
+	RestockWThirtyDay     float64 `mapstructure:"RESTOCK_DAILY_AVG_W_30D"`
+
+	// 节流
+	RestockFloorMinIntervalMin int `mapstructure:"RESTOCK_PUSH_FLOOR_MIN_INTERVAL_MIN"`
+	RestockOfficeP0MinMin      int `mapstructure:"RESTOCK_PUSH_OFFICE_P0_MIN_MIN"`
+	RestockOfficeP1MinMin      int `mapstructure:"RESTOCK_PUSH_OFFICE_P1_MIN_MIN"`
+	RestockOfficeP2MinMin      int `mapstructure:"RESTOCK_PUSH_OFFICE_P2_MIN_MIN"`
+	RestockMaxPushPerTick      int `mapstructure:"RESTOCK_MAX_PUSH_PER_TICK"`
+
+	// 静默升级
+	RestockEscalateP2ToP1Hours int `mapstructure:"RESTOCK_ESCALATE_P2_TO_P1_HOURS"`
+	RestockEscalateP1ToP0Hours int `mapstructure:"RESTOCK_ESCALATE_P1_TO_P0_HOURS"`
+
+	// cron
+	RestockHourlyCron    string `mapstructure:"RESTOCK_CRON_HOURLY"`
+	RestockAggregateCron string `mapstructure:"RESTOCK_CRON_AGGREGATE"`
+	RestockLlmPlanCron   string `mapstructure:"RESTOCK_CRON_LLM_PLAN"`
+
+	// cube 名(env 覆盖,空 = 用默认)
+	RestockCubeSales     string `mapstructure:"RESTOCK_CUBE_SALES"`
+	RestockCubeInventory string `mapstructure:"RESTOCK_CUBE_INVENTORY"`
+	RestockCubePromotion string `mapstructure:"RESTOCK_CUBE_PROMOTION"`
+
+	// LLM
+	RestockLLMEnabled     bool `mapstructure:"RESTOCK_LLM_ENABLED"`
+	RestockLLMPlanEnabled bool `mapstructure:"RESTOCK_LLM_PLAN_ENABLED"`
+	RestockLLMModel       string `mapstructure:"RESTOCK_LLM_MODEL"`
+	RestockLLMPlanCacheHrs int `mapstructure:"RESTOCK_LLM_PLAN_CACHE_HRS"`
+
+	// 企微智能机器人
+	WeComCorpID          string `mapstructure:"WECOM_CORP_ID"`
+	WeComAgentID         string `mapstructure:"WECOM_AGENT_ID"`
+	WeComAgentSecret     string `mapstructure:"WECOM_AGENT_SECRET"`
+	WeComCallbackToken   string `mapstructure:"WECOM_CALLBACK_TOKEN"`
+	WeComCallbackAES     string `mapstructure:"WECOM_CALLBACK_AES_KEY"`
+	WeComFloorChatID     string `mapstructure:"WECOM_FLOOR_CHAT_ID"`
+	WeComOfficeChatID    string `mapstructure:"WECOM_OFFICE_CHAT_ID"`
 }
 
 // leaves 列出所有需要 BindEnv 的叶子 key
@@ -72,6 +119,21 @@ var leaves = []string{
 	"AGENT_URL", "AGENT_TOKEN", "DATA_SOURCE",
 	"OCR_TIMEOUT_SEC", "LLM_TIMEOUT_SEC", "USE_LLM", "FUZZY_DISTANCE",
 	"MAX_CONCURRENT_PARSE", "RATE_LIMIT_WAIT_SEC",
+
+	// restock
+	"RESTOCK_BRANCH_NO",
+	"RESTOCK_ROP_FACTOR", "RESTOCK_OUT_DAYS", "RESTOCK_OUT_PROMO_BOOST", "RESTOCK_SAFETY_MIN",
+	"RESTOCK_DAILY_AVG_W_OLD", "RESTOCK_DAILY_AVG_W_7D", "RESTOCK_DAILY_AVG_W_30D",
+	"RESTOCK_PUSH_FLOOR_MIN_INTERVAL_MIN", "RESTOCK_PUSH_OFFICE_P0_MIN_MIN",
+	"RESTOCK_PUSH_OFFICE_P1_MIN_MIN", "RESTOCK_PUSH_OFFICE_P2_MIN_MIN",
+	"RESTOCK_MAX_PUSH_PER_TICK",
+	"RESTOCK_ESCALATE_P2_TO_P1_HOURS", "RESTOCK_ESCALATE_P1_TO_P0_HOURS",
+	"RESTOCK_CRON_HOURLY", "RESTOCK_CRON_AGGREGATE", "RESTOCK_CRON_LLM_PLAN",
+	"RESTOCK_CUBE_SALES", "RESTOCK_CUBE_INVENTORY", "RESTOCK_CUBE_PROMOTION",
+	"RESTOCK_LLM_ENABLED", "RESTOCK_LLM_PLAN_ENABLED", "RESTOCK_LLM_MODEL", "RESTOCK_LLM_PLAN_CACHE_HRS",
+	"WECOM_CORP_ID", "WECOM_AGENT_ID", "WECOM_AGENT_SECRET",
+	"WECOM_CALLBACK_TOKEN", "WECOM_CALLBACK_AES_KEY",
+	"WECOM_FLOOR_CHAT_ID", "WECOM_OFFICE_CHAT_ID",
 }
 
 // Load 加载配置
@@ -147,6 +209,40 @@ func Load() (*Config, error) {
 
 	v.SetDefault("MAX_CONCURRENT_PARSE", 4)
 	v.SetDefault("RATE_LIMIT_WAIT_SEC", 30)
+
+	// restock 默认值
+	v.SetDefault("RESTOCK_BRANCH_NO", "")
+	v.SetDefault("RESTOCK_ROP_FACTOR", 1.5)
+	v.SetDefault("RESTOCK_OUT_DAYS", 7)
+	v.SetDefault("RESTOCK_OUT_PROMO_BOOST", 1.3)
+	v.SetDefault("RESTOCK_SAFETY_MIN", 5)
+	v.SetDefault("RESTOCK_DAILY_AVG_W_OLD", 0.4)
+	v.SetDefault("RESTOCK_DAILY_AVG_W_7D", 0.4)
+	v.SetDefault("RESTOCK_DAILY_AVG_W_30D", 0.2)
+	v.SetDefault("RESTOCK_PUSH_FLOOR_MIN_INTERVAL_MIN", 30)
+	v.SetDefault("RESTOCK_PUSH_OFFICE_P0_MIN_MIN", 15)
+	v.SetDefault("RESTOCK_PUSH_OFFICE_P1_MIN_MIN", 60)
+	v.SetDefault("RESTOCK_PUSH_OFFICE_P2_MIN_MIN", 360)
+	v.SetDefault("RESTOCK_MAX_PUSH_PER_TICK", 20)
+	v.SetDefault("RESTOCK_ESCALATE_P2_TO_P1_HOURS", 24)
+	v.SetDefault("RESTOCK_ESCALATE_P1_TO_P0_HOURS", 12)
+	v.SetDefault("RESTOCK_CRON_HOURLY", "0 7-21 * * *")
+	v.SetDefault("RESTOCK_CRON_AGGREGATE", "0 30 21 * * *")
+	v.SetDefault("RESTOCK_CRON_LLM_PLAN", "0 0 1,7,13,19 * * *")
+	v.SetDefault("RESTOCK_CUBE_SALES", "sales_yesterday")
+	v.SetDefault("RESTOCK_CUBE_INVENTORY", "inventory_current")
+	v.SetDefault("RESTOCK_CUBE_PROMOTION", "promotion_plan_7d")
+	v.SetDefault("RESTOCK_LLM_ENABLED", true)
+	v.SetDefault("RESTOCK_LLM_PLAN_ENABLED", true)
+	v.SetDefault("RESTOCK_LLM_MODEL", "glm-4-flash")
+	v.SetDefault("RESTOCK_LLM_PLAN_CACHE_HRS", 6)
+	v.SetDefault("WECOM_CORP_ID", "")
+	v.SetDefault("WECOM_AGENT_ID", "")
+	v.SetDefault("WECOM_AGENT_SECRET", "")
+	v.SetDefault("WECOM_CALLBACK_TOKEN", "")
+	v.SetDefault("WECOM_CALLBACK_AES_KEY", "")
+	v.SetDefault("WECOM_FLOOR_CHAT_ID", "")
+	v.SetDefault("WECOM_OFFICE_CHAT_ID", "")
 
 	cfg := &Config{}
 	if err := v.Unmarshal(cfg); err != nil {

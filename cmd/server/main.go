@@ -16,6 +16,7 @@ import (
 	"github.com/tinkler/collect-ai/internal/parser"
 	"github.com/tinkler/collect-ai/internal/parser/agent"
 	"github.com/tinkler/collect-ai/internal/parser/bigmodel"
+	"github.com/tinkler/collect-ai/internal/restock"
 	"github.com/tinkler/collect-ai/internal/store"
 	"github.com/gin-gonic/gin"
 )
@@ -78,7 +79,58 @@ func main() {
 	}
 
 	gin.SetMode(gin.ReleaseMode)
-	r := api.NewRouter(h, cfg)
+
+	// ============== restock 模块启动 ==============
+	restockCfg := &restock.RestockConfig{
+		BranchNo:               cfg.RestockBranchNo,
+		HourlyCron:             cfg.RestockHourlyCron,
+		AggregateCron:          cfg.RestockAggregateCron,
+		LlmPlanCron:            cfg.RestockLlmPlanCron,
+		MaxPushPerTick:         cfg.RestockMaxPushPerTick,
+		ROPFactor:              cfg.RestockROPFactor,
+		OUTDays:                cfg.RestockOUTDays,
+		OUTPromoBoost:          cfg.RestockOUTPromoBoost,
+		SafetyMin:              cfg.RestockSafetyMin,
+		WYesterday:             cfg.RestockWYesterday,
+		WSevenDay:              cfg.RestockWSevenDay,
+		WThirtyDay:             cfg.RestockWThirtyDay,
+		FloorMinIntervalMin:    cfg.RestockFloorMinIntervalMin,
+		OfficeP0MinMin:         cfg.RestockOfficeP0MinMin,
+		OfficeP1MinMin:         cfg.RestockOfficeP1MinMin,
+		OfficeP2MinMin:         cfg.RestockOfficeP2MinMin,
+		EscalateP2ToP1Hours:    cfg.RestockEscalateP2ToP1Hours,
+		EscalateP1ToP0Hours:    cfg.RestockEscalateP1ToP0Hours,
+		CubeSales:              cfg.RestockCubeSales,
+		CubeInventory:          cfg.RestockCubeInventory,
+		CubePromotion:          cfg.RestockCubePromotion,
+		LLMEnabled:             cfg.RestockLLMEnabled,
+		LLMPlanEnabled:         cfg.RestockLLMPlanEnabled,
+		LLMModel:               cfg.RestockLLMModel,
+		LLMPlanCacheHrs:        cfg.RestockLLMPlanCacheHrs,
+		WeComCorpID:            cfg.WeComCorpID,
+		WeComAgentID:           cfg.WeComAgentID,
+		WeComAgentSecret:       cfg.WeComAgentSecret,
+		WeComCallbackToken:     cfg.WeComCallbackToken,
+		WeComCallbackAES:       cfg.WeComCallbackAES,
+		WeComFloorChatID:       cfg.WeComFloorChatID,
+		WeComOfficeChatID:      cfg.WeComOfficeChatID,
+	}
+	restockCube := restock.NewCubeQuerier(agentClient, restockCfg)
+	restockLLM := restock.NewLlmPlanner(llmClient, cfg.RestockLLMModel, cfg.RestockLLMPlanEnabled, cfg.RestockLLMPlanCacheHrs)
+	restockWeCom := restock.NewWeCom(restockCfg)
+	restockSvc := restock.NewService(restockCfg, pool, restockCube, restockLLM, restockWeCom)
+
+	if cfg.RestockBranchNo != "" {
+		if err := restockSvc.Start(); err != nil {
+			log.Printf("[main] restock cron start failed: %v (继续运行,restock 不可用)", err)
+		}
+	} else {
+		log.Printf("[main] RESTOCK_BRANCH_NO 未配置,restock 模块不启动")
+	}
+
+	restockCallback := &restock.CallbackHandler{WeCom: restockWeCom, Store: restockSvc.Store}
+
+	r := api.NewRouter(h, cfg, restockCallback, restockSvc)
 	log.Printf("[main] 限流: max_concurrent_parse=%d, wait_sec=%d", cfg.MaxConcurrentParse, cfg.RateLimitWaitSec)
 
 	srv := &http.Server{
@@ -103,4 +155,7 @@ func main() {
 	if err := srv.Shutdown(shutdownCtx); err != nil {
 		log.Printf("shutdown: %v", err)
 	}
+
+	// 停 restock cron
+	restockSvc.Stop()
 }
