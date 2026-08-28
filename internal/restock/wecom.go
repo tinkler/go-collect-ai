@@ -54,9 +54,9 @@ type WeCom struct {
 	connected bool
 
 	// 事件回调(由 service.go 注册)
-	OnButtonClick func(chatID, userID, taskID, eventKey string) // 按钮点击
-	OnMessage     func(chatID, userID, text string)             // 文本消息(用于自动发现)
-	OnConnect     func()                                        // 连接成功
+	OnButtonClick func(reqID, chatID, userID, taskID, eventKey string) // 按钮点击(req_id 用于回发 update 帧)
+	OnMessage     func(chatID, userID, text string)                    // 文本消息(用于自动发现)
+	OnConnect     func()                                               // 连接成功
 
 	// 内部
 	stopCh   chan struct{}
@@ -538,7 +538,14 @@ func (w *WeCom) handleEvent(f *ChatFrame) {
 		log.Printf("[wecom] button click: chat=%s user=%s key=%s -> kind=%s task=%s",
 			f.Body.ChatID, f.Body.From.UserID, ev.EventKey, kind, taskID)
 		if w.OnButtonClick != nil && taskID != "" {
-			w.OnButtonClick(f.Body.ChatID, f.Body.From.UserID, taskID, ev.EventKey)
+			// 透传 req_id(从 frame header 拿),让 service.go 能回发 aibot_respond_update_msg
+			reqID := ""
+			if f.Headers != nil {
+				if v, ok := f.Headers["req_id"].(string); ok {
+					reqID = v
+				}
+			}
+			w.OnButtonClick(reqID, f.Body.ChatID, f.Body.From.UserID, taskID, ev.EventKey)
 		}
 	case "enter_chat":
 		log.Printf("[wecom] user entered chat: user=%s", f.Body.From.UserID)
@@ -579,6 +586,35 @@ func (w *WeCom) recordChat(chatID string) {
 // =====================================================================
 // 发消息
 // =====================================================================
+
+// SendUpdateCard 员工点完按钮后,长连接回发 aibot_respond_update_msg 帧
+//   reqID: 原 callback event 的 req_id(必须透传,5 秒内回复)
+//   cardBody: 完整 template_card JSON(与 RenderFloorCard 兼容,msgtype=template_card + template_card={...})
+//   注意: body 不需要 chatid, 也不需要 msgtype 字段, 只放 response_type + template_card
+func (w *WeCom) SendUpdateCard(ctx context.Context, reqID string, cardBody []byte) error {
+	var card map[string]any
+	if err := json.Unmarshal(cardBody, &card); err != nil {
+		return fmt.Errorf("update card body not JSON: %w", err)
+	}
+	// 抽掉 msgtype 顶层(它属于 aibot_send_msg,update 不需要)
+	delete(card, "msgtype")
+	tplCard, ok := card["template_card"].(map[string]any)
+	if !ok {
+		return fmt.Errorf("template_card missing in update body")
+	}
+
+	frame := map[string]any{
+		"cmd": "aibot_respond_update_msg",
+		"headers": map[string]any{
+			"req_id": reqID,
+		},
+		"body": map[string]any{
+			"response_type":  "update_template_card",
+			"template_card":  tplCard,
+		},
+	}
+	return w.sendJSON(frame)
+}
 
 // SendAppChat 发消息到指定 chat_id(role 找 chat_id)
 //   role: "floor" / "office" / 任何已绑定的 chat_id
@@ -636,10 +672,17 @@ func (w *WeCom) resolveChatID(roleOrChatID string) string {
 // =====================================================================
 
 func (w *WeCom) bindingsFile() string {
-	if w.cfg.WeComBindFile != "" {
-		return w.cfg.WeComBindFile
+	// 智能 fallback: 如果 env 配的是 .json(老配置),自动改用 .yaml
+	// 避免新部署忘改 env 又踩坑
+	p := w.cfg.WeComBindFile
+	if p == "" {
+		return "./wecom_bindings.yaml"
 	}
-	return "./wecom_bindings.yaml"
+	if strings.HasSuffix(p, ".json") {
+		log.Printf("[wecom] WECOM_BIND_FILE=%s 是老格式,自动改用 .yaml", p)
+		return strings.TrimSuffix(p, ".json") + ".yaml"
+	}
+	return p
 }
 
 func (w *WeCom) loadBindings() {
@@ -703,7 +746,7 @@ func (w *WeCom) saveBindings() error {
 			FirstSeen: seen,
 		})
 	}
-	w.mu.Unlock()
+	w.mu.RUnlock()
 
 	// 头部加注释(让用户知道这是自动生成的)
 	header := []byte("# wecom_bindings.yaml - 自动生成,手编后会被覆盖\n# role: floor | office | (空)\n# 手动改后请通过 POST /api/v1/restock/wecom/chats/bind 写回\n")

@@ -1,6 +1,10 @@
 package restock
 
-import "encoding/json"
+import (
+	"encoding/json"
+	"fmt"
+	"time"
+)
 
 // RenderFloorCard 卖场员工群卡片
 //
@@ -62,4 +66,43 @@ func itoa(n int) string {
 		buf[i] = '-'
 	}
 	return string(buf[i:])
+}
+
+// RenderFloorCardAfterConfirm 员工点完按钮后,卡片 in-place 更新为"无按钮的已确认状态"
+//   kind: "DONE" | "SHORT"
+//   用于 aibot_respond_update_msg 帧(5 秒内通过长连接回发)
+func RenderFloorCardAfterConfirm(sku *SkuSnapshot, qty int, kind string) []byte {
+	var title string
+	var desc string
+	switch kind {
+	case FeedbackDone:
+		title = "✅ 已补货"
+		desc = fmt.Sprintf("%s · 已确认", sku.ItemName)
+	case FeedbackShort:
+		title = "⚠️ 已上报缺货"
+		desc = fmt.Sprintf("%s · 等采购", sku.ItemName)
+	default:
+		title = "已处理"
+		desc = sku.ItemName
+	}
+
+	card := map[string]any{
+		"msgtype": "template_card",
+		"template_card": map[string]any{
+			"card_type": "text_notice", // 改成无按钮的纯通知卡
+			"source": map[string]any{
+				"desc": "商超 AI 机器人",
+			},
+			"main_title": map[string]any{
+				"title": title,
+				"desc":  desc,
+			},
+			"horizontal_content_list": []map[string]any{
+				{"keyname": "建议补货", "value": itoa(qty) + " 件"},
+				{"keyname": "处理时间", "value": time.Now().Format("15:04")},
+			},
+		},
+	}
+	bs, _ := json.Marshal(card)
+	return bs
 }

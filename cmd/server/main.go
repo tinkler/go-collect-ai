@@ -117,7 +117,7 @@ func main() {
 	restockWeCom := restock.NewWeCom(restockCfg)
 	restockSvc := restock.NewService(restockCfg, pool, restockCube, restockLLM, restockWeCom)
 
-	// 注册企微按钮点击回调 → 复用 Service.OnButtonClick(写 Feedback + 改状态)
+	// 注册企微按钮点击回调 → 复用 Service.OnButtonClick(写 Feedback + 改状态 + in-place 更新卡片)
 	restockWeCom.OnButtonClick = restockSvc.OnButtonClick
 	restockWeCom.OnMessage = func(chatID, userID, text string) {
 		log.Printf("[wecom] msg from chat=%s user=%s: %s", chatID, userID, text)

@@ -486,9 +486,9 @@ func (s *Service) pushOffice(ctx context.Context, event string, sku *SkuSnapshot
 	}
 }
 
-// OnButtonClick 企微按钮点击 → 写 Feedback + 改 task 状态
-//   供 wecom.OnButtonClick 注册使用
-func (s *Service) OnButtonClick(chatID, userID, taskID, eventKey string) {
+// OnButtonClick 企微按钮点击 → 写 Feedback + 改 task 状态 + in-place 更新卡片为"已确认"无按钮版
+//   reqID: 原 callback event 的 req_id,用于 aibot_respond_update_msg 帧(5 秒内)
+func (s *Service) OnButtonClick(reqID, chatID, userID, taskID, eventKey string) {
 	kind, realTaskID := parseButtonKey2(eventKey)
 	if kind == "" {
 		kind = FeedbackDone
@@ -499,6 +499,7 @@ func (s *Service) OnButtonClick(chatID, userID, taskID, eventKey string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
+	// 1) 写 Feedback
 	fb := &Feedback{
 		TaskID:       realTaskID,
 		FeedbackType: kind,
@@ -508,6 +509,8 @@ func (s *Service) OnButtonClick(chatID, userID, taskID, eventKey string) {
 	if err := s.Store.InsertFeedback(ctx, fb); err != nil {
 		log.Printf("[restock] insert feedback: %v", err)
 	}
+
+	// 2) 改 task 状态
 	status := TaskStatusAcked
 	if kind == FeedbackShort {
 		status = TaskStatusShort
@@ -515,6 +518,35 @@ func (s *Service) OnButtonClick(chatID, userID, taskID, eventKey string) {
 	_ = s.Store.UpdateStatus(ctx, realTaskID, status)
 	log.Printf("[restock] button click: chat=%s user=%s task=%s kind=%s",
 		chatID, userID, realTaskID, kind)
+
+	// 3) in-place 更新原卡片为"已确认"无按钮版(必须在 5 秒内)
+	if reqID == "" {
+		log.Printf("[restock] update card skipped: no req_id in callback")
+		return
+	}
+	go func() {
+		// 查 task 拿 item_name / suggest_qty 用于新卡片
+		task, err := s.Store.GetTask(ctx, realTaskID)
+		if err != nil || task == nil {
+			log.Printf("[restock] update card: task %s not found: %v", realTaskID, err)
+			return
+		}
+		sku := &SkuSnapshot{
+			BranchNo:  task.BranchNo,
+			ItemNo:    task.ItemNo,
+			ItemName:  task.ItemName,
+			Stock:     task.CurrentStock,
+			YesterdaySales: task.YesterdaySales,
+		}
+		newCard := RenderFloorCardAfterConfirm(sku, task.SuggestQty, kind)
+		updCtx, cancelUpd := context.WithTimeout(context.Background(), 4*time.Second)
+		defer cancelUpd()
+		if err := s.WeCom.SendUpdateCard(updCtx, reqID, newCard); err != nil {
+			log.Printf("[restock] update card failed: %v (req_id=%s)", err, reqID)
+			return
+		}
+		log.Printf("[restock] card updated to %s: task=%s", kind, realTaskID)
+	}()
 }
 
 // ============== HTTP Handlers (供 router 调用) ==============

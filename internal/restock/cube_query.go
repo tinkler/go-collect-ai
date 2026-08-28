@@ -31,6 +31,7 @@ func NewCubeQuerier(a *agent.Client, cfg *RestockConfig) *CubeQuerier {
 }
 
 // SalesYesterday 拉昨日 + 7日均 + 30日均销量
+//   适配 cube-agent-server 上 sales_yesterday cube
 //   返回: map[item_no] -> { YesterdaySales, SevenDayAvg, ThirtyDayAvg }
 func (q *CubeQuerier) SalesYesterday(ctx context.Context, branchNo string) (map[string]*SkuSnapshot, error) {
 	cube := q.cfg.CubeSales
@@ -38,10 +39,10 @@ func (q *CubeQuerier) SalesYesterday(ctx context.Context, branchNo string) (map[
 		cube = "sales_yesterday"
 	}
 	rows, err := q.agent.Execute(cube,
-		[]string{"sales.sale_qty_yesterday", "sales.sale_qty_7d_avg", "sales.sale_qty_30d_avg"},
-		[]string{"sales.item_no", "sales.item_name", "sales.barcode", "sales.supplier_name"},
+		[]string{"sales_yesterday.sale_qty_yesterday", "sales_yesterday.sale_qty_7d_avg", "sales_yesterday.sale_qty_30d_avg"},
+		[]string{"sales_yesterday.item_no", "sales_yesterday.item_name", "sales_yesterday.barcode", "sales_yesterday.supplier_name"},
 		[]map[string]any{
-			{"member": "sales.branch_no", "operator": "equals", "values": []string{branchNo}},
+			{"member": "sales_yesterday.branch_no", "operator": "equals", "values": []string{branchNo}},
 		},
 		nil, 5000)
 	if err != nil {
@@ -49,17 +50,24 @@ func (q *CubeQuerier) SalesYesterday(ctx context.Context, branchNo string) (map[
 	}
 	out := make(map[string]*SkuSnapshot, len(rows))
 	for _, r := range rows {
-		sku := rowToSnapshot(r, branchNo)
-		sku.YesterdaySales = asInt(r, "sales.sale_qty_yesterday")
-		sku.SevenDayAvg = asInt(r, "sales.sale_qty_7d_avg")
-		sku.ThirtyDayAvg = asInt(r, "sales.sale_qty_30d_avg")
+		sku := &SkuSnapshot{
+			BranchNo:       branchNo,
+			ItemNo:         asString(r, "sales_yesterday.item_no"),
+			ItemName:       asString(r, "sales_yesterday.item_name"),
+			Barcode:        asString(r, "sales_yesterday.barcode"),
+			SupplierName:   asString(r, "sales_yesterday.supplier_name"),
+			YesterdaySales: asInt(r, "sales_yesterday.sale_qty_yesterday"),
+			SevenDayAvg:    asInt(r, "sales_yesterday.sale_qty_7d_avg"),
+			ThirtyDayAvg:   asInt(r, "sales_yesterday.sale_qty_30d_avg"),
+		}
 		out[sku.ItemNo] = sku
 	}
-	log.Printf("[restock] sales_yesterday: %d items", len(out))
+	log.Printf("[restock] sales(%s): %d items, branch=%s", cube, len(out), branchNo)
 	return out, nil
 }
 
 // InventoryCurrent 拉当前库存
+//   适配 inventory_current cube
 //   返回: map[item_no] -> { Stock }
 func (q *CubeQuerier) InventoryCurrent(ctx context.Context, branchNo string) (map[string]int, error) {
 	cube := q.cfg.CubeInventory
@@ -67,10 +75,10 @@ func (q *CubeQuerier) InventoryCurrent(ctx context.Context, branchNo string) (ma
 		cube = "inventory_current"
 	}
 	rows, err := q.agent.Execute(cube,
-		[]string{"inventory.stock_qty"},
-		[]string{"inventory.item_no"},
+		[]string{"inventory_current.stock_qty"},
+		[]string{"inventory_current.item_no"},
 		[]map[string]any{
-			{"member": "inventory.branch_no", "operator": "equals", "values": []string{branchNo}},
+			{"member": "inventory_current.branch_no", "operator": "equals", "values": []string{branchNo}},
 		},
 		nil, 10000)
 	if err != nil {
@@ -78,27 +86,28 @@ func (q *CubeQuerier) InventoryCurrent(ctx context.Context, branchNo string) (ma
 	}
 	out := make(map[string]int, len(rows))
 	for _, r := range rows {
-		itemNo := asString(r, "inventory.item_no")
+		itemNo := asString(r, "inventory_current.item_no")
 		if itemNo == "" {
 			continue
 		}
-		out[itemNo] = asInt(r, "inventory.stock_qty")
+		out[itemNo] = asInt(r, "inventory_current.stock_qty")
 	}
-	log.Printf("[restock] inventory_current: %d items", len(out))
+	log.Printf("[restock] inventory(%s): %d items", cube, len(out))
 	return out, nil
 }
 
 // Promotion7d 拉未来 7 天促销计划(只关心哪些 item 有促销)
+//   适配 promotion_plan_7d cube
 func (q *CubeQuerier) Promotion7d(ctx context.Context, branchNo string) (map[string]bool, error) {
 	cube := q.cfg.CubePromotion
 	if cube == "" {
 		cube = "promotion_plan_7d"
 	}
 	rows, err := q.agent.Execute(cube,
-		[]string{"promo.count"},
-		[]string{"promo.item_no"},
+		[]string{"promotion_plan_7d.count"},
+		[]string{"promotion_plan_7d.item_no"},
 		[]map[string]any{
-			{"member": "promo.branch_no", "operator": "equals", "values": []string{branchNo}},
+			{"member": "promotion_plan_7d.branch_no", "operator": "equals", "values": []string{branchNo}},
 		},
 		nil, 10000)
 	if err != nil {
@@ -106,7 +115,7 @@ func (q *CubeQuerier) Promotion7d(ctx context.Context, branchNo string) (map[str
 	}
 	out := make(map[string]bool, len(rows))
 	for _, r := range rows {
-		itemNo := asString(r, "promo.item_no")
+		itemNo := asString(r, "promotion_plan_7d.item_no")
 		if itemNo == "" {
 			continue
 		}
@@ -118,10 +127,10 @@ func (q *CubeQuerier) Promotion7d(ctx context.Context, branchNo string) (map[str
 func rowToSnapshot(r map[string]any, branchNo string) *SkuSnapshot {
 	return &SkuSnapshot{
 		BranchNo:     branchNo,
-		ItemNo:       asString(r, "sales.item_no"),
-		ItemName:     asString(r, "sales.item_name"),
-		Barcode:      asString(r, "sales.barcode"),
-		SupplierName: asString(r, "sales.supplier_name"),
+		ItemNo:       asString(r, "sales_yesterday.item_no"),
+		ItemName:     asString(r, "sales_yesterday.item_name"),
+		Barcode:      asString(r, "sales_yesterday.barcode"),
+		SupplierName: asString(r, "sales_yesterday.supplier_name"),
 	}
 }
 
