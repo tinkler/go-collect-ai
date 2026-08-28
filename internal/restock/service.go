@@ -24,8 +24,9 @@ type Service struct {
 	LLM    *LlmPlanner
 	WeCom  *WeCom
 
-	stopCh chan struct{}
-	wg     sync.WaitGroup
+	stopCh   chan struct{}
+	stopOnce sync.Once
+	wg       sync.WaitGroup
 }
 
 func NewService(
@@ -81,9 +82,11 @@ func (s *Service) Start() error {
 }
 
 func (s *Service) Stop() {
-	if s.stopCh != nil {
-		close(s.stopCh)
-	}
+	s.stopOnce.Do(func() {
+		if s.stopCh != nil {
+			close(s.stopCh)
+		}
+	})
 	s.wg.Wait()
 }
 

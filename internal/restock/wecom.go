@@ -57,8 +57,9 @@ type WeCom struct {
 	OnConnect     func()                                        // 连接成功
 
 	// 内部
-	stopCh chan struct{}
-	reqID  uint64
+	stopCh   chan struct{}
+	stopOnce sync.Once
+	reqID    uint64
 
 	// for TLS ws://
 	tlsConfig *tls.Config
@@ -94,8 +95,10 @@ func (w *WeCom) Start(ctx context.Context) error {
 }
 
 func (w *WeCom) Stop() {
-	close(w.stopCh)
-	w.closeConn()
+	w.stopOnce.Do(func() {
+		close(w.stopCh)
+		w.closeConn()
+	})
 }
 
 // connectLoop 重连循环(指数退避)

@@ -170,7 +170,5 @@ func main() {
 	if err := srv.Shutdown(shutdownCtx); err != nil {
 		log.Printf("shutdown: %v", err)
 	}
-
-	// 停 restock cron
-	restockSvc.Stop()
+	// restockSvc.Stop() / restockWeCom.Stop() 通过 line 134/146 的 defer 自动调用
 }
