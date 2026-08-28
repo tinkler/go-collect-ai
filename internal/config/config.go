@@ -234,7 +234,7 @@ func Load() (*Config, error) {
 	v.SetDefault("WECOM_BOT_ID", "")
 	v.SetDefault("WECOM_BOT_SECRET", "")
 	v.SetDefault("WECOM_WS_URL", "wss://openws.work.weixin.qq.com")
-	v.SetDefault("WECOM_BIND_FILE", "./wecom_bindings.json")
+	v.SetDefault("WECOM_BIND_FILE", "./wecom_bindings.yaml")
 
 	cfg := &Config{}
 	if err := v.Unmarshal(cfg); err != nil {

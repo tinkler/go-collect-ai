@@ -19,6 +19,8 @@ import (
 	"time"
 
 	"crypto/tls"
+
+	"gopkg.in/yaml.v3"
 )
 
 // =====================================================================
@@ -65,13 +67,13 @@ type WeCom struct {
 	tlsConfig *tls.Config
 }
 
-// ChatBinding 持久化结构
+// ChatBinding 持久化结构(YAML)
 type ChatBinding struct {
-	ChatID     string    `json:"chat_id"`
-	Role       string    `json:"role"`        // "floor" / "office" / ""
-	FirstSeen  time.Time `json:"first_seen"`
-	LastActive time.Time `json:"last_active"`
-	Note       string    `json:"note,omitempty"`
+	ChatID     string    `yaml:"chat_id" json:"chat_id"`
+	Role       string    `yaml:"role" json:"role"` // "floor" / "office" / ""
+	FirstSeen  time.Time `yaml:"first_seen" json:"first_seen"`
+	LastActive time.Time `yaml:"last_active,omitempty" json:"last_active,omitempty"`
+	Note       string    `yaml:"note,omitempty" json:"note,omitempty"`
 }
 
 func NewWeCom(cfg *RestockConfig) *WeCom {
@@ -637,18 +639,37 @@ func (w *WeCom) bindingsFile() string {
 	if w.cfg.WeComBindFile != "" {
 		return w.cfg.WeComBindFile
 	}
-	return "./wecom_bindings.json"
+	return "./wecom_bindings.yaml"
 }
 
 func (w *WeCom) loadBindings() {
-	bs, err := os.ReadFile(w.bindingsFile())
-	if err != nil {
-		return
+	// 优先读 .yaml(新格式), 如果不存在再读 .json(老格式, 一次性迁移)
+	yamlPath := w.bindingsFile()
+	jsonPath := yamlPath
+	if strings.HasSuffix(yamlPath, ".yaml") {
+		jsonPath = strings.TrimSuffix(yamlPath, ".yaml") + ".json"
+	} else if strings.HasSuffix(yamlPath, ".yml") {
+		jsonPath = strings.TrimSuffix(yamlPath, ".yml") + ".json"
 	}
+
+	var bs []byte
+	var err error
+	if bs, err = os.ReadFile(yamlPath); err != nil {
+		// yaml 不存在, 试老 json
+		if bs, err = os.ReadFile(jsonPath); err != nil {
+			return
+		}
+		log.Printf("[wecom] migrating bindings: %s -> %s", jsonPath, yamlPath)
+	}
+
 	var list []ChatBinding
-	if err := json.Unmarshal(bs, &list); err != nil {
-		log.Printf("[wecom] load bindings: %v", err)
-		return
+	// 试 yaml
+	if err := yaml.Unmarshal(bs, &list); err != nil {
+		// 试 json(老文件)
+		if jerr := json.Unmarshal(bs, &list); jerr != nil {
+			log.Printf("[wecom] load bindings: yaml=%v json=%v", err, jerr)
+			return
+		}
 	}
 	w.mu.Lock()
 	for _, b := range list {
@@ -660,6 +681,16 @@ func (w *WeCom) loadBindings() {
 		}
 	}
 	w.mu.Unlock()
+
+	// 迁移成功后, 删老 json
+	if yamlPath != jsonPath {
+		if _, err := os.Stat(jsonPath); err == nil {
+			_ = os.Remove(jsonPath)
+			log.Printf("[wecom] removed old %s", jsonPath)
+		}
+		// 立即用新格式重写一次(标准化)
+		_ = w.saveBindings()
+	}
 }
 
 func (w *WeCom) saveBindings() error {
@@ -672,10 +703,15 @@ func (w *WeCom) saveBindings() error {
 			FirstSeen: seen,
 		})
 	}
-	w.mu.RUnlock()
+	w.mu.Unlock()
 
-	bs, _ := json.MarshalIndent(list, "", "  ")
-	return os.WriteFile(w.bindingsFile(), bs, 0o644)
+	// 头部加注释(让用户知道这是自动生成的)
+	header := []byte("# wecom_bindings.yaml - 自动生成,手编后会被覆盖\n# role: floor | office | (空)\n# 手动改后请通过 POST /api/v1/restock/wecom/chats/bind 写回\n")
+	bs, err := yaml.Marshal(list)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(w.bindingsFile(), append(header, bs...), 0o644)
 }
 
 // BindChat 绑定 chat_id 到 role

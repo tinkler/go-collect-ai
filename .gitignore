@@ -59,6 +59,8 @@ $RECYCLE.BIN/
 
 # ===== restock 模块运行时 =====
 # 企微 chat_id 绑定持久化(含企业内部群 ID)
+wecom_bindings.yaml
+wecom_bindings.yml
 wecom_bindings.json
 
 # ===== 跨平台编译临时输出 =====
