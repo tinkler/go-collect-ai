@@ -123,24 +123,26 @@ func main() {
 		log.Printf("[wecom] msg from chat=%s user=%s: %s", chatID, userID, text)
 	}
 
+	// restock cron(独立开关: 没门店不跑)
 	if cfg.RestockBranchNo != "" {
 		if err := restockSvc.Start(); err != nil {
 			log.Printf("[main] restock cron start failed: %v (继续运行,restock 不可用)", err)
 		}
-		// 启企微长连接
-		if cfg.WeComBotID != "" {
-			if err := restockWeCom.Start(context.Background()); err != nil {
-				log.Printf("[main] wecom ws start failed: %v", err)
-			} else {
-				log.Printf("[main] wecom ws connecting... (bot_id=%s)", cfg.WeComBotID)
-			}
+	} else {
+		log.Printf("[main] RESTOCK_BRANCH_NO 未配置,restock cron 不启动")
+	}
+	defer restockSvc.Stop()
+
+	// 企微长连接(独立开关: 任何时候都能起,用于测试/绑定 chat)
+	if cfg.WeComBotID != "" {
+		if err := restockWeCom.Start(context.Background()); err != nil {
+			log.Printf("[main] wecom ws start failed: %v", err)
 		} else {
-			log.Printf("[main] WECOM_BOT_ID 未配置,企微长连接不启动")
+			log.Printf("[main] wecom ws connecting... (bot_id=%s)", cfg.WeComBotID)
 		}
 	} else {
-		log.Printf("[main] RESTOCK_BRANCH_NO 未配置,restock 模块不启动")
+		log.Printf("[main] WECOM_BOT_ID 未配置,企微长连接不启动")
 	}
-
 	defer restockWeCom.Stop()
 
 	r := api.NewRouter(h, cfg, restockSvc)
