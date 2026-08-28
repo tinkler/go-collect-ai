@@ -13,7 +13,7 @@ import (
 	"github.com/tinkler/collect-ai/internal/restock"
 )
 
-func NewRouter(h *handler.Handler, cfg *config.Config, restockH *restock.CallbackHandler, restockSvc *restock.Service) *gin.Engine {
+func NewRouter(h *handler.Handler, cfg *config.Config, restockSvc *restock.Service) *gin.Engine {
 	r := gin.New()
 	r.Use(gin.Recovery(), gin.Logger())
 
@@ -89,16 +89,11 @@ func NewRouter(h *handler.Handler, cfg *config.Config, restockH *restock.Callbac
 		api.GET("/restock/need-purchase", restock.RestockNeedPurchaseList(restockSvc))
 		api.POST("/restock/cron/tick", restock.RestockManualTick(restockSvc))
 		api.GET("/restock/llm/plan", restock.RestockLlmPlanNow(restockSvc))
-		api.POST("/restock/wecom/chat", restock.RestockCreateChat(restockSvc))
-	}
 
-	// ============== 企微回调(不走 /api/v1 前缀,企微后台固定) ==============
-	if restockH != nil {
-		wecom := r.Group("/wecom")
-		{
-			wecom.GET("/callback", restockH.VerifyURL)
-			wecom.POST("/callback", restockH.OnEvent)
-		}
+		// 企微 chat_id 管理(长连接模式下: 用户在群里发消息 → 自动发现 → 人工绑定 role)
+		api.GET("/restock/wecom/chats", restock.RestockListChats(restockSvc))
+		api.POST("/restock/wecom/chats/bind", restock.RestockBindChat(restockSvc))
+		api.POST("/restock/wecom/chats/test", restock.RestockTestChat(restockSvc))
 	}
 
 	r.GET("/", func(c *gin.Context) {

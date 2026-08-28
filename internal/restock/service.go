@@ -2,6 +2,7 @@ package restock
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
 	"strconv"
@@ -386,7 +387,7 @@ func (s *Service) HourlyTick(ctx context.Context) error {
 
 		// 推卖场群
 		card := RenderFloorCard(&sku, finalQty, task.TaskID)
-		if err := s.WeCom.SendAppChat(ctx, s.Cfg.WeComFloorChatID, card); err != nil {
+		if err := s.WeCom.SendAppChat(ctx, "floor", card); err != nil {
 			log.Printf("[restock] push floor %s: %v", itemNo, err)
 		} else {
 			_ = s.Store.MarkPushed(ctx, task.TaskID)
@@ -472,14 +473,45 @@ func (s *Service) AggregateTick(ctx context.Context) error {
 	card := RenderOfficeCard("aggregate", &SkuSnapshot{
 		BranchNo: branch, ItemName: fmt.Sprintf("%d 项待采购", len(needs)),
 	}, len(needs), "")
-	return s.WeCom.SendAppChat(ctx, s.Cfg.WeComOfficeChatID, card)
+	return s.WeCom.SendAppChat(ctx, "office", card)
 }
 
 func (s *Service) pushOffice(ctx context.Context, event string, sku *SkuSnapshot, qty int, taskID string) {
 	card := RenderOfficeCard(event, sku, qty, taskID)
-	if err := s.WeCom.SendAppChat(ctx, s.Cfg.WeComOfficeChatID, card); err != nil {
+	if err := s.WeCom.SendAppChat(ctx, "office", card); err != nil {
 		log.Printf("[restock] push office %s: %v", event, err)
 	}
+}
+
+// OnButtonClick 企微按钮点击 → 写 Feedback + 改 task 状态
+//   供 wecom.OnButtonClick 注册使用
+func (s *Service) OnButtonClick(chatID, userID, taskID, eventKey string) {
+	kind, realTaskID := parseButtonKey2(eventKey)
+	if kind == "" {
+		kind = FeedbackDone
+	}
+	if realTaskID == "" {
+		realTaskID = taskID
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	fb := &Feedback{
+		TaskID:       realTaskID,
+		FeedbackType: kind,
+		FeedbackUser: userID,
+		FeedbackTime: time.Now(),
+	}
+	if err := s.Store.InsertFeedback(ctx, fb); err != nil {
+		log.Printf("[restock] insert feedback: %v", err)
+	}
+	status := TaskStatusAcked
+	if kind == FeedbackShort {
+		status = TaskStatusShort
+	}
+	_ = s.Store.UpdateStatus(ctx, realTaskID, status)
+	log.Printf("[restock] button click: chat=%s user=%s task=%s kind=%s",
+		chatID, userID, realTaskID, kind)
 }
 
 // ============== HTTP Handlers (供 router 调用) ==============
@@ -580,47 +612,86 @@ func RestockLlmPlanNow(svc *Service) gin.HandlerFunc {
 	}
 }
 
-// RestockCreateChat POST /api/v1/restock/wecom/chat
-//   body: {"name":"群名","owner":"userid","userlist":["u1","u2"],"custom_chatid":""}
-//   一次性建好补货双群,返回 chat_id 写入 .env
-//
-//   ⚠️ owner 必须是企微智能机器人应用可见范围内的 userid
-//      拿 userid 的方法: 管理后台 → 通讯录 → 选中用户 → 详情页 URL 有 userid 字段
-//                       或: 你的企微 → 我 → 个人 userid
-func RestockCreateChat(svc *Service) gin.HandlerFunc {
+// RestockListChats GET /api/v1/restock/wecom/chats
+//   列出所有已发现/已绑定的 chat_id
+func RestockListChats(svc *Service) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		chats := svc.WeCom.ListChats()
+		connected := svc.WeCom.IsConnected()
+		c.JSON(200, gin.H{
+			"chats":     chats,
+			"count":     len(chats),
+			"connected": connected,
+		})
+	}
+}
+
+// RestockBindChat POST /api/v1/restock/wecom/chats/bind
+//   body: {"chat_id":"wrXXX", "role":"floor"|"office"|""}
+//   把 chat_id 绑定到 floor/office 角色,服务重启后从 WECOM_BIND_FILE 恢复
+func RestockBindChat(svc *Service) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		var req struct {
-			Name         string   `json:"name"`
-			Owner        string   `json:"owner"`
-			UserList     []string `json:"userlist"`
-			CustomChatID string   `json:"custom_chatid"`
+			ChatID string `json:"chat_id"`
+			Role   string `json:"role"`
 		}
 		if err := c.ShouldBindJSON(&req); err != nil {
 			c.JSON(400, gin.H{"error": "bad json: " + err.Error()})
 			return
 		}
-		if req.Name == "" {
-			c.JSON(400, gin.H{"error": "name 必填 (群名,如 '卖场补货群')"})
+		if req.ChatID == "" {
+			c.JSON(400, gin.H{"error": "chat_id 必填"})
 			return
 		}
-		if req.Owner == "" {
-			c.JSON(400, gin.H{"error": "owner 必填 (企微 userid, 管理后台通讯录里查)"})
+		if err := svc.WeCom.BindChat(req.ChatID, req.Role); err != nil {
+			c.JSON(400, gin.H{"error": err.Error()})
 			return
+		}
+		c.JSON(200, gin.H{"ok": true, "chat_id": req.ChatID, "role": req.Role})
+	}
+}
+
+// RestockTestChat POST /api/v1/restock/wecom/chats/test
+//   body: {"chat_id":"wrXXX" or "role":"floor", "text":"测试消息"}
+//   主动发一条测试消息(验证绑定是否对、机器人能否推到群)
+func RestockTestChat(svc *Service) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		var req struct {
+			ChatID string `json:"chat_id"`
+			Role   string `json:"role"`
+			Text   string `json:"text"`
+		}
+		if err := c.ShouldBindJSON(&req); err != nil {
+			c.JSON(400, gin.H{"error": "bad json: " + err.Error()})
+			return
+		}
+		target := req.ChatID
+		if target == "" {
+			target = req.Role
+		}
+		if target == "" {
+			c.JSON(400, gin.H{"error": "chat_id 或 role 至少填一个"})
+			return
+		}
+		text := req.Text
+		if text == "" {
+			text = "🛒 商超 AI 机器人测试消息 - " + time.Now().Format("15:04:05")
 		}
 
-		ctx, cancel := context.WithTimeout(c.Request.Context(), 15*time.Second)
+		card := map[string]any{
+			"msgtype": "markdown",
+			"markdown": map[string]any{
+				"content": text,
+			},
+		}
+		body, _ := json.Marshal(card)
+
+		ctx, cancel := context.WithTimeout(c.Request.Context(), 10*time.Second)
 		defer cancel()
-
-		chatID, err := svc.WeCom.CreateAppChat(ctx, req.Name, req.Owner, req.UserList, req.CustomChatID)
-		if err != nil {
+		if err := svc.WeCom.SendAppChat(ctx, target, body); err != nil {
 			c.JSON(500, gin.H{"error": err.Error()})
 			return
 		}
-		c.JSON(200, gin.H{
-			"ok":      true,
-			"chat_id": chatID,
-			"name":    req.Name,
-			"hint":    "把 chat_id 写入 .env 的 WECOM_FLOOR_CHAT_ID 或 WECOM_OFFICE_CHAT_ID",
-		})
+		c.JSON(200, gin.H{"ok": true, "sent_to": target})
 	}
 }

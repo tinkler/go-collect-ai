@@ -171,12 +171,9 @@ type RestockConfig struct {
 	LLMPlanEnabled bool
 	LLMPlanCacheHrs int
 
-	// 企微
-	WeComCorpID        string
-	WeComAgentID       string
-	WeComAgentSecret   string
-	WeComCallbackToken string
-	WeComCallbackAES   string
-	WeComFloorChatID   string
-	WeComOfficeChatID  string
+	// 企微智能机器人(长连接模式)
+	WeComBotID     string
+	WeComBotSecret string
+	WeComWSURL     string // 默认 wss://openws.work.weixin.qq.com
+	WeComBindFile  string // 默认 ./wecom_bindings.json
 }

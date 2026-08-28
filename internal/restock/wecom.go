@@ -1,319 +1,684 @@
 package restock
 
 import (
-	"bytes"
 	"context"
-	"crypto/aes"
-	"crypto/cipher"
 	"crypto/rand"
 	"crypto/sha1"
 	"encoding/base64"
 	"encoding/binary"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
-	"net/http"
-	"sort"
+	"log"
+	"net"
+	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 )
 
-// WeCom 企业微信智能机器人 client
+// =====================================================================
+// 企业微信智能机器人 长连接客户端(WebSocket 模式)
 //
-// 复用:无(企微 client 是新增)
-// 文档: https://developer.work.weixin.qq.com/document/path/90236
+// API 文档: https://developer.work.weixin.qq.com/document/path/101833
+// 协议: 客户端主动建立 WS → 发 aibot_subscribe 认证 → 收 aibot_event_callback
+//       → 30s 一次 ping → 发消息走 aibot_send_msg 帧
 //
-// 主要能力:
-//   - get_access_token: 7200s 过期,内存缓存
-//   - appchat/msg 群应用消息发送(传 chat_id)
-//   - URL 验证(GET,首次配置回调 URL 时)
-//   - 回调加解密(AES-256-CBC,PKCS#7,EncodingAESKey)
-//   - 回调签名校验(SHA1)
+// 凭证: BotID + Secret (就这 2 个,不需要 CorpID/AgentID/Token/AESKey)
+//
+// 关键约束:
+//   - 一个机器人同时只能有 1 个有效长连接(新连接会踢旧连接)
+//   - 群 chat_id 不能预先创建,用户在群里发消息后企微推过来
+//   - 主动发消息: 用户必须先在会话里发过消息(24 小时内)
+//   - 频率限制: 30 条/分钟/会话, 1000 条/小时/会话
+// =====================================================================
+
+// WeCom 客户端
 type WeCom struct {
 	cfg *RestockConfig
 
-	mu          sync.Mutex
-	accessToken string
-	tokenExp    time.Time
-	httpClient  *http.Client
+	// bindings: chat_id -> "floor" / "office" / ""
+	bindings   map[string]string
+	discovered map[string]time.Time // 首次发现时间
+	mu         sync.RWMutex
+
+	// 长连接状态
+	conn      net.Conn
+	writeMu   sync.Mutex
+	connected bool
+
+	// 事件回调(由 service.go 注册)
+	OnButtonClick func(chatID, userID, taskID, eventKey string) // 按钮点击
+	OnMessage     func(chatID, userID, text string)             // 文本消息(用于自动发现)
+	OnConnect     func()                                        // 连接成功
+
+	// 内部
+	stopCh chan struct{}
+	reqID  uint64
+}
+
+// ChatBinding 持久化结构
+type ChatBinding struct {
+	ChatID     string    `json:"chat_id"`
+	Role       string    `json:"role"`        // "floor" / "office" / ""
+	FirstSeen  time.Time `json:"first_seen"`
+	LastActive time.Time `json:"last_active"`
+	Note       string    `json:"note,omitempty"`
 }
 
 func NewWeCom(cfg *RestockConfig) *WeCom {
-	return &WeCom{
+	w := &WeCom{
 		cfg:        cfg,
-		httpClient: &http.Client{Timeout: 10 * time.Second},
+		bindings:   make(map[string]string),
+		discovered: make(map[string]time.Time),
+		stopCh:     make(chan struct{}),
+	}
+	w.loadBindings()
+	return w
+}
+
+// Start 启长连接(后台 goroutine)
+func (w *WeCom) Start(ctx context.Context) error {
+	if w.cfg.WeComBotID == "" || w.cfg.WeComBotSecret == "" {
+		return fmt.Errorf("WECOM_BOT_ID / WECOM_BOT_SECRET 未配置")
+	}
+	go w.connectLoop(ctx)
+	return nil
+}
+
+func (w *WeCom) Stop() {
+	close(w.stopCh)
+	w.closeConn()
+}
+
+// connectLoop 重连循环(指数退避)
+func (w *WeCom) connectLoop(ctx context.Context) {
+	backoff := 2 * time.Second
+	maxBackoff := 60 * time.Second
+	for {
+		select {
+		case <-w.stopCh:
+			return
+		case <-ctx.Done():
+			return
+		default:
+		}
+		if err := w.connect(ctx); err != nil {
+			log.Printf("[wecom] connect failed: %v (retry in %s)", err, backoff)
+			select {
+			case <-w.stopCh:
+				return
+			case <-time.After(backoff):
+			}
+			backoff *= 2
+			if backoff > maxBackoff {
+				backoff = maxBackoff
+			}
+			continue
+		}
+		backoff = 2 * time.Second
 	}
 }
 
-// GetAccessToken 取(并缓存)access_token
-func (w *WeCom) GetAccessToken(ctx context.Context) (string, error) {
-	if w.cfg.WeComCorpID == "" || w.cfg.WeComAgentSecret == "" {
-		return "", fmt.Errorf("WECOM_CORP_ID / WECOM_AGENT_SECRET 未配置")
+// connect 单次连接生命周期: 拨号 → WS 握手 → 订阅 → 收发循环 → 断开返回
+func (w *WeCom) connect(ctx context.Context) error {
+	log.Printf("[wecom] dialing %s ...", w.cfg.WeComWSURL)
+	dialer := &net.Dialer{Timeout: 10 * time.Second}
+	rawConn, err := dialer.DialContext(ctx, "tcp", w.cfg.WeComWSURL)
+	if err != nil {
+		return fmt.Errorf("tcp dial: %w", err)
 	}
+
+	// WS 客户端握手
+	host := w.cfg.WeComWSURL
+	if strings.Contains(host, ":") && !strings.HasPrefix(host, "[") {
+		// 带端口
+	}
+	wsKey, err := w.wsHandshake(rawConn, host, "/")
+	if err != nil {
+		rawConn.Close()
+		return fmt.Errorf("ws handshake: %w", err)
+	}
+	log.Printf("[wecom] ws handshake ok, key=%s", wsKey)
 
 	w.mu.Lock()
-	defer w.mu.Unlock()
+	w.conn = rawConn
+	w.connected = true
+	w.mu.Unlock()
 
-	// 提前 5 分钟刷新
-	if w.accessToken != "" && time.Now().Add(5*time.Minute).Before(w.tokenExp) {
-		return w.accessToken, nil
+	// 订阅
+	if err := w.subscribe(); err != nil {
+		w.closeConn()
+		return fmt.Errorf("subscribe: %w", err)
+	}
+	log.Printf("[wecom] subscribed, bot_id=%s", w.cfg.WeComBotID)
+
+	if w.OnConnect != nil {
+		w.OnConnect()
 	}
 
-	url := fmt.Sprintf("https://qyapi.weixin.qq.com/cgi-bin/gettoken?corpid=%s&corpsecret=%s",
-		w.cfg.WeComCorpID, w.cfg.WeComAgentSecret)
-	req, _ := http.NewRequestWithContext(ctx, "GET", url, nil)
-	resp, err := w.httpClient.Do(req)
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
-	body, _ := io.ReadAll(resp.Body)
+	// 启心跳 + 收消息
+	pingTicker := time.NewTicker(25 * time.Second) // 略小于 30s
+	defer pingTicker.Stop()
 
-	var r struct {
-		ErrCode     int    `json:"errcode"`
-		ErrMsg      string `json:"errmsg"`
-		AccessToken string `json:"access_token"`
-		ExpiresIn   int    `json:"expires_in"`
-	}
-	if err := json.Unmarshal(body, &r); err != nil {
-		return "", fmt.Errorf("parse token: %w (body=%s)", err, truncate(string(body), 200))
-	}
-	if r.ErrCode != 0 {
-		return "", fmt.Errorf("gettoken errcode=%d errmsg=%s", r.ErrCode, r.ErrMsg)
-	}
-	w.accessToken = r.AccessToken
-	w.tokenExp = time.Now().Add(time.Duration(r.ExpiresIn) * time.Second)
-	return w.accessToken, nil
+	go func() {
+		for {
+			select {
+			case <-w.stopCh:
+				return
+			case <-pingTicker.C:
+				if err := w.ping(); err != nil {
+					log.Printf("[wecom] ping failed: %v", err)
+					w.closeConn()
+					return
+				}
+			}
+		}
+	}()
+
+	// 收消息主循环
+	return w.readLoop()
 }
 
-// CreateAppChat 建群
-//   POST https://qyapi.weixin.qq.com/cgi-bin/appchat/create?access_token=...
-//   body: {"name":"群名","owner":"userid","userlist":["userid1","userid2"],"chatid":"可选,自定义 ID"}
-//   返回: {"errcode":0,"errmsg":"ok","chatid":"wrXXX"}
-//
-// 注意: 智能机器人应用建群需要 owner 是应用的可见范围成员,userlist 同理
-func (w *WeCom) CreateAppChat(ctx context.Context, name, owner string, userlist []string, customChatID string) (string, error) {
-	token, err := w.GetAccessToken(ctx)
+// wsHandshake WebSocket 客户端握手(简化版,只支持 wss://host:port/)
+//   返回 Sec-WebSocket-Accept 校验后的 key
+func (w *WeCom) wsHandshake(conn net.Conn, host, path string) (string, error) {
+	// 生成 Sec-WebSocket-Key
+	keyBytes := make([]byte, 16)
+	if _, err := rand.Read(keyBytes); err != nil {
+		return "", err
+	}
+	key := base64.StdEncoding.EncodeToString(keyBytes)
+
+	req := fmt.Sprintf("GET %s HTTP/1.1\r\n"+
+		"Host: %s\r\n"+
+		"Upgrade: websocket\r\n"+
+		"Connection: Upgrade\r\n"+
+		"Sec-WebSocket-Key: %s\r\n"+
+		"Sec-WebSocket-Version: 13\r\n"+
+		"\r\n", path, host, key)
+
+	if err := conn.SetDeadline(time.Now().Add(10 * time.Second)); err != nil {
+		return "", err
+	}
+	if _, err := conn.Write([]byte(req)); err != nil {
+		return "", err
+	}
+
+	// 读响应(直到 \r\n\r\n)
+	buf := make([]byte, 4096)
+	n, err := readUntil(conn, buf, "\r\n\r\n")
 	if err != nil {
 		return "", err
 	}
-	if owner == "" {
-		return "", fmt.Errorf("owner is required (use 应用可见范围内的 userid)")
+	resp := string(buf[:n])
+	if !strings.Contains(resp, "101") {
+		return "", fmt.Errorf("ws upgrade failed: %s", strings.SplitN(resp, "\r\n", 2)[0])
 	}
 
-	payload := map[string]any{
-		"name":    name,
-		"owner":   owner,
-		"userlist": userlist,
+	// 校验 Sec-WebSocket-Accept
+	expected := computeAcceptKey(key)
+	if !strings.Contains(resp, expected) {
+		return "", fmt.Errorf("ws accept key mismatch: want %s", expected)
 	}
-	if customChatID != "" {
-		payload["chatid"] = customChatID
-	}
-	bs, _ := json.Marshal(payload)
-
-	url := "https://qyapi.weixin.qq.com/cgi-bin/appchat/create?access_token=" + token
-	req, _ := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(bs))
-	req.Header.Set("Content-Type", "application/json")
-	resp, err := w.httpClient.Do(req)
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
-	respBs, _ := io.ReadAll(resp.Body)
-
-	var r struct {
-		ErrCode int    `json:"errcode"`
-		ErrMsg  string `json:"errmsg"`
-		ChatID  string `json:"chatid"`
-	}
-	if err := json.Unmarshal(respBs, &r); err != nil {
-		return "", fmt.Errorf("parse create: %w (body=%s)", err, truncate(string(respBs), 200))
-	}
-	if r.ErrCode != 0 {
-		return "", fmt.Errorf("appchat.create errcode=%d errmsg=%s", r.ErrCode, r.ErrMsg)
-	}
-	return r.ChatID, nil
+	conn.SetDeadline(time.Time{}) // 清除 deadline
+	return key, nil
 }
 
-// SendAppChat 发群应用消息到指定 chat_id
-//   chatID: 群 chat_id
-//   body:   完整的 msgtype=template_card JSON
-func (w *WeCom) SendAppChat(ctx context.Context, chatID string, body []byte) error {
-	if chatID == "" {
-		return fmt.Errorf("chatID is empty")
+func computeAcceptKey(key string) string {
+	h := sha1.New()
+	h.Write([]byte(key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"))
+	return base64.StdEncoding.EncodeToString(h.Sum(nil))
+}
+
+func readUntil(r io.Reader, buf []byte, delim string) (int, error) {
+	total := 0
+	delimBs := []byte(delim)
+	for total < len(buf) {
+		n, err := r.Read(buf[total:])
+		if n > 0 {
+			total += n
+			if total >= len(delimBs) && string(buf[total-len(delimBs):total]) == delim {
+				return total, nil
+			}
+		}
+		if err != nil {
+			if err == io.EOF {
+				return total, nil
+			}
+			return total, err
+		}
 	}
-	token, err := w.GetAccessToken(ctx)
-	if err != nil {
+	return total, fmt.Errorf("buffer full before delim")
+}
+
+// readLoop 读消息主循环
+func (w *WeCom) readLoop() error {
+	header := make([]byte, 14)
+	for {
+		// 读 frame header (最少 2 字节,最长 14 字节含 8 字节 masking key)
+		if _, err := io.ReadFull(w.conn, header[:2]); err != nil {
+			return fmt.Errorf("read frame hdr: %w", err)
+		}
+		fin := (header[0] & 0x80) != 0
+		opcode := header[0] & 0x0F
+		masked := (header[1] & 0x80) != 0
+		payloadLen := int(header[1] & 0x7F)
+
+		if payloadLen == 126 {
+			var ext [2]byte
+			if _, err := io.ReadFull(w.conn, ext[:]); err != nil {
+				return err
+			}
+			payloadLen = int(binary.BigEndian.Uint16(ext[:]))
+		} else if payloadLen == 127 {
+			var ext [8]byte
+			if _, err := io.ReadFull(w.conn, ext[:]); err != nil {
+				return err
+			}
+			payloadLen = int(binary.BigEndian.Uint64(ext[:]))
+		}
+
+		var maskKey [4]byte
+		if masked {
+			if _, err := io.ReadFull(w.conn, maskKey[:]); err != nil {
+				return err
+			}
+		}
+
+		payload := make([]byte, payloadLen)
+		if payloadLen > 0 {
+			if _, err := io.ReadFull(w.conn, payload); err != nil {
+				return err
+			}
+			if masked {
+				for i := range payload {
+					payload[i] ^= maskKey[i%4]
+				}
+			}
+		}
+
+		_ = fin
+		switch opcode {
+		case 0x1: // text
+			w.handleMessage(payload)
+		case 0x8: // close
+			log.Printf("[wecom] received close frame")
+			return fmt.Errorf("server closed")
+		case 0x9: // ping
+			_ = w.pong(payload)
+		case 0xA: // pong
+			// noop
+		default:
+			// binary / 其它忽略
+		}
+	}
+}
+
+// writeFrame 写一帧(客户端必须 mask)
+func (w *WeCom) writeFrame(opcode byte, payload []byte) error {
+	w.writeMu.Lock()
+	defer w.writeMu.Unlock()
+
+	conn := w.conn
+	if conn == nil {
+		return fmt.Errorf("not connected")
+	}
+
+	var header [14]byte
+	header[0] = 0x80 | opcode // FIN=1
+
+	plen := len(payload)
+	if plen < 126 {
+		header[1] = 0x80 | byte(plen)
+		_, err := conn.Write(header[:2])
+		if err != nil {
+			return err
+		}
+	} else if plen < 65536 {
+		header[1] = 0x80 | 126
+		binary.BigEndian.PutUint16(header[2:], uint16(plen))
+		_, err := conn.Write(header[:4])
+		if err != nil {
+			return err
+		}
+	} else {
+		header[1] = 0x80 | 127
+		binary.BigEndian.PutUint64(header[2:], uint64(plen))
+		_, err := conn.Write(header[:10])
+		if err != nil {
+			return err
+		}
+	}
+
+	// 客户端必须 mask
+	maskKey := [4]byte{}
+	if _, err := rand.Read(maskKey[:]); err != nil {
+		return err
+	}
+	if _, err := conn.Write(maskKey[:]); err != nil {
 		return err
 	}
 
-	// 在 body 顶层注入 chatid(企微要求)
+	masked := make([]byte, plen)
+	for i := range payload {
+		masked[i] = payload[i] ^ maskKey[i%4]
+	}
+	_, err := conn.Write(masked)
+	return err
+}
+
+func (w *WeCom) nextReqID() string {
+	w.reqID++
+	return "restock-" + strconv.FormatUint(w.reqID, 10) + "-" + strconv.FormatInt(time.Now().UnixNano()%1_000_000_000, 10)
+}
+
+// sendJSON 通用发 JSON 帧
+func (w *WeCom) sendJSON(v any) error {
+	bs, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+	return w.writeFrame(0x1, bs)
+}
+
+func (w *WeCom) subscribe() error {
+	return w.sendJSON(map[string]any{
+		"cmd":     "aibot_subscribe",
+		"headers": map[string]any{"req_id": w.nextReqID()},
+		"body": map[string]any{
+			"bot_id": w.cfg.WeComBotID,
+			"secret": w.cfg.WeComBotSecret,
+		},
+	})
+}
+
+func (w *WeCom) ping() error {
+	return w.sendJSON(map[string]any{
+		"cmd":     "ping",
+		"headers": map[string]any{"req_id": w.nextReqID()},
+	})
+}
+
+func (w *WeCom) pong(payload []byte) error {
+	return w.writeFrame(0xA, payload)
+}
+
+func (w *WeCom) closeConn() {
+	w.mu.Lock()
+	if w.conn != nil {
+		w.conn.Close()
+		w.conn = nil
+	}
+	w.connected = false
+	w.mu.Unlock()
+}
+
+// =====================================================================
+// 业务消息收发
+// =====================================================================
+
+// ChatFrame 收消息 envelope
+type ChatFrame struct {
+	Cmd     string         `json:"cmd"`
+	Headers map[string]any `json:"headers"`
+	Body    struct {
+		MsgID     string `json:"msgid"`
+		CreateAt  int64  `json:"create_time"`
+		AIBotID   string `json:"aibotid"`
+		ChatID    string `json:"chatid"`
+		ChatType  string `json:"chattype"` // single / group
+		From      struct {
+			CorpID string `json:"corpid"`
+			UserID string `json:"userid"`
+		} `json:"from"`
+		ResponseURL string `json:"response_url"`
+		MsgType     string `json:"msgtype"` // text / event
+		Text        *struct {
+			Content string `json:"content"`
+		} `json:"text,omitempty"`
+		Event *struct {
+			EventType          string `json:"eventtype"`
+			TemplateCardEvent  *struct {
+				CardType string `json:"card_type"`
+				EventKey string `json:"event_key"`
+				TaskID   string `json:"task_id"`
+			} `json:"template_card_event,omitempty"`
+		} `json:"event,omitempty"`
+	} `json:"body"`
+}
+
+func (w *WeCom) handleMessage(payload []byte) {
+	var f ChatFrame
+	if err := json.Unmarshal(payload, &f); err != nil {
+		log.Printf("[wecom] parse frame: %v payload=%s", err, Truncate(string(payload), 300))
+		return
+	}
+
+	switch f.Cmd {
+	case "aibot_event_callback":
+		w.handleEvent(&f)
+	case "aibot_msg_callback":
+		w.handleTextMsg(&f)
+	default:
+		// 订阅响应、ping 响应等: 打印
+		if f.Cmd == "" {
+			// 可能是订阅响应包,忽略
+			return
+		}
+		log.Printf("[wecom] frame cmd=%s: %s", f.Cmd, Truncate(string(payload), 200))
+	}
+}
+
+func (w *WeCom) handleEvent(f *ChatFrame) {
+	// 首次发现 chat_id(只要有 chatid 就记)
+	if f.Body.ChatID != "" {
+		w.recordChat(f.Body.ChatID)
+	}
+	if f.Body.Event == nil {
+		return
+	}
+	switch f.Body.Event.EventType {
+	case "template_card_event":
+		if f.Body.Event.TemplateCardEvent == nil {
+			return
+		}
+		ev := f.Body.Event.TemplateCardEvent
+		// 解析 event_key (格式: "DONE|task_id" / "SHORT|task_id")
+		kind, taskID := parseButtonKey2(ev.EventKey)
+		log.Printf("[wecom] button click: chat=%s user=%s key=%s -> kind=%s task=%s",
+			f.Body.ChatID, f.Body.From.UserID, ev.EventKey, kind, taskID)
+		if w.OnButtonClick != nil && taskID != "" {
+			w.OnButtonClick(f.Body.ChatID, f.Body.From.UserID, taskID, ev.EventKey)
+		}
+	case "enter_chat":
+		log.Printf("[wecom] user entered chat: user=%s", f.Body.From.UserID)
+	case "disconnected_event":
+		log.Printf("[wecom] disconnected event (new connection took over)")
+	}
+}
+
+func (w *WeCom) handleTextMsg(f *ChatFrame) {
+	if f.Body.ChatID != "" {
+		w.recordChat(f.Body.ChatID)
+	}
+	if f.Body.Text != nil && w.OnMessage != nil {
+		w.OnMessage(f.Body.ChatID, f.Body.From.UserID, f.Body.Text.Content)
+	}
+}
+
+func parseButtonKey2(key string) (kind, taskID string) {
+	if i := strings.Index(key, "|"); i >= 0 {
+		return key[:i], key[i+1:]
+	}
+	return "", key
+}
+
+// recordChat 记录 chat_id(首次发现)
+func (w *WeCom) recordChat(chatID string) {
+	w.mu.Lock()
+	if _, exists := w.discovered[chatID]; !exists {
+		w.discovered[chatID] = time.Now()
+		w.mu.Unlock()
+		_ = w.saveBindings()
+		log.Printf("[wecom] NEW chat discovered: %s (use POST /api/v1/restock/wecom/chats/bind to bind role)", chatID)
+		return
+	}
+	w.mu.Unlock()
+}
+
+// =====================================================================
+// 发消息
+// =====================================================================
+
+// SendAppChat 发消息到指定 chat_id(role 找 chat_id)
+//   role: "floor" / "office" / 任何已绑定的 chat_id
+func (w *WeCom) SendAppChat(ctx context.Context, chatID string, body []byte) error {
+	chatID = w.resolveChatID(chatID)
+	if chatID == "" {
+		return fmt.Errorf("no chat_id for role, bind first via /api/v1/restock/wecom/chats/bind")
+	}
+
+	// 解析 body 拿 msgtype 和对应字段
 	var msg map[string]any
 	if err := json.Unmarshal(body, &msg); err != nil {
 		return fmt.Errorf("body not JSON: %w", err)
 	}
-	msg["chatid"] = chatID
-	bs, _ := json.Marshal(msg)
+	msgType, _ := msg["msgtype"].(string)
+	if msgType == "" {
+		return fmt.Errorf("body.msgtype empty")
+	}
+	payload, ok := msg[msgType].(map[string]any)
+	if !ok {
+		return fmt.Errorf("body.%s not object", msgType)
+	}
 
-	url := "https://qyapi.weixin.qq.com/cgi-bin/appchat/send?access_token=" + token
-	req, _ := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(bs))
-	req.Header.Set("Content-Type", "application/json")
-	resp, err := w.httpClient.Do(req)
-	if err != nil {
-		return err
+	frame := map[string]any{
+		"cmd":     "aibot_send_msg",
+		"headers": map[string]any{"req_id": w.nextReqID()},
+		"body": map[string]any{
+			"chatid":    chatID,
+			"chat_type": 2, // 群聊
+			"msgtype":   msgType,
+			msgType:     payload,
+		},
 	}
-	defer resp.Body.Close()
-	respBs, _ := io.ReadAll(resp.Body)
-
-	var r struct {
-		ErrCode int    `json:"errcode"`
-		ErrMsg  string `json:"errmsg"`
-	}
-	if err := json.Unmarshal(respBs, &r); err != nil {
-		return fmt.Errorf("parse send: %w", err)
-	}
-	if r.ErrCode != 0 {
-		return fmt.Errorf("appchat.send errcode=%d errmsg=%s", r.ErrCode, r.ErrMsg)
-	}
-	return nil
+	return w.sendJSON(frame)
 }
 
-// VerifyURL GET /wecom/callback 首次配置 URL 时验证
-//   URL 上 query: ?msg_signature=...&timestamp=...&nonce=...&echostr=...
-//   流程: SHA1 校验 → AES 解密 echostr → 返回明文
-func (w *WeCom) VerifyURL(signature, timestamp, nonce, echostr string) (string, error) {
-	if err := w.checkSignature(signature, timestamp, nonce, echostr); err != nil {
-		return "", err
+// resolveChatID role → chat_id
+func (w *WeCom) resolveChatID(roleOrChatID string) string {
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+	if strings.HasPrefix(roleOrChatID, "wr") || strings.HasPrefix(roleOrChatID, "wc") {
+		// 直接是 chat_id
+		return roleOrChatID
 	}
-	plain, err := w.decrypt(echostr)
-	if err != nil {
-		return "", err
+	for cid, role := range w.bindings {
+		if role == roleOrChatID {
+			return cid
+		}
 	}
-	return string(plain), nil
+	return ""
 }
 
-// DecryptEvent POST /wecom/callback 业务消息解密
-//   流程: SHA1 校验 → AES 解密 msg → 解析 XML
-func (w *WeCom) DecryptEvent(signature, timestamp, nonce, encrypt string) ([]byte, error) {
-	if err := w.checkSignature(signature, timestamp, nonce, encrypt); err != nil {
-		return nil, err
+// =====================================================================
+// Bindings 持久化
+// =====================================================================
+
+func (w *WeCom) bindingsFile() string {
+	if w.cfg.WeComBindFile != "" {
+		return w.cfg.WeComBindFile
 	}
-	return w.decrypt(encrypt)
+	return "./wecom_bindings.json"
 }
 
-// checkSignature SHA1(token, timestamp, nonce, encrypt) 字典序排序后拼接
-func (w *WeCom) checkSignature(signature, timestamp, nonce, encrypt string) error {
-	if w.cfg.WeComCallbackToken == "" {
-		return fmt.Errorf("WECOM_CALLBACK_TOKEN 未配置")
+func (w *WeCom) loadBindings() {
+	bs, err := os.ReadFile(w.bindingsFile())
+	if err != nil {
+		return
 	}
-	parts := []string{w.cfg.WeComCallbackToken, timestamp, nonce, encrypt}
-	sort.Strings(parts)
-	h := sha1.New()
-	h.Write([]byte(strings.Join(parts, "")))
-	got := hex.EncodeToString(h.Sum(nil))
-	if got != signature {
-		return fmt.Errorf("signature mismatch: got=%s want=%s", got, signature)
+	var list []ChatBinding
+	if err := json.Unmarshal(bs, &list); err != nil {
+		log.Printf("[wecom] load bindings: %v", err)
+		return
 	}
-	return nil
+	w.mu.Lock()
+	for _, b := range list {
+		w.bindings[b.ChatID] = b.Role
+		if b.FirstSeen.IsZero() {
+			w.discovered[b.ChatID] = time.Now()
+		} else {
+			w.discovered[b.ChatID] = b.FirstSeen
+		}
+	}
+	w.mu.Unlock()
 }
 
-// decrypt AES-256-CBC 解密 EncodingAESKey
-//   EncodingAESKey 是 43 字符 base64 → 32 字节 key
-//   IV = AESKey 前 16 字节
-//   明文 = 16 字节随机 + 真实消息 + 4 字节 msg_len(网络字节序) + receiveid
-func (w *WeCom) decrypt(encrypt string) ([]byte, error) {
-	if w.cfg.WeComCallbackAES == "" {
-		return nil, fmt.Errorf("WECOM_CALLBACK_AES_KEY 未配置")
+func (w *WeCom) saveBindings() error {
+	w.mu.RLock()
+	list := make([]ChatBinding, 0, len(w.discovered))
+	for cid, seen := range w.discovered {
+		list = append(list, ChatBinding{
+			ChatID:    cid,
+			Role:      w.bindings[cid],
+			FirstSeen: seen,
+		})
 	}
-	// 企微的 EncodingAESKey 是 43 字符 base64(无 padding),加 "=" 补齐
-	aesKeyB64 := w.cfg.WeComCallbackAES
-	if len(aesKeyB64) == 43 {
-		aesKeyB64 += "="
-	}
-	aesKey, err := base64.StdEncoding.DecodeString(aesKeyB64)
-	if err != nil {
-		return nil, fmt.Errorf("base64 aes key: %w", err)
-	}
+	w.mu.RUnlock()
 
-	encBs, err := base64.StdEncoding.DecodeString(encrypt)
-	if err != nil {
-		return nil, fmt.Errorf("base64 encrypt: %w", err)
-	}
-
-	block, err := aes.NewCipher(aesKey)
-	if err != nil {
-		return nil, err
-	}
-	if len(encBs)%aes.BlockSize != 0 {
-		return nil, fmt.Errorf("ciphertext not block-aligned")
-	}
-	iv := aesKey[:16]
-	mode := cipher.NewCBCDecrypter(block, iv)
-	plain := make([]byte, len(encBs))
-	mode.CryptBlocks(plain, encBs)
-
-	// 去 PKCS#7 padding
-	padLen := int(plain[len(plain)-1])
-	if padLen < 1 || padLen > 32 {
-		return nil, fmt.Errorf("bad padding: %d", padLen)
-	}
-	plain = plain[:len(plain)-padLen]
-
-	// 前 16 字节随机 → 跳过
-	// 接下来 N 字节是消息
-	// 4 字节(网络字节序)msg_len
-	// 剩下是 receiveid
-	if len(plain) < 20 {
-		return nil, fmt.Errorf("plaintext too short: %d", len(plain))
-	}
-	msgLen := binary.BigEndian.Uint32(plain[16:20])
-	if int(msgLen) > len(plain)-20 {
-		return nil, fmt.Errorf("msg_len=%d exceeds plain", msgLen)
-	}
-	return plain[20 : 20+msgLen], nil
+	bs, _ := json.MarshalIndent(list, "", "  ")
+	return os.WriteFile(w.bindingsFile(), bs, 0o644)
 }
 
-// Encrypt 加密(回执响应企微时使用,业务上不太需要,留接口)
-func (w *WeCom) Encrypt(plain []byte) (string, error) {
-	aesKeyB64 := w.cfg.WeComCallbackAES
-	if len(aesKeyB64) == 43 {
-		aesKeyB64 += "="
+// BindChat 绑定 chat_id 到 role
+func (w *WeCom) BindChat(chatID, role string) error {
+	if role != "floor" && role != "office" && role != "" {
+		return fmt.Errorf("role must be floor/office/empty")
 	}
-	aesKey, err := base64.StdEncoding.DecodeString(aesKeyB64)
-	if err != nil {
-		return "", err
+	w.mu.Lock()
+	w.bindings[chatID] = role
+	if _, ok := w.discovered[chatID]; !ok {
+		w.discovered[chatID] = time.Now()
 	}
-	// 16 字节随机 + plain + 4 字节 len(网络序) + receiveid
-	buf := make([]byte, 16+len(plain)+4+len(w.cfg.WeComCorpID))
-	rand.Read(buf[:16])
-	copy(buf[16:], plain)
-	binary.BigEndian.PutUint32(buf[16+len(plain):], uint32(len(plain)))
-	copy(buf[16+len(plain)+4:], w.cfg.WeComCorpID)
-
-	// PKCS#7 padding
-	padLen := aes.BlockSize - len(buf)%aes.BlockSize
-	pad := bytes.Repeat([]byte{byte(padLen)}, padLen)
-	buf = append(buf, pad...)
-
-	block, err := aes.NewCipher(aesKey)
-	if err != nil {
-		return "", err
-	}
-	iv := aesKey[:16]
-	mode := cipher.NewCBCEncrypter(block, iv)
-	enc := make([]byte, len(buf))
-	mode.CryptBlocks(enc, buf)
-	return base64.StdEncoding.EncodeToString(enc), nil
+	w.mu.Unlock()
+	return w.saveBindings()
 }
 
-func truncate(s string, n int) string {
+// ListChats 列出所有已知 chat
+func (w *WeCom) ListChats() []ChatBinding {
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+	out := make([]ChatBinding, 0, len(w.discovered))
+	for cid, seen := range w.discovered {
+		out = append(out, ChatBinding{
+			ChatID:    cid,
+			Role:      w.bindings[cid],
+			FirstSeen: seen,
+		})
+	}
+	return out
+}
+
+// IsConnected 长连接状态
+func (w *WeCom) IsConnected() bool {
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+	return w.connected
+}
+
+// =====================================================================
+// HTTP helpers (保留供旧代码使用,实际不再调用)
+// =====================================================================
+
+// SendAppChatLegacy 兼容旧签名
+func (w *WeCom) SendAppChatLegacy(chatID string) bool { return false }
+
+// Truncate 字符串截断(供同包使用)
+func Truncate(s string, n int) string {
 	if len(s) <= n {
 		return s
 	}
 	return s[:n] + "..."
 }
-
-// Truncate 导出(供同包其它文件使用)
-func Truncate(s string, n int) string { return truncate(s, n) }

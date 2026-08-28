@@ -99,14 +99,11 @@ type Config struct {
 	RestockLLMModel       string `mapstructure:"RESTOCK_LLM_MODEL"`
 	RestockLLMPlanCacheHrs int `mapstructure:"RESTOCK_LLM_PLAN_CACHE_HRS"`
 
-	// 企微智能机器人
-	WeComCorpID          string `mapstructure:"WECOM_CORP_ID"`
-	WeComAgentID         string `mapstructure:"WECOM_AGENT_ID"`
-	WeComAgentSecret     string `mapstructure:"WECOM_AGENT_SECRET"`
-	WeComCallbackToken   string `mapstructure:"WECOM_CALLBACK_TOKEN"`
-	WeComCallbackAES     string `mapstructure:"WECOM_CALLBACK_AES_KEY"`
-	WeComFloorChatID     string `mapstructure:"WECOM_FLOOR_CHAT_ID"`
-	WeComOfficeChatID    string `mapstructure:"WECOM_OFFICE_CHAT_ID"`
+	// 企微智能机器人(长连接模式)
+	WeComBotID     string `mapstructure:"WECOM_BOT_ID"`
+	WeComBotSecret string `mapstructure:"WECOM_BOT_SECRET"`
+	WeComWSURL     string `mapstructure:"WECOM_WS_URL"`
+	WeComBindFile  string `mapstructure:"WECOM_BIND_FILE"`
 }
 
 // leaves 列出所有需要 BindEnv 的叶子 key
@@ -131,9 +128,7 @@ var leaves = []string{
 	"RESTOCK_CRON_HOURLY", "RESTOCK_CRON_AGGREGATE", "RESTOCK_CRON_LLM_PLAN",
 	"RESTOCK_CUBE_SALES", "RESTOCK_CUBE_INVENTORY", "RESTOCK_CUBE_PROMOTION",
 	"RESTOCK_LLM_ENABLED", "RESTOCK_LLM_PLAN_ENABLED", "RESTOCK_LLM_MODEL", "RESTOCK_LLM_PLAN_CACHE_HRS",
-	"WECOM_CORP_ID", "WECOM_AGENT_ID", "WECOM_AGENT_SECRET",
-	"WECOM_CALLBACK_TOKEN", "WECOM_CALLBACK_AES_KEY",
-	"WECOM_FLOOR_CHAT_ID", "WECOM_OFFICE_CHAT_ID",
+	"WECOM_BOT_ID", "WECOM_BOT_SECRET", "WECOM_WS_URL", "WECOM_BIND_FILE",
 }
 
 // Load 加载配置
@@ -236,13 +231,10 @@ func Load() (*Config, error) {
 	v.SetDefault("RESTOCK_LLM_PLAN_ENABLED", true)
 	v.SetDefault("RESTOCK_LLM_MODEL", "glm-4-flash")
 	v.SetDefault("RESTOCK_LLM_PLAN_CACHE_HRS", 6)
-	v.SetDefault("WECOM_CORP_ID", "")
-	v.SetDefault("WECOM_AGENT_ID", "")
-	v.SetDefault("WECOM_AGENT_SECRET", "")
-	v.SetDefault("WECOM_CALLBACK_TOKEN", "")
-	v.SetDefault("WECOM_CALLBACK_AES_KEY", "")
-	v.SetDefault("WECOM_FLOOR_CHAT_ID", "")
-	v.SetDefault("WECOM_OFFICE_CHAT_ID", "")
+	v.SetDefault("WECOM_BOT_ID", "")
+	v.SetDefault("WECOM_BOT_SECRET", "")
+	v.SetDefault("WECOM_WS_URL", "wss://openws.work.weixin.qq.com")
+	v.SetDefault("WECOM_BIND_FILE", "./wecom_bindings.json")
 
 	cfg := &Config{}
 	if err := v.Unmarshal(cfg); err != nil {

@@ -107,30 +107,43 @@ func main() {
 		LLMPlanEnabled:         cfg.RestockLLMPlanEnabled,
 		LLMModel:               cfg.RestockLLMModel,
 		LLMPlanCacheHrs:        cfg.RestockLLMPlanCacheHrs,
-		WeComCorpID:            cfg.WeComCorpID,
-		WeComAgentID:           cfg.WeComAgentID,
-		WeComAgentSecret:       cfg.WeComAgentSecret,
-		WeComCallbackToken:     cfg.WeComCallbackToken,
-		WeComCallbackAES:       cfg.WeComCallbackAES,
-		WeComFloorChatID:       cfg.WeComFloorChatID,
-		WeComOfficeChatID:      cfg.WeComOfficeChatID,
+		WeComBotID:             cfg.WeComBotID,
+		WeComBotSecret:         cfg.WeComBotSecret,
+		WeComWSURL:             cfg.WeComWSURL,
+		WeComBindFile:          cfg.WeComBindFile,
 	}
 	restockCube := restock.NewCubeQuerier(agentClient, restockCfg)
 	restockLLM := restock.NewLlmPlanner(llmClient, cfg.RestockLLMModel, cfg.RestockLLMPlanEnabled, cfg.RestockLLMPlanCacheHrs)
 	restockWeCom := restock.NewWeCom(restockCfg)
 	restockSvc := restock.NewService(restockCfg, pool, restockCube, restockLLM, restockWeCom)
 
+	// 注册企微按钮点击回调 → 复用 Service.OnButtonClick(写 Feedback + 改状态)
+	restockWeCom.OnButtonClick = restockSvc.OnButtonClick
+	restockWeCom.OnMessage = func(chatID, userID, text string) {
+		log.Printf("[wecom] msg from chat=%s user=%s: %s", chatID, userID, text)
+	}
+
 	if cfg.RestockBranchNo != "" {
 		if err := restockSvc.Start(); err != nil {
 			log.Printf("[main] restock cron start failed: %v (继续运行,restock 不可用)", err)
+		}
+		// 启企微长连接
+		if cfg.WeComBotID != "" {
+			if err := restockWeCom.Start(context.Background()); err != nil {
+				log.Printf("[main] wecom ws start failed: %v", err)
+			} else {
+				log.Printf("[main] wecom ws connecting... (bot_id=%s)", cfg.WeComBotID)
+			}
+		} else {
+			log.Printf("[main] WECOM_BOT_ID 未配置,企微长连接不启动")
 		}
 	} else {
 		log.Printf("[main] RESTOCK_BRANCH_NO 未配置,restock 模块不启动")
 	}
 
-	restockCallback := &restock.CallbackHandler{WeCom: restockWeCom, Store: restockSvc.Store}
+	defer restockWeCom.Stop()
 
-	r := api.NewRouter(h, cfg, restockCallback, restockSvc)
+	r := api.NewRouter(h, cfg, restockSvc)
 	log.Printf("[main] 限流: max_concurrent_parse=%d, wait_sec=%d", cfg.MaxConcurrentParse, cfg.RateLimitWaitSec)
 
 	srv := &http.Server{
