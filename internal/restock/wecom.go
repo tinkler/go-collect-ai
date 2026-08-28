@@ -11,6 +11,7 @@ import (
 	"io"
 	"log"
 	"net"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -123,19 +124,35 @@ func (w *WeCom) connectLoop(ctx context.Context) {
 
 // connect 单次连接生命周期: 拨号 → WS 握手 → 订阅 → 收发循环 → 断开返回
 func (w *WeCom) connect(ctx context.Context) error {
-	log.Printf("[wecom] dialing %s ...", w.cfg.WeComWSURL)
+	// 解析 wss://host:port/path → 拿 host, port, path
+	u, err := url.Parse(w.cfg.WeComWSURL)
+	if err != nil {
+		return fmt.Errorf("parse ws url: %w", err)
+	}
+	host := u.Host
+	if u.Port() == "" {
+		if u.Scheme == "wss" {
+			host = u.Host + ":443"
+		} else {
+			host = u.Host + ":80"
+		}
+	}
+	path := u.Path
+	if path == "" {
+		path = "/"
+	}
+	// Host 头不含端口(如果是 443/80)
+	hostHeader := u.Host
+
+	log.Printf("[wecom] dialing %s ...", host)
 	dialer := &net.Dialer{Timeout: 10 * time.Second}
-	rawConn, err := dialer.DialContext(ctx, "tcp", w.cfg.WeComWSURL)
+	rawConn, err := dialer.DialContext(ctx, "tcp", host)
 	if err != nil {
 		return fmt.Errorf("tcp dial: %w", err)
 	}
 
 	// WS 客户端握手
-	host := w.cfg.WeComWSURL
-	if strings.Contains(host, ":") && !strings.HasPrefix(host, "[") {
-		// 带端口
-	}
-	wsKey, err := w.wsHandshake(rawConn, host, "/")
+	wsKey, err := w.wsHandshake(rawConn, hostHeader, path)
 	if err != nil {
 		rawConn.Close()
 		return fmt.Errorf("ws handshake: %w", err)
