@@ -17,6 +17,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"crypto/tls"
 )
 
 // =====================================================================
@@ -45,7 +47,7 @@ type WeCom struct {
 	mu         sync.RWMutex
 
 	// 长连接状态
-	conn      net.Conn
+	conn      io.ReadWriteCloser
 	writeMu   sync.Mutex
 	connected bool
 
@@ -57,6 +59,9 @@ type WeCom struct {
 	// 内部
 	stopCh chan struct{}
 	reqID  uint64
+
+	// for TLS ws://
+	tlsConfig *tls.Config
 }
 
 // ChatBinding 持久化结构
@@ -151,16 +156,32 @@ func (w *WeCom) connect(ctx context.Context) error {
 		return fmt.Errorf("tcp dial: %w", err)
 	}
 
+	// wss:// 需要 TLS 握手
+	var wsConn io.ReadWriteCloser = rawConn
+	if u.Scheme == "wss" {
+		log.Printf("[wecom] tls handshake to %s ...", hostHeader)
+		tlsConn := tls.Client(rawConn, &tls.Config{
+			ServerName: hostHeader,
+			MinVersion: tls.VersionTLS12,
+		})
+		if err := tlsConn.HandshakeContext(ctx); err != nil {
+			rawConn.Close()
+			return fmt.Errorf("tls handshake: %w", err)
+		}
+		wsConn = tlsConn
+		log.Printf("[wecom] tls handshake ok")
+	}
+
 	// WS 客户端握手
-	wsKey, err := w.wsHandshake(rawConn, hostHeader, path)
+	wsKey, err := w.wsHandshake(wsConn, hostHeader, path)
 	if err != nil {
-		rawConn.Close()
+		wsConn.Close()
 		return fmt.Errorf("ws handshake: %w", err)
 	}
 	log.Printf("[wecom] ws handshake ok, key=%s", wsKey)
 
 	w.mu.Lock()
-	w.conn = rawConn
+	w.conn = wsConn
 	w.connected = true
 	w.mu.Unlock()
 
@@ -200,7 +221,7 @@ func (w *WeCom) connect(ctx context.Context) error {
 
 // wsHandshake WebSocket 客户端握手(简化版,只支持 wss://host:port/)
 //   返回 Sec-WebSocket-Accept 校验后的 key
-func (w *WeCom) wsHandshake(conn net.Conn, host, path string) (string, error) {
+func (w *WeCom) wsHandshake(conn io.ReadWriteCloser, host, path string) (string, error) {
 	// 生成 Sec-WebSocket-Key
 	keyBytes := make([]byte, 16)
 	if _, err := rand.Read(keyBytes); err != nil {
@@ -214,10 +235,13 @@ func (w *WeCom) wsHandshake(conn net.Conn, host, path string) (string, error) {
 		"Connection: Upgrade\r\n"+
 		"Sec-WebSocket-Key: %s\r\n"+
 		"Sec-WebSocket-Version: 13\r\n"+
+		"User-Agent: collect-ai-wecom/1.0\r\n"+
 		"\r\n", path, host, key)
 
-	if err := conn.SetDeadline(time.Now().Add(10 * time.Second)); err != nil {
-		return "", err
+	// tls.Conn 支持 SetDeadline, 普通 net.Conn 也支持
+	// io.ReadWriteCloser 没有 SetDeadline,我们尽量用 timeout 控制
+	if tc, ok := conn.(interface{ SetDeadline(time.Time) error }); ok {
+		_ = tc.SetDeadline(time.Now().Add(10 * time.Second))
 	}
 	if _, err := conn.Write([]byte(req)); err != nil {
 		return "", err
@@ -230,16 +254,18 @@ func (w *WeCom) wsHandshake(conn net.Conn, host, path string) (string, error) {
 		return "", err
 	}
 	resp := string(buf[:n])
-	if !strings.Contains(resp, "101") {
+	if !strings.Contains(resp, " 101 ") && !strings.Contains(resp, " 101\r") {
 		return "", fmt.Errorf("ws upgrade failed: %s", strings.SplitN(resp, "\r\n", 2)[0])
 	}
 
 	// 校验 Sec-WebSocket-Accept
 	expected := computeAcceptKey(key)
 	if !strings.Contains(resp, expected) {
-		return "", fmt.Errorf("ws accept key mismatch: want %s", expected)
+		return "", fmt.Errorf("ws accept key mismatch: want %s in %s", expected, Truncate(resp, 200))
 	}
-	conn.SetDeadline(time.Time{}) // 清除 deadline
+	if tc, ok := conn.(interface{ SetDeadline(time.Time) error }); ok {
+		_ = tc.SetDeadline(time.Time{})
+	}
 	return key, nil
 }
 
