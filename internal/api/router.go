@@ -93,6 +93,7 @@ func NewRouter(h *handler.Handler, cfg *config.Config, restockSvc *restock.Servi
 		// 企微 chat_id 管理(长连接模式下: 用户在群里发消息 → 自动发现 → 人工绑定 role)
 		api.GET("/restock/wecom/chats", restock.RestockListChats(restockSvc))
 		api.POST("/restock/wecom/chats/bind", restock.RestockBindChat(restockSvc))
+		api.POST("/restock/wecom/chats/bulk-bind", restock.RestockBulkBindChat(restockSvc))
 		api.POST("/restock/wecom/chats/test", restock.RestockTestChat(restockSvc))
 	}
 

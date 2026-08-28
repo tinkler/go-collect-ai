@@ -698,3 +698,43 @@ func RestockTestChat(svc *Service) gin.HandlerFunc {
 		c.JSON(200, gin.H{"ok": true, "sent_to": target})
 	}
 }
+
+// RestockBulkBindChat POST /api/v1/restock/wecom/chats/bulk-bind
+//   body: {"bindings":[{"chat_id":"wrXXX","role":"floor"},...]}
+//   一次性批量绑定(适合从 .env 导入或脚本部署)
+func RestockBulkBindChat(svc *Service) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		var req struct {
+			Bindings []struct {
+				ChatID string `json:"chat_id"`
+				Role   string `json:"role"`
+			} `json:"bindings"`
+		}
+		if err := c.ShouldBindJSON(&req); err != nil {
+			c.JSON(400, gin.H{"error": "bad json: " + err.Error()})
+			return
+		}
+		if len(req.Bindings) == 0 {
+			c.JSON(400, gin.H{"error": "bindings 数组不能为空"})
+			return
+		}
+		var ok, fail int
+		var errs []string
+		for _, b := range req.Bindings {
+			if b.ChatID == "" {
+				continue
+			}
+			if err := svc.WeCom.BindChat(b.ChatID, b.Role); err != nil {
+				fail++
+				errs = append(errs, b.ChatID+": "+err.Error())
+			} else {
+				ok++
+			}
+		}
+		c.JSON(200, gin.H{
+			"ok":      ok,
+			"fail":    fail,
+			"errors":  errs,
+		})
+	}
+}
