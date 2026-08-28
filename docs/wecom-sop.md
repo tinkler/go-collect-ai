@@ -68,19 +68,56 @@ URL: https://work.weixin.qq.com/wework_admin/
 - 添加 collect-ai 服务器的公网 IP(不是 127.0.0.1)
 - 多服务器时全部加上
 
-### 6. 建 2 个群并拉入应用
+### 6. 建 2 个群并拿到 chat_id
 
-**群 1:卖场补货群**
-- 群主:店长
-- 成员:所有卖场员工
-- 拉入应用:右上角 → 群机器人 → 添加 `超市 AI 助手`
-- 拿到 **chat_id**(群详情 → 群号,或企微 API 拿) → 写入 `WECOM_FLOOR_CHAT_ID`
+**chat_id 怎么拿**（管理后台不显示,必须用 API 创建时返回）:
 
-**群 2:办公室管理群**
-- 群主:店长/采购经理
-- 成员:店长、采购、办公室员工
-- 拉入应用:同上
-- 拿到 chat_id → 写入 `WECOM_OFFICE_CHAT_ID`
+#### 方式 A: 用本服务提供的端点(推荐,一键建好两个群)
+
+**前置**: 你需要一个企微 userid 作为群主(owner)。获取方法:
+- 企微管理后台 → 通讯录 → 选中一个用户 → 详情页 URL 上有 `userid=xxx` 字段
+- 或者你自己的企微 → 「我」页面 → 个人信息里有你的 userid
+
+**建群端点**: `POST http://127.0.0.1:8089/api/v1/restock/wecom/chat`
+
+```powershell
+# 建卖场群
+$body = @{
+    name    = "卖场补货群"
+    owner   = "ZhangSan"          # ← 换成你的 userid
+    userlist = @()                # ← 先空,群建好后手动拉人
+} | ConvertTo-Json
+Invoke-RestMethod -Method Post -Uri "http://127.0.0.1:8089/api/v1/restock/wecom/chat" -Body $body -ContentType "application/json"
+
+# 响应:
+# { "ok": true, "chat_id": "wrOdJLCQAAbCdEfGhIjKlMnOpQrStUvWx", "name": "卖场补货群", "hint": "..." }
+```
+
+把 `chat_id` 写入 `.env` 的 `WECOM_FLOOR_CHAT_ID`。
+
+同样的方法建办公室群,把 chat_id 写入 `WECOM_OFFICE_CHAT_ID`。
+
+#### 方式 B: 用企微原生 API
+
+```
+POST https://qyapi.weixin.qq.com/cgi-bin/appchat/create?access_token={token}
+Content-Type: application/json
+{"name":"卖场补货群","owner":"ZhangSan","userlist":[]}
+```
+
+返回 `chatid` 字段。
+
+#### 群建好后,手动拉人
+
+企微里打开群 → 右上角 → 群机器人 / 群管理 → 添加成员
+
+#### ⚠️ 常见错
+
+| errcode | 原因 | 解决 |
+|---|---|---|
+| `86003` | owner 不在应用可见范围 | 把这个人加进应用的可见部门 |
+| `86004` | 群名含敏感词 | 换个名字 |
+| `60011` | 没有该应用的权限 | 应用详情 → 权限管理 → 群应用权限开通 |
 
 ### 7. 验证回调连通
 

@@ -89,6 +89,7 @@ func NewRouter(h *handler.Handler, cfg *config.Config, restockH *restock.Callbac
 		api.GET("/restock/need-purchase", restock.RestockNeedPurchaseList(restockSvc))
 		api.POST("/restock/cron/tick", restock.RestockManualTick(restockSvc))
 		api.GET("/restock/llm/plan", restock.RestockLlmPlanNow(restockSvc))
+		api.POST("/restock/wecom/chat", restock.RestockCreateChat(restockSvc))
 	}
 
 	// ============== 企微回调(不走 /api/v1 前缀,企微后台固定) ==============

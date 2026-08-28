@@ -88,6 +88,55 @@ func (w *WeCom) GetAccessToken(ctx context.Context) (string, error) {
 	return w.accessToken, nil
 }
 
+// CreateAppChat 建群
+//   POST https://qyapi.weixin.qq.com/cgi-bin/appchat/create?access_token=...
+//   body: {"name":"群名","owner":"userid","userlist":["userid1","userid2"],"chatid":"可选,自定义 ID"}
+//   返回: {"errcode":0,"errmsg":"ok","chatid":"wrXXX"}
+//
+// 注意: 智能机器人应用建群需要 owner 是应用的可见范围成员,userlist 同理
+func (w *WeCom) CreateAppChat(ctx context.Context, name, owner string, userlist []string, customChatID string) (string, error) {
+	token, err := w.GetAccessToken(ctx)
+	if err != nil {
+		return "", err
+	}
+	if owner == "" {
+		return "", fmt.Errorf("owner is required (use 应用可见范围内的 userid)")
+	}
+
+	payload := map[string]any{
+		"name":    name,
+		"owner":   owner,
+		"userlist": userlist,
+	}
+	if customChatID != "" {
+		payload["chatid"] = customChatID
+	}
+	bs, _ := json.Marshal(payload)
+
+	url := "https://qyapi.weixin.qq.com/cgi-bin/appchat/create?access_token=" + token
+	req, _ := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(bs))
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := w.httpClient.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	respBs, _ := io.ReadAll(resp.Body)
+
+	var r struct {
+		ErrCode int    `json:"errcode"`
+		ErrMsg  string `json:"errmsg"`
+		ChatID  string `json:"chatid"`
+	}
+	if err := json.Unmarshal(respBs, &r); err != nil {
+		return "", fmt.Errorf("parse create: %w (body=%s)", err, truncate(string(respBs), 200))
+	}
+	if r.ErrCode != 0 {
+		return "", fmt.Errorf("appchat.create errcode=%d errmsg=%s", r.ErrCode, r.ErrMsg)
+	}
+	return r.ChatID, nil
+}
+
 // SendAppChat 发群应用消息到指定 chat_id
 //   chatID: 群 chat_id
 //   body:   完整的 msgtype=template_card JSON

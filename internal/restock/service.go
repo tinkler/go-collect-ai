@@ -579,3 +579,48 @@ func RestockLlmPlanNow(svc *Service) gin.HandlerFunc {
 		c.JSON(200, gin.H{"ok": true, "ts": time.Now().Unix()})
 	}
 }
+
+// RestockCreateChat POST /api/v1/restock/wecom/chat
+//   body: {"name":"群名","owner":"userid","userlist":["u1","u2"],"custom_chatid":""}
+//   一次性建好补货双群,返回 chat_id 写入 .env
+//
+//   ⚠️ owner 必须是企微智能机器人应用可见范围内的 userid
+//      拿 userid 的方法: 管理后台 → 通讯录 → 选中用户 → 详情页 URL 有 userid 字段
+//                       或: 你的企微 → 我 → 个人 userid
+func RestockCreateChat(svc *Service) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		var req struct {
+			Name         string   `json:"name"`
+			Owner        string   `json:"owner"`
+			UserList     []string `json:"userlist"`
+			CustomChatID string   `json:"custom_chatid"`
+		}
+		if err := c.ShouldBindJSON(&req); err != nil {
+			c.JSON(400, gin.H{"error": "bad json: " + err.Error()})
+			return
+		}
+		if req.Name == "" {
+			c.JSON(400, gin.H{"error": "name 必填 (群名,如 '卖场补货群')"})
+			return
+		}
+		if req.Owner == "" {
+			c.JSON(400, gin.H{"error": "owner 必填 (企微 userid, 管理后台通讯录里查)"})
+			return
+		}
+
+		ctx, cancel := context.WithTimeout(c.Request.Context(), 15*time.Second)
+		defer cancel()
+
+		chatID, err := svc.WeCom.CreateAppChat(ctx, req.Name, req.Owner, req.UserList, req.CustomChatID)
+		if err != nil {
+			c.JSON(500, gin.H{"error": err.Error()})
+			return
+		}
+		c.JSON(200, gin.H{
+			"ok":      true,
+			"chat_id": chatID,
+			"name":    req.Name,
+			"hint":    "把 chat_id 写入 .env 的 WECOM_FLOOR_CHAT_ID 或 WECOM_OFFICE_CHAT_ID",
+		})
+	}
+}
