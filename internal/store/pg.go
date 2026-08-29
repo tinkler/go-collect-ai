@@ -43,6 +43,8 @@ func Migrate(ctx context.Context, pool *pgxpool.Pool) error {
 			mode            TEXT NOT NULL,
 			image_path      TEXT NOT NULL,
 			image_url       TEXT NOT NULL DEFAULT '',
+			image_paths     JSONB NOT NULL DEFAULT '[]'::jsonb,
+			image_urls      JSONB NOT NULL DEFAULT '[]'::jsonb,
 			source          TEXT NOT NULL,
 			raw_ocr_json    JSONB,
 			raw_llm_json    JSONB,
@@ -52,6 +54,9 @@ func Migrate(ctx context.Context, pool *pgxpool.Pool) error {
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_session_created ON parse_session(created_at DESC)`,
 		`CREATE INDEX IF NOT EXISTS idx_session_supplier ON parse_session(supplier_name)`,
+		// 多图字段兼容老库(2026-08-28 加入, 用于企微 H5 多图采购收货单)
+		`ALTER TABLE parse_session ADD COLUMN IF NOT EXISTS image_paths JSONB NOT NULL DEFAULT '[]'::jsonb`,
+		`ALTER TABLE parse_session ADD COLUMN IF NOT EXISTS image_urls  JSONB NOT NULL DEFAULT '[]'::jsonb`,
 		`CREATE TABLE IF NOT EXISTS parse_row (
 			id              BIGSERIAL PRIMARY KEY,
 			session_id      UUID NOT NULL REFERENCES parse_session(id) ON DELETE CASCADE,

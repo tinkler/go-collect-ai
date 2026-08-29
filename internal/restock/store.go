@@ -235,6 +235,40 @@ func (s *Store) ListPendingNeeds(ctx context.Context, branchNo string) ([]*NeedP
 	return out, rows.Err()
 }
 
+// ListPendingNeedsBySupplier 拉某供应商所有 pending need_purchase
+//   branchNo 可选,空字符串 = 不限门店
+//   2026-08-28 加入, 用于企微 H5 采购收货单按 supplier 反查计划
+func (s *Store) ListPendingNeedsBySupplier(ctx context.Context, supplierName, branchNo string) ([]*NeedPurchase, error) {
+	q := `
+		SELECT id, branch_no, item_no, COALESCE(item_name,''), COALESCE(barcode,''),
+			COALESCE(supplier_name,''), suggest_qty, trigger_kind,
+			COALESCE(trigger_task_id,''), status, created_at, updated_at, exported_at
+		FROM restock_need_purchase
+		WHERE supplier_name = $1 AND status = 'pending'`
+	args := []any{supplierName}
+	if branchNo != "" {
+		q += " AND branch_no = $2"
+		args = append(args, branchNo)
+	}
+	q += " ORDER BY created_at DESC"
+	rows, err := s.pool.Query(ctx, q, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []*NeedPurchase
+	for rows.Next() {
+		np := &NeedPurchase{}
+		if err := rows.Scan(&np.ID, &np.BranchNo, &np.ItemNo, &np.ItemName, &np.Barcode,
+			&np.SupplierName, &np.SuggestQty, &np.TriggerKind, &np.TriggerTaskID,
+			&np.Status, &np.CreatedAt, &np.UpdatedAt, &np.ExportedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, np)
+	}
+	return out, rows.Err()
+}
+
 // MarkNeedsExported 批量标已导出
 func (s *Store) MarkNeedsExported(ctx context.Context, ids []int64) error {
 	if len(ids) == 0 {

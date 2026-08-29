@@ -17,11 +17,17 @@ func NewRouter(h *handler.Handler, cfg *config.Config, restockSvc *restock.Servi
 	r := gin.New()
 	r.Use(gin.Recovery(), gin.Logger())
 
-	// CORS (飞书 H5 跨域)
+	// CORS (飞书 H5 / 企微 H5 跨域)
+	//   2026-08-28: 反射 Origin 头, 兼容 credentials=include
 	r.Use(func(c *gin.Context) {
-		c.Header("Access-Control-Allow-Origin", "*")
+		origin := c.Request.Header.Get("Origin")
+		if origin == "" {
+			origin = "*"
+		}
+		c.Header("Access-Control-Allow-Origin", origin)
 		c.Header("Access-Control-Allow-Methods", "GET,POST,PUT,DELETE,OPTIONS")
-		c.Header("Access-Control-Allow-Headers", "Content-Type,Authorization")
+		c.Header("Access-Control-Allow-Headers", "Content-Type,Authorization,X-Requested-With")
+		c.Header("Access-Control-Allow-Credentials", "true")
 		if c.Request.Method == "OPTIONS" {
 			c.AbortWithStatus(204)
 			return
@@ -70,6 +76,9 @@ func NewRouter(h *handler.Handler, cfg *config.Config, restockSvc *restock.Servi
 		api.GET("/sessions/:id/export", h.ExportSession)
 		api.PUT("/sessions/:id/rows/:rowId", h.UpdateRow)
 		api.DELETE("/sessions/:id/rows/:rowId", h.DeleteRow)
+
+		// 采购计划(企微 H5 用, 按 supplier 反查 need_purchase) — 2026-08-28
+		api.GET("/purchase-plans", restock.PurchasePlansList(restockSvc))
 
 		// 数据源切换(unified cube)
 		//   GET  /datasource              → 当前数据源

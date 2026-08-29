@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"log"
+	"mime/multipart"
 	"os"
 	"path/filepath"
 	"sort"
@@ -14,10 +16,12 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/tinkler/collect-ai/internal/business"
+	"github.com/tinkler/collect-ai/internal/dsstate"
 	"github.com/tinkler/collect-ai/internal/model"
 	"github.com/tinkler/collect-ai/internal/parser"
 	"github.com/tinkler/collect-ai/internal/parser/agent"
 	"github.com/tinkler/collect-ai/internal/parser/matcher"
+	"github.com/tinkler/collect-ai/internal/restock"
 	"github.com/tinkler/collect-ai/internal/store"
 )
 
@@ -31,12 +35,15 @@ type Handler struct {
 	BusinessReg   *business.Registry // 业务字段映射(products / suppliers 跨数据源)
 	Sessions      *store.SessionRepo
 	Templates     *store.TemplateRepo
+	RestockSvc    *restock.Service // 2026-08-28: 采购收货单附加 plan_qty
 	FuzzyDistance int // rematch 用 (旧接口保留)
 	// 兜底值 (per-template 没配时, 用这几个)
 	DefaultOcrModel  string
 	DefaultLlmModel  string
 	DefaultUseLlm    bool
 	DefaultFuzzyDist int
+	// 2026-08-29: 数据源状态持久化路径 (空 = 不持久化)
+	DataSourceStatePath string
 }
 
 // resolveTemplateConfig 根据 template_id 查 PG, 合并兜底值
@@ -487,7 +494,10 @@ func (h *Handler) Rematch(c *gin.Context) {
 
 // ============== Sessions ==============
 
-// CreateSession multipart 收图 + 存库
+// CreateSession multipart 收图(支持 1 张或多张) + 存库
+//   多图: form-data 用 files[] 重复提交, 或 files (单字段多文件)
+//   单图兼容: 仍可用 file 字段(向后兼容飞书 H5)
+//   2026-08-28 加入多图支持
 func (h *Handler) CreateSession(c *gin.Context) {
 	supplier := c.Query("supplier")
 	mode := c.DefaultQuery("mode", "purchase")
@@ -505,45 +515,128 @@ func (h *Handler) CreateSession(c *gin.Context) {
 	effectivePrompt, effectiveOcrModel, effectiveLlmModel, useLlm, fuzzyDist, _ :=
 		h.resolveTemplateConfig(c.Request.Context(), templateID, customPrompt)
 
-	file, header, err := c.Request.FormFile("file")
-	if err != nil {
-		c.JSON(400, gin.H{"error": "未收到 file: " + err.Error()})
-		return
+	// 收集所有文件(多图): 优先 files[] 数组, 其次 files 多文件, 最后单图 file
+	type uploaded struct {
+		header *multipart.FileHeader
+		bytes  []byte
 	}
-	defer file.Close()
-	imgBytes, err := io.ReadAll(file)
-	if err != nil {
-		c.JSON(500, gin.H{"error": err.Error()})
+	var uploads []uploaded
+
+	// 强制 parse multipart(不调的话, MultipartForm 为 nil, 拿不到 files map)
+	if err := c.Request.ParseMultipartForm(32 << 20); err != nil {
+		// parse 失败, 退化到 file 字段
+		log.Printf("[CreateSession] ParseMultipartForm err: %v, fallback to file field", err)
+	}
+
+	if files := c.Request.MultipartForm; files != nil && files.File != nil {
+		if fhs, ok := files.File["files[]"]; ok && len(fhs) > 0 {
+			for _, fh := range fhs {
+				f, err := fh.Open()
+				if err != nil {
+					c.JSON(400, gin.H{"error": "打开文件失败: " + err.Error()})
+					return
+				}
+				bytes, err := io.ReadAll(f)
+				f.Close()
+				if err != nil {
+					c.JSON(500, gin.H{"error": err.Error()})
+					return
+				}
+				uploads = append(uploads, uploaded{fh, bytes})
+			}
+		} else if fhs, ok := files.File["files"]; ok && len(fhs) > 0 {
+			for _, fh := range fhs {
+				f, err := fh.Open()
+				if err != nil {
+					c.JSON(400, gin.H{"error": "打开文件失败: " + err.Error()})
+					return
+				}
+				bytes, err := io.ReadAll(f)
+				f.Close()
+				if err != nil {
+					c.JSON(500, gin.H{"error": err.Error()})
+					return
+				}
+				uploads = append(uploads, uploaded{fh, bytes})
+			}
+		}
+	}
+	if len(uploads) == 0 {
+		// 单图兼容: 飞书 H5 / 旧调用方可能只发 file
+		file, header, err := c.Request.FormFile("file")
+		if err != nil {
+			log.Printf("[CreateSession] 没有 file/files, 收到字段: %v", c.Request.MultipartForm)
+			c.JSON(400, gin.H{"error": "未收到 file/files: " + err.Error()})
+			return
+		}
+		defer file.Close()
+		bytes, err := io.ReadAll(file)
+		if err != nil {
+			c.JSON(500, gin.H{"error": err.Error()})
+			return
+		}
+		uploads = append(uploads, uploaded{header, bytes})
+	}
+
+	if len(uploads) == 0 {
+		c.JSON(400, gin.H{"error": "未收到任何图片"})
 		return
 	}
 
-	rows, _, _, err := h.Parser.ParseImageBytes(c.Request.Context(), imgBytes, header.Filename,
-		supplier, mode, effectivePrompt, effectiveOcrModel, effectiveLlmModel, useLlm, fuzzyDist)
-	if err != nil {
-		c.JSON(500, gin.H{"error": err.Error()})
-		return
-	}
-
-	// 保存图片到 uploads/
+	// 预先创建 session id, 用来组织多图目录
 	id := uuid.NewString()
-	ext := filepath.Ext(header.Filename)
-	if ext == "" {
-		ext = ".jpg"
-	}
-	relPath := filepath.Join(id[:2], id+ext)
-	absDir := filepath.Join(h.UploadDir, id[:2])
+	bucket := id[:2]
+	absDir := filepath.Join(h.UploadDir, bucket)
 	if err := os.MkdirAll(absDir, 0o755); err != nil {
 		c.JSON(500, gin.H{"error": "创建上传目录失败: " + err.Error()})
 		return
 	}
-	absPath := filepath.Join(absDir, id+ext)
-	if err := os.WriteFile(absPath, imgBytes, 0o644); err != nil {
-		c.JSON(500, gin.H{"error": "保存图片失败: " + err.Error()})
-		return
+
+	// 逐张图 OCR + 匹配, 合并 rows
+	var allRows []model.SkuRow
+	var imagePaths, imageURLs []string
+	for idx, u := range uploads {
+		ext := filepath.Ext(u.header.Filename)
+		if ext == "" {
+			ext = ".jpg"
+		}
+		// 多图文件命名: <id>_<idx>.<ext>
+		fileName := fmt.Sprintf("%s_%d%s", id, idx, ext)
+		relPath := filepath.Join(bucket, fileName)
+		absPath := filepath.Join(absDir, fileName)
+		if err := os.WriteFile(absPath, u.bytes, 0o644); err != nil {
+			c.JSON(500, gin.H{"error": "保存图片失败: " + err.Error()})
+			return
+		}
+		imagePaths = append(imagePaths, relPath)
+		if h.PublicBase != "" {
+			imageURLs = append(imageURLs, fmt.Sprintf("%s/uploads/%s/%s", h.PublicBase, bucket, fileName))
+		} else {
+			imageURLs = append(imageURLs, fmt.Sprintf("/uploads/%s/%s", bucket, fileName))
+		}
+
+		rows, _, _, err := h.Parser.ParseImageBytes(c.Request.Context(), u.bytes, u.header.Filename,
+			supplier, mode, effectivePrompt, effectiveOcrModel, effectiveLlmModel, useLlm, fuzzyDist)
+		if err != nil {
+			c.JSON(500, gin.H{"error": fmt.Sprintf("OCR 第 %d 张失败: %s", idx+1, err.Error())})
+			return
+		}
+		// 续接 seq (从已有 max 续)
+		baseSeq := len(allRows)
+		for i := range rows {
+			rows[i].Seq = baseSeq + i + 1
+		}
+		allRows = append(allRows, rows...)
 	}
+
+	// 单图兼容字段(取第一张)
+	imagePath := ""
 	imageURL := ""
-	if h.PublicBase != "" {
-		imageURL = fmt.Sprintf("%s/uploads/%s/%s", h.PublicBase, id[:2], id+ext)
+	if len(imagePaths) > 0 {
+		imagePath = imagePaths[0]
+	}
+	if len(imageURLs) > 0 {
+		imageURL = imageURLs[0]
 	}
 
 	s := &model.Session{
@@ -552,11 +645,13 @@ func (h *Handler) CreateSession(c *gin.Context) {
 		TemplateID:   templateID,
 		TemplateName: templateName,
 		Mode:         model.TemplateMode(mode),
-		ImagePath:    relPath,
+		ImagePath:    imagePath,
 		ImageURL:     imageURL,
+		ImagePaths:   imagePaths,
+		ImageURLs:    imageURLs,
 		Source:       source,
 		Note:         note,
-		Rows:         rows,
+		Rows:         allRows,
 	}
 	if err := h.Sessions.Create(c.Request.Context(), s); err != nil {
 		c.JSON(500, gin.H{"error": "存库失败: " + err.Error()})
@@ -565,6 +660,10 @@ func (h *Handler) CreateSession(c *gin.Context) {
 	// 回填 row_id
 	if saved, err := h.Sessions.Get(c.Request.Context(), id); err == nil && saved != nil {
 		s.Rows = saved.Rows
+	}
+	// 采购模式 + 有 restock 服务: 附加 plan_qty
+	if s.Mode == model.ModePurchase && h.RestockSvc != nil {
+		_ = h.RestockSvc.AttachPlanQtyToRows(c.Request.Context(), s.SupplierName, s.Rows)
 	}
 	c.JSON(200, s)
 }
@@ -600,6 +699,10 @@ func (h *Handler) GetSession(c *gin.Context) {
 	if s == nil {
 		c.JSON(404, gin.H{"error": "not found"})
 		return
+	}
+	// 采购模式 + 有 restock 服务: 附加 plan_qty (2026-08-28)
+	if s.Mode == model.ModePurchase && h.RestockSvc != nil {
+		_ = h.RestockSvc.AttachPlanQtyToRows(c.Request.Context(), s.SupplierName, s.Rows)
 	}
 	c.JSON(200, s)
 }
@@ -780,6 +883,12 @@ func (h *Handler) SetDataSource(c *gin.Context) {
 		return
 	}
 	h.Agent.SetDataSource(ds)
+	// 持久化(2026-08-29): 重启后不丢失
+	if h.DataSourceStatePath != "" {
+		if err := dsstate.Save(h.DataSourceStatePath, ds); err != nil {
+			log.Printf("[SetDataSource] save state: %v (继续运行)", err)
+		}
+	}
 	c.JSON(200, gin.H{
 		"datasource": ds,
 		"status":     "ok",

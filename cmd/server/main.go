@@ -13,6 +13,9 @@ import (
 	"github.com/tinkler/collect-ai/internal/api/handler"
 	"github.com/tinkler/collect-ai/internal/business"
 	"github.com/tinkler/collect-ai/internal/config"
+	"github.com/tinkler/collect-ai/internal/dsstate"
+
+	"path/filepath"
 	"github.com/tinkler/collect-ai/internal/parser"
 	"github.com/tinkler/collect-ai/internal/parser/agent"
 	"github.com/tinkler/collect-ai/internal/parser/bigmodel"
@@ -57,30 +60,25 @@ func main() {
 
 	ocrClient := bigmodel.NewOcrClient(cfg.BigModelAPIKey, cfg.BigModelBase, cfg.OcrTimeoutSec)
 	llmClient := bigmodel.NewLlmClient(cfg.BigModelAPIKey, cfg.BigModelBase, cfg.LlmTimeoutSec)
-	agentClient := agent.NewClient(cfg.AgentURL, cfg.AgentToken, 30, cfg.DataSource)
+	// 数据源: 优先用 .datasource.state 持久化值, 其次 env/cfg 默认值 (2026-08-29)
+	// 绝对路径: cwd 不依赖 (run_in_background 启的进程 cwd 可能不是项目目录)
+	absExe, _ := filepath.Abs(os.Args[0])
+	dsStatePath := filepath.Join(filepath.Dir(absExe), "datasource.state")
+	initialDS := cfg.DataSource
+	if savedDS := dsstate.Load(dsStatePath); savedDS != "" {
+		initialDS = savedDS
+		log.Printf("[main] datasource loaded from state: %s", initialDS)
+	} else {
+		log.Printf("[main] datasource from cfg: %s", initialDS)
+	}
+	agentClient := agent.NewClient(cfg.AgentURL, cfg.AgentToken, 30, initialDS)
 	businessReg := business.NewDefaultRegistry()
 
 	psr := parser.New(ocrClient, llmClient, agentClient)
 
-	h := &handler.Handler{
-		UploadDir:        cfg.UploadDir,
-		PublicBase:       cfg.PublicBaseURL,
-		MaxUpload:        int64(cfg.MaxUploadMB) * 1024 * 1024,
-		Parser:           psr,
-		Agent:            agentClient,
-		BusinessReg:      businessReg,
-		Sessions:         sessionRepo,
-		Templates:        templateRepo,
-		FuzzyDistance:    cfg.FuzzyDistance,
-		DefaultOcrModel:  cfg.OCRModel,
-		DefaultLlmModel:  cfg.LLMModel,
-		DefaultUseLlm:    cfg.UseLlm,
-		DefaultFuzzyDist: cfg.FuzzyDistance,
-	}
-
 	gin.SetMode(gin.ReleaseMode)
 
-	// ============== restock 模块启动 ==============
+	// ============== restock 模块启动(2026-08-28: 提前到这里,让 Handler 注入 RestockSvc) ==============
 	restockCfg := &restock.RestockConfig{
 		BranchNo:               cfg.RestockBranchNo,
 		HourlyCron:             cfg.RestockHourlyCron,
@@ -116,6 +114,24 @@ func main() {
 	restockLLM := restock.NewLlmPlanner(llmClient, cfg.RestockLLMModel, cfg.RestockLLMPlanEnabled, cfg.RestockLLMPlanCacheHrs)
 	restockWeCom := restock.NewWeCom(restockCfg)
 	restockSvc := restock.NewService(restockCfg, pool, restockCube, restockLLM, restockWeCom)
+
+	h := &handler.Handler{
+		UploadDir:           cfg.UploadDir,
+		PublicBase:          cfg.PublicBaseURL,
+		MaxUpload:           int64(cfg.MaxUploadMB) * 1024 * 1024,
+		Parser:              psr,
+		Agent:               agentClient,
+		BusinessReg:         businessReg,
+		Sessions:            sessionRepo,
+		Templates:           templateRepo,
+		RestockSvc:          restockSvc, // 2026-08-28: 采购收货单附加 plan_qty
+		FuzzyDistance:       cfg.FuzzyDistance,
+		DefaultOcrModel:     cfg.OCRModel,
+		DefaultLlmModel:     cfg.LLMModel,
+		DefaultUseLlm:       cfg.UseLlm,
+		DefaultFuzzyDist:    cfg.FuzzyDistance,
+		DataSourceStatePath: dsStatePath, // 2026-08-29: 数据源状态持久化
+	}
 
 	// 注册企微按钮点击回调 → 复用 Service.OnButtonClick(写 Feedback + 改状态 + in-place 更新卡片)
 	restockWeCom.OnButtonClick = restockSvc.OnButtonClick

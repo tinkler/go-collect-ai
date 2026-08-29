@@ -59,6 +59,12 @@ type SkuRow struct {
 	StockQty      *float64 `json:"stock_qty,omitempty"`
 	StockDiff     *float64 `json:"stock_diff,omitempty"`
 	StockMismatch bool     `json:"stock_mismatch,omitempty"`
+	// 采购计划参考(2026-08-28 加入,按识别 SKU 反查 restock_need_purchase)
+	// 仅在 GetSession 响应里填充,不入库
+	PlanItemNo   string `json:"plan_item_no,omitempty"`
+	PlanItemName string `json:"plan_item_name,omitempty"`
+	PlanBarcode  string `json:"plan_barcode,omitempty"`
+	PlanQty      *int   `json:"plan_qty,omitempty"`
 }
 
 // ============== 模板 ==============
@@ -102,9 +108,11 @@ type Session struct {
 	TemplateID   string    `json:"template_id"`
 	TemplateName string    `json:"template_name"`
 	Mode         TemplateMode `json:"mode"`
-	ImagePath    string    `json:"image_path"`
-	ImageURL     string    `json:"image_url"`
-	Source       string    `json:"source"` // csharp / feishu
+	ImagePath    string    `json:"image_path"`     // 兼容: 多图时为第一张
+	ImageURL     string    `json:"image_url"`      // 兼容: 多图时为第一张
+	ImagePaths   []string  `json:"image_paths"`    // 多图: 相对路径数组
+	ImageURLs    []string  `json:"image_urls"`     // 多图: 完整 URL 数组
+	Source       string    `json:"source"`         // csharp / feishu / wecom_h5
 	Note         string    `json:"note,omitempty"`
 	CreatedAt    time.Time `json:"created_at"`
 	UpdatedAt    time.Time `json:"updated_at"`
@@ -117,6 +125,7 @@ type SessionSummary struct {
 	TemplateName string       `json:"template_name"`
 	Mode         TemplateMode `json:"mode"`
 	RowCount     int          `json:"row_count"`
+	ImageCount   int          `json:"image_count"`  // 图片张数(2026-08-28 多图)
 	Source       string       `json:"source"`
 	CreatedAt    time.Time    `json:"created_at"`
 	UpdatedAt    time.Time    `json:"updated_at"`
