@@ -11,6 +11,7 @@ import (
 	"github.com/tinkler/collect-ai/internal/api/middleware"
 	"github.com/tinkler/collect-ai/internal/auth"
 	"github.com/tinkler/collect-ai/internal/config"
+	"github.com/tinkler/collect-ai/internal/rbac"
 	"github.com/tinkler/collect-ai/internal/restock"
 )
 
@@ -20,7 +21,7 @@ import (
 // Gin 路由中间件顺序约定: 中间件在前, handler 在最后
 //   r.GET("/x", AuthMiddleware(), RequirePerm("p"), handler)
 //   → AuthMiddleware → RequirePerm → handler
-func NewRouter(h *handler.Handler, cfg *config.Config, restockSvc *restock.Service, authSvc *auth.Service, authSign *auth.Signer) *gin.Engine {
+func NewRouter(h *handler.Handler, cfg *config.Config, restockSvc *restock.Service, authSvc *auth.Service, authSign *auth.Signer, rbacStore *rbac.Store) *gin.Engine {
 	r := gin.New()
 	r.Use(gin.Recovery(), gin.Logger())
 
@@ -126,6 +127,31 @@ func NewRouter(h *handler.Handler, cfg *config.Config, restockSvc *restock.Servi
 			authed.GET("/restock/h5/categories", auth.RequirePerm("plan:read"), restock.RestockH5Categories(restockSvc))
 			authed.GET("/restock/h5/cls-map", auth.RequirePerm("plan:read"), restock.RestockH5ClsMap(restockSvc))
 			authed.GET("/restock/h5/purchase-plans", auth.RequirePerm("plan:read"), restock.RestockH5PurchasePlans(restockSvc))
+
+			// ============== Admin 权限管理 (2026-08-30) ==============
+			rbacH := rbac.NewHandler(rbacStore)
+			admin := authed.Group("/admin", auth.RequirePerm("user:manage"))
+			{
+				admin.GET("/stats", rbacH.Stats)
+				admin.GET("/users", rbacH.ListUsers)
+				admin.GET("/users/:id", rbacH.GetUser)
+				admin.PUT("/users/:id", rbacH.UpdateUser)
+				admin.DELETE("/users/:id", rbacH.MarkLeft)
+				admin.POST("/users/:id/restore", rbacH.RestoreUser)
+
+				admin.POST("/user-roles", rbacH.GrantRole)
+				admin.DELETE("/user-roles", rbacH.RevokeRole)
+
+				admin.GET("/roles", rbacH.ListRoles)
+				admin.GET("/roles/:id", rbacH.GetRole)
+				admin.POST("/roles", rbacH.CreateRole)
+				admin.PUT("/roles/:id", rbacH.UpdateRole)
+				admin.DELETE("/roles/:id", rbacH.DeleteRole)
+
+				admin.GET("/permissions", rbacH.ListPermissions)
+				admin.GET("/departments", rbacH.ListDepartments)
+				admin.GET("/audit", rbacH.ListAudit)
+			}
 
 			// wecom chat 管理 (admin)
 			authed.GET("/restock/wecom/chats", auth.RequirePerm("admin"), restock.RestockListChats(restockSvc))

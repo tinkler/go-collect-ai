@@ -169,8 +169,9 @@ var (
 )
 
 // LoadAllRolePerms 加载 role_permissions 全表到内存
+// 2026-08-30: 改读新表 (role_id, perm_id)
 func (s *Store) LoadAllRolePerms(ctx context.Context) error {
-	rows, err := s.pool.Query(ctx, `SELECT role, perm FROM role_permissions`)
+	rows, err := s.pool.Query(ctx, `SELECT role_id, perm_id FROM role_permissions`)
 	if err != nil {
 		return err
 	}

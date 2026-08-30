@@ -20,6 +20,7 @@ import (
 	"github.com/tinkler/collect-ai/internal/parser"
 	"github.com/tinkler/collect-ai/internal/parser/agent"
 	"github.com/tinkler/collect-ai/internal/parser/bigmodel"
+	"github.com/tinkler/collect-ai/internal/rbac"
 	"github.com/tinkler/collect-ai/internal/restock"
 	"github.com/tinkler/collect-ai/internal/store"
 	"github.com/gin-gonic/gin"
@@ -178,7 +179,8 @@ func main() {
 	}
 	defer restockWeCom.Stop()
 
-	r := api.NewRouter(h, cfg, restockSvc, authSvc, authSign)
+	rbacStore := rbac.NewStore(pool)
+	r := api.NewRouter(h, cfg, restockSvc, authSvc, authSign, rbacStore)
 	log.Printf("[main] 限流: max_concurrent_parse=%d, wait_sec=%d", cfg.MaxConcurrentParse, cfg.RateLimitWaitSec)
 	log.Printf("[main] auth: dev_mode=%v, cookie_domain=%s, cookie_secure=%v, access_ttl=%ds, refresh_ttl=%ds",
 		cfg.DevMode, cfg.CookieDomain, cfg.CookieSecure, cfg.AccessTokenTTLSec, cfg.RefreshTokenTTLSec)

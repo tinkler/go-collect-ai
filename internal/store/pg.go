@@ -203,6 +203,78 @@ func Migrate(ctx context.Context, pool *pgxpool.Pool) error {
 		`CREATE INDEX IF NOT EXISTS idx_users_tenant ON users(tenant_id)`,
 		`CREATE INDEX IF NOT EXISTS idx_users_group ON users("group")`,
 
+		// ============== RBAC 增强 (2026-08-30) ==============
+		// 部门缓存 + 用户多角色 + 权限点字典 + 审计
+		`CREATE TABLE IF NOT EXISTS wecom_departments (
+			id              BIGINT PRIMARY KEY,
+			parent_id       BIGINT,
+			name            TEXT NOT NULL,
+			path            TEXT NOT NULL DEFAULT '',
+			order_idx       INT DEFAULT 0,
+			synced_at       TIMESTAMPTZ DEFAULT now()
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_dept_path ON wecom_departments(path)`,
+
+		`CREATE TABLE IF NOT EXISTS roles (
+			id              TEXT PRIMARY KEY,
+			name            TEXT NOT NULL,
+			scope           TEXT NOT NULL DEFAULT 'platform',  -- 'platform' / 'store' / 'dept'
+			description     TEXT DEFAULT '',
+			is_builtin      BOOLEAN NOT NULL DEFAULT false,
+			created_at      TIMESTAMPTZ DEFAULT now()
+		)`,
+
+		`CREATE TABLE IF NOT EXISTS permissions (
+			id              TEXT PRIMARY KEY,        -- 'session:create' / 'restock:feedback' / 'user:manage' ...
+			domain          TEXT NOT NULL,           -- 'session' / 'restock' / 'inventory' / 'user' / 'report'
+			action          TEXT NOT NULL,           -- 'create' / 'read' / 'update' / 'delete' / 'manage' / 'feedback'
+			description     TEXT DEFAULT ''
+		)`,
+
+		`CREATE TABLE IF NOT EXISTS role_permissions (
+			role_id         TEXT NOT NULL REFERENCES roles(id) ON DELETE CASCADE,
+			perm_id         TEXT NOT NULL REFERENCES permissions(id) ON DELETE CASCADE,
+			PRIMARY KEY (role_id, perm_id)
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_role_perm_perm ON role_permissions(perm_id)`,
+
+		`CREATE TABLE IF NOT EXISTS user_roles (
+			user_id         TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+			role_id         TEXT NOT NULL REFERENCES roles(id) ON DELETE CASCADE,
+			scope_type      TEXT NOT NULL DEFAULT 'all',   -- 'all' / 'store' / 'dept'
+			scope_id        TEXT NOT NULL DEFAULT '',     -- 门店号 '0001' / 部门 path '/5/12/'
+			is_primary      BOOLEAN NOT NULL DEFAULT false,
+			granted_by      TEXT DEFAULT '',
+			granted_at      TIMESTAMPTZ DEFAULT now(),
+			expires_at      TIMESTAMPTZ,                 -- 临时授权到期 (NULL=永久)
+			PRIMARY KEY (user_id, role_id, scope_type, scope_id)
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_user_roles_role ON user_roles(role_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_user_roles_expires ON user_roles(expires_at) WHERE expires_at IS NOT NULL`,
+
+		`CREATE TABLE IF NOT EXISTS permission_audit (
+			id              BIGSERIAL PRIMARY KEY,
+			actor_id        TEXT DEFAULT '',             -- 操作人
+			target_user     TEXT DEFAULT '',             -- 被操作用户
+			action          TEXT NOT NULL,               -- 'grant' / 'revoke' / 'create_role' / 'update_role' / 'delete_role' / 'left' / 'sync'
+			detail          JSONB DEFAULT '{}'::jsonb,
+			reason          TEXT DEFAULT '',
+			ts              TIMESTAMPTZ DEFAULT now()
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_audit_target_ts ON permission_audit(target_user, ts DESC)`,
+		`CREATE INDEX IF NOT EXISTS idx_audit_actor_ts ON permission_audit(actor_id, ts DESC)`,
+
+		// users 表加新字段 (部门/手机/职位/在职)
+		`ALTER TABLE users ADD COLUMN IF NOT EXISTS mobile TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE users ADD COLUMN IF NOT EXISTS department_id BIGINT`,
+		`ALTER TABLE users ADD COLUMN IF NOT EXISTS department_path TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE users ADD COLUMN IF NOT EXISTS position TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE users ADD COLUMN IF NOT EXISTS hired_at TIMESTAMPTZ`,
+		`ALTER TABLE users ADD COLUMN IF NOT EXISTS left_at TIMESTAMPTZ`,
+		`ALTER TABLE users ADD COLUMN IF NOT EXISTS sync_at TIMESTAMPTZ`,
+		`CREATE INDEX IF NOT EXISTS idx_users_dept ON users(department_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_users_left ON users(left_at)`,
+
 		`CREATE TABLE IF NOT EXISTS role_permissions (
 			role            TEXT NOT NULL,
 			perm            TEXT NOT NULL,
@@ -240,20 +312,69 @@ func Migrate(ctx context.Context, pool *pgxpool.Pool) error {
 		`UPDATE users SET "group" = 'office' WHERE id IN ('u_owner','u_manager','u_buyer') AND ("group" IS NULL OR "group" = '')`,
 		`UPDATE users SET "group" = 'floor'  WHERE id = 'u_cashier'               AND ("group" IS NULL OR "group" = '')`,
 
-		`INSERT INTO role_permissions (role, perm) VALUES
-			('owner', '*'),
+		// ============== RBAC 增强 seed (2026-08-30) ==============
+		// 内置 6 个角色 (旧的 'role' 字段 + 新的 roles 表双轨)
+		`INSERT INTO roles (id, name, scope, description, is_builtin) VALUES
+			('owner',   '店主',     'platform', '平台总管理员, 所有权限',   true),
+			('manager', '店长',     'store',   '门店管理 (单店范围)',      true),
+			('buyer',   '采购',     'platform', '采购员 (跨店)',           true),
+			('cashier', '收银',     'store',   '收银员 (单店, 只读)',     true),
+			('floor',   '卖场员工', 'store',   '卖场员工 (反馈补货)',      true),
+			('office',  '办公室',   'platform', '办公室人员 (看板)',       true)
+		ON CONFLICT (id) DO NOTHING`,
+
+		// 权限点字典 (跟现有 role_permissions 表保持一致)
+		`INSERT INTO permissions (id, domain, action, description) VALUES
+			('*',               '_wildcard', 'all',     '通配 (所有权限)'),
+			('session:create',   'session',   'create',  '创建收货单'),
+			('session:read',     'session',   'read',    '查看收货单'),
+			('session:update',   'session',   'update',  '编辑收货单'),
+			('session:delete',   'session',   'delete',  '删除收货单'),
+			('row:update',       'row',       'update',  '修改明细行'),
+			('row:delete',       'row',       'delete',  '删除明细行'),
+			('plan:read',        'plan',      'read',    '查看补货计划'),
+			('plan:create',      'plan',      'create',  '生成补货计划'),
+			('plan:approve',     'plan',      'approve', '审批补货计划'),
+			('restock:feedback', 'restock',   'feedback','反馈补货 (已补/缺货)'),
+			('inventory:view',   'inventory', 'view',    '查看库存'),
+			('inventory:adjust', 'inventory', 'adjust',  '调整库存'),
+			('report:view',      'report',    'view',    '查看报表'),
+			('user:manage',      'user',      'manage',  '管理员工/授权'),
+			('role:manage',      'role',      'manage',  '管理角色'),
+			('admin',            'admin',     'manage',  '系统管理 (同步/审计)')
+		ON CONFLICT (id) DO NOTHING`,
+
+		// 内置角色-权限映射 (新表)
+		`INSERT INTO role_permissions (role_id, perm_id) VALUES
+			('owner',   '*'),
+			('owner',   'admin'),
 			('manager', 'session:create'), ('manager', 'session:read'),
 			('manager', 'session:update'), ('manager', 'session:delete'),
-			('manager', 'row:update'), ('manager', 'row:delete'),
-			('manager', 'plan:read'), ('manager', 'plan:create'),
+			('manager', 'row:update'),     ('manager', 'row:delete'),
+			('manager', 'plan:read'),      ('manager', 'plan:create'),
+			('manager', 'restock:feedback'),
 			('manager', 'inventory:view'), ('manager', 'inventory:adjust'),
-			('manager', 'report:view'),
-			('buyer', 'session:create'), ('buyer', 'session:read'),
-			('buyer', 'session:update'), ('buyer', 'session:delete'),
-			('buyer', 'row:update'), ('buyer', 'row:delete'),
-			('buyer', 'plan:read'), ('buyer', 'plan:create'),
-			('buyer', 'inventory:view'),
-			('cashier', 'session:read'), ('cashier', 'plan:read')
+			('manager', 'report:view'),    ('manager', 'user:manage'),
+			('buyer',   'session:create'), ('buyer',   'session:read'),
+			('buyer',   'session:update'), ('buyer',   'session:delete'),
+			('buyer',   'row:update'),     ('buyer',   'row:delete'),
+			('buyer',   'plan:read'),      ('buyer',   'plan:create'),
+			('buyer',   'plan:approve'),   ('buyer',   'inventory:view'),
+			('cashier', 'session:read'),   ('cashier', 'plan:read'),
+			('cashier', 'restock:feedback'),
+			('floor',   'plan:read'),      ('floor',   'restock:feedback'),
+			('office',  'plan:read'),      ('office',  'plan:create'),
+			('office',  'inventory:view'), ('office',  'report:view'),
+			('office',  'restock:feedback')
+		ON CONFLICT (role_id, perm_id) DO NOTHING`,
+
+		// 现有 dev 账号绑定到内置角色 (1:1)
+		`INSERT INTO user_roles (user_id, role_id, scope_type, scope_id, is_primary) VALUES
+			('u_owner',   'owner',   'platform', '', true),
+			('u_manager', 'manager', 'store',   '0001', true),
+			('u_buyer',   'buyer',   'platform', '', true),
+			('u_cashier', 'cashier', 'store',   '0001', true),
+			('u_cashier', 'floor',   'store',   '0001', false)
 		ON CONFLICT DO NOTHING`,
 	}
 	for _, s := range stmts {
