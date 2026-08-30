@@ -74,12 +74,14 @@ go run ./cmd/server
 
 可用账号 (在 `users` 表 seed):
 
-| user_id | name | role | 能做的 |
+| user_id | name | role | 能做的 (跟 PG `role_permissions` 100% 对齐) |
 |---|---|---|---|
 | `u_owner` | 梁老板(店主) | owner | 全部 (`*` 通配) |
-| `u_manager` | 李店长 | manager | session:*, row:*, plan:*, inventory:* |
-| `u_buyer` | 王采购 | buyer | session:*, row:*, plan:*, inventory:view |
-| `u_cashier` | 陈收银 | cashier | session:read, plan:read (只读) |
+| `u_manager` | 李店长 | manager | session:create/read/update/delete, row:update/delete, plan:read/create, inventory:view/adjust, report:view, restock:feedback, user:manage |
+| `u_buyer` | 王采购 | buyer | session:create/read/update/delete, row:update/delete, plan:read/create/approve, inventory:view |
+| `u_cashier` | 陈收银 | cashier | session:read, plan:read, restock:feedback (只读 + 反馈) |
+
+**多角色**: `users.role` (主) 塞进 JWT, `user_roles` 表支持 N:M 扩展. **但 auth.HasPerm 只看主 role** — 最小权限原则, 不并集. 也就是说一个用户多挂几个 user_role 不会扩大他的访问范围 (需要再调一次 dev-login/admin 切换主 role).
 
 dev 登录:
 
@@ -128,11 +130,19 @@ python F:\weixinapp\supermarket-ai\get_token.py cashier   # 拿 cashier token (�
 
 ### 加一个新 perm
 
+**注意**: perm 字符串先要在 `permissions` 表登记 (有外键约束), 才能在 `role_permissions` 引用。
+
 ```sql
-INSERT INTO role_permissions (role, perm) VALUES
+-- 1. 登记新 perm (permissions 表)
+INSERT INTO permissions (id, domain, action, description) VALUES
+  ('mynew:action', 'mynew', 'action', '我的新权限')
+ON CONFLICT (id) DO NOTHING;
+
+-- 2. 分配给角色 (role_permissions 表 — 用 role_id, perm_id)
+INSERT INTO role_permissions (role_id, perm_id) VALUES
   ('manager', 'mynew:action'),
   ('buyer',   'mynew:action')
-ON CONFLICT DO NOTHING;
+ON CONFLICT (role_id, perm_id) DO NOTHING;
 ```
 
 改完 SQL 后, **重启服务** (目前不热加载)。如果想热加载: 调 `auth.Store.ReloadRolePerms(ctx)`。
@@ -145,8 +155,8 @@ INSERT INTO users (id, name, role, tenant_id, source)
 VALUES ('u_alice', 'Alice', 'supervisor', 't_dev', 'dev')
 ON CONFLICT (id) DO NOTHING;
 
--- 2. 加权限
-INSERT INTO role_permissions (role, perm) VALUES
+-- 2. 加权限 (列名是 role_id, perm_id — 不是 role, perm)
+INSERT INTO role_permissions (role_id, perm_id) VALUES
   ('supervisor', 'session:read'),
   ('supervisor', 'plan:read')
 ON CONFLICT DO NOTHING;

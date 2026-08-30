@@ -275,11 +275,9 @@ func Migrate(ctx context.Context, pool *pgxpool.Pool) error {
 		`CREATE INDEX IF NOT EXISTS idx_users_dept ON users(department_id)`,
 		`CREATE INDEX IF NOT EXISTS idx_users_left ON users(left_at)`,
 
-		`CREATE TABLE IF NOT EXISTS role_permissions (
-			role            TEXT NOT NULL,
-			perm            TEXT NOT NULL,
-			PRIMARY KEY (role, perm)
-		)`,
+		// 注意: role_permissions 表已在上面 (line ~234) 由 rbac 包创建, 列 (role_id, perm_id) + FK
+		//       这里不再重复创建 — 之前 auth 包的 (role, perm) 简版被 IF NOT EXISTS 跳过, 留作历史
+		//       真实 RBAC 数据全部走 rbac 那张表
 
 		`CREATE TABLE IF NOT EXISTS auth_sessions (
 			id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
