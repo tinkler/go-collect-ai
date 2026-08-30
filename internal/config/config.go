@@ -99,11 +99,29 @@ type Config struct {
 	RestockLLMModel       string `mapstructure:"RESTOCK_LLM_MODEL"`
 	RestockLLMPlanCacheHrs int `mapstructure:"RESTOCK_LLM_PLAN_CACHE_HRS"`
 
-	// 企微智能机器人(长连接模式)
+	// 企微智能机器人(长连接模式) — 用于 bot 长连接收消息, 跟 OAuth 无关
 	WeComBotID     string `mapstructure:"WECOM_BOT_ID"`
 	WeComBotSecret string `mapstructure:"WECOM_BOT_SECRET"`
 	WeComWSURL     string `mapstructure:"WECOM_WS_URL"`
 	WeComBindFile  string `mapstructure:"WECOM_BIND_FILE"`
+
+	// ============== 鉴权 (2026-08-29) ==============
+	// JWT
+	JWTSecret         string `mapstructure:"JWT_SECRET"`
+	AccessTokenTTLSec int    `mapstructure:"ACCESS_TOKEN_TTL_SEC"`
+	RefreshTokenTTLSec int   `mapstructure:"REFRESH_TOKEN_TTL_SEC"`
+
+	// Dev 模式开关 (启用 /auth/dev-login)
+	DevMode bool `mapstructure:"DEV_MODE"`
+
+	// 企微 OAuth (H5 免登) — corpSecret 严禁进前端
+	WeComCorpID     string `mapstructure:"WECOM_CORP_ID"`
+	WeComAgentID    string `mapstructure:"WECOM_AGENT_ID"`
+	WeComCorpSecret string `mapstructure:"WECOM_CORP_SECRET"`
+
+	// Refresh cookie
+	CookieDomain string `mapstructure:"COOKIE_DOMAIN"`
+	CookieSecure bool   `mapstructure:"COOKIE_SECURE"`
 }
 
 // leaves 列出所有需要 BindEnv 的叶子 key
@@ -129,6 +147,12 @@ var leaves = []string{
 	"RESTOCK_CUBE_SALES", "RESTOCK_CUBE_INVENTORY", "RESTOCK_CUBE_PROMOTION",
 	"RESTOCK_LLM_ENABLED", "RESTOCK_LLM_PLAN_ENABLED", "RESTOCK_LLM_MODEL", "RESTOCK_LLM_PLAN_CACHE_HRS",
 	"WECOM_BOT_ID", "WECOM_BOT_SECRET", "WECOM_WS_URL", "WECOM_BIND_FILE",
+
+	// auth
+	"JWT_SECRET", "ACCESS_TOKEN_TTL_SEC", "REFRESH_TOKEN_TTL_SEC",
+	"DEV_MODE",
+	"WECOM_CORP_ID", "WECOM_AGENT_ID", "WECOM_CORP_SECRET",
+	"COOKIE_DOMAIN", "COOKIE_SECURE",
 }
 
 // Load 加载配置
@@ -236,6 +260,19 @@ func Load() (*Config, error) {
 	v.SetDefault("WECOM_WS_URL", "wss://openws.work.weixin.qq.com")
 	v.SetDefault("WECOM_BIND_FILE", "./wecom_bindings.yaml")
 
+	// auth 默认
+	//   JWT_SECRET 故意给一个明显 dev 值, 启动时 main 会校验
+	//   强制 ≥32 字符, 满足 HS256 最低要求
+	v.SetDefault("JWT_SECRET", "dev-secret-change-me-in-prod-32chars")
+	v.SetDefault("ACCESS_TOKEN_TTL_SEC", 900)     // 15 min
+	v.SetDefault("REFRESH_TOKEN_TTL_SEC", 604800) // 7 days
+	v.SetDefault("DEV_MODE", true)                // 默认开 dev-login, 生产手动关
+	v.SetDefault("WECOM_CORP_ID", "")
+	v.SetDefault("WECOM_AGENT_ID", "")
+	v.SetDefault("WECOM_CORP_SECRET", "")
+	v.SetDefault("COOKIE_DOMAIN", "127.0.0.1")
+	v.SetDefault("COOKIE_SECURE", false)
+
 	cfg := &Config{}
 	if err := v.Unmarshal(cfg); err != nil {
 		return nil, fmt.Errorf("unmarshal config: %w", err)
@@ -244,6 +281,8 @@ func Load() (*Config, error) {
 	// 兜底: bool 字段如果 yaml / .env 写了 "true"/"false" 字符串,
 	// viper 应该自动转,但保险起见手动处理
 	cfg.UseLlm = parseBoolEnv("USE_LLM", cfg.UseLlm)
+	cfg.DevMode = parseBoolEnv("DEV_MODE", cfg.DevMode)
+	cfg.CookieSecure = parseBoolEnv("COOKIE_SECURE", cfg.CookieSecure)
 
 	return cfg, nil
 }

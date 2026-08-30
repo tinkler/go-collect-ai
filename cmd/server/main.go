@@ -11,6 +11,7 @@ import (
 
 	"github.com/tinkler/collect-ai/internal/api"
 	"github.com/tinkler/collect-ai/internal/api/handler"
+	"github.com/tinkler/collect-ai/internal/auth"
 	"github.com/tinkler/collect-ai/internal/business"
 	"github.com/tinkler/collect-ai/internal/config"
 	"github.com/tinkler/collect-ai/internal/dsstate"
@@ -115,6 +116,22 @@ func main() {
 	restockWeCom := restock.NewWeCom(restockCfg)
 	restockSvc := restock.NewService(restockCfg, pool, restockCube, restockLLM, restockWeCom)
 
+	// ============== 鉴权 (2026-08-29) ==============
+	authStore := auth.NewStore(pool)
+	// 启动时加载 role_permissions 到内存 (RBAC 热路径用)
+	if err := authStore.LoadAllRolePerms(ctx); err != nil {
+		log.Printf("[main] WARN: load role_permissions failed: %v (RBAC will deny all)", err)
+	} else {
+		log.Printf("[main] role_permissions loaded OK")
+	}
+	authSign := auth.NewSigner(cfg.JWTSecret, cfg.AccessTokenTTLSec, cfg.RefreshTokenTTLSec)
+	// 安全: prod + 默认 secret → 警告 (不阻断, 一些环境用 secrets manager 启动后才注入)
+	if !cfg.DevMode && cfg.JWTSecret == "dev-secret-change-me-in-prod-32chars" {
+		log.Printf("[main] WARNING: PROD mode with default JWT_SECRET — set JWT_SECRET in env!")
+	}
+	authWeCom := auth.NewWeComClient(cfg.WeComCorpID, cfg.WeComAgentID, cfg.WeComCorpSecret)
+	authSvc := auth.NewService(authStore, authSign, authWeCom)
+
 	h := &handler.Handler{
 		UploadDir:           cfg.UploadDir,
 		PublicBase:          cfg.PublicBaseURL,
@@ -161,8 +178,10 @@ func main() {
 	}
 	defer restockWeCom.Stop()
 
-	r := api.NewRouter(h, cfg, restockSvc)
+	r := api.NewRouter(h, cfg, restockSvc, authSvc, authSign)
 	log.Printf("[main] 限流: max_concurrent_parse=%d, wait_sec=%d", cfg.MaxConcurrentParse, cfg.RateLimitWaitSec)
+	log.Printf("[main] auth: dev_mode=%v, cookie_domain=%s, cookie_secure=%v, access_ttl=%ds, refresh_ttl=%ds",
+		cfg.DevMode, cfg.CookieDomain, cfg.CookieSecure, cfg.AccessTokenTTLSec, cfg.RefreshTokenTTLSec)
 
 	srv := &http.Server{
 		Addr:    ":" + cfg.Port,

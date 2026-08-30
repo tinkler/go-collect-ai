@@ -183,6 +183,78 @@ func Migrate(ctx context.Context, pool *pgxpool.Pool) error {
 			updated_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 			PRIMARY KEY (supplier_name, item_no)
 		)`,
+
+		// ============== 鉴权 (2026-08-29) ==============
+		// users / role_permissions / auth_sessions / audit_log
+		`CREATE TABLE IF NOT EXISTS users (
+			id              TEXT PRIMARY KEY,
+			name            TEXT NOT NULL,
+			role            TEXT NOT NULL,
+			tenant_id       TEXT NOT NULL DEFAULT 't_dev',
+			external_id     TEXT,
+			source          TEXT NOT NULL DEFAULT 'wecom',
+			status          TEXT NOT NULL DEFAULT 'active',
+			"group"         TEXT NOT NULL DEFAULT '',   -- 2026-08-30: 'floor' / 'office' / ''
+			created_at      TIMESTAMPTZ DEFAULT now(),
+			updated_at      TIMESTAMPTZ DEFAULT now()
+		)`,
+		`ALTER TABLE users ADD COLUMN IF NOT EXISTS "group" TEXT NOT NULL DEFAULT ''`,
+		`CREATE INDEX IF NOT EXISTS idx_users_role ON users(role)`,
+		`CREATE INDEX IF NOT EXISTS idx_users_tenant ON users(tenant_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_users_group ON users("group")`,
+
+		`CREATE TABLE IF NOT EXISTS role_permissions (
+			role            TEXT NOT NULL,
+			perm            TEXT NOT NULL,
+			PRIMARY KEY (role, perm)
+		)`,
+
+		`CREATE TABLE IF NOT EXISTS auth_sessions (
+			id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+			user_id         TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+			refresh_hash    TEXT NOT NULL,
+			expires_at      TIMESTAMPTZ NOT NULL,
+			created_at      TIMESTAMPTZ DEFAULT now(),
+			revoked_at      TIMESTAMPTZ
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_auth_sessions_user ON auth_sessions(user_id) WHERE revoked_at IS NULL`,
+
+		`CREATE TABLE IF NOT EXISTS audit_log (
+			id              BIGSERIAL PRIMARY KEY,
+			user_id         TEXT,
+			method          TEXT,
+			path            TEXT,
+			status          INT,
+			ts              TIMESTAMPTZ DEFAULT now()
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_audit_log_user_ts ON audit_log(user_id, ts DESC)`,
+
+		// seed 4 个 dev 账号 (2026-08-30: 加 group 分组: office=管理者,floor=卖场员工)
+		`INSERT INTO users (id, name, role, tenant_id, source, "group") VALUES
+			('u_owner',   '梁老板(店主)', 'owner',   't_dev', 'dev', 'office'),
+			('u_manager', '李店长',       'manager', 't_dev', 'dev', 'office'),
+			('u_buyer',   '王采购',       'buyer',   't_dev', 'dev', 'office'),
+			('u_cashier', '陈收银',       'cashier', 't_dev', 'dev', 'floor')
+		ON CONFLICT (id) DO NOTHING`,
+		// 已有账号补 group 字段 (UPDATE 而不是 INSERT 触发 ON CONFLICT)
+		`UPDATE users SET "group" = 'office' WHERE id IN ('u_owner','u_manager','u_buyer') AND ("group" IS NULL OR "group" = '')`,
+		`UPDATE users SET "group" = 'floor'  WHERE id = 'u_cashier'               AND ("group" IS NULL OR "group" = '')`,
+
+		`INSERT INTO role_permissions (role, perm) VALUES
+			('owner', '*'),
+			('manager', 'session:create'), ('manager', 'session:read'),
+			('manager', 'session:update'), ('manager', 'session:delete'),
+			('manager', 'row:update'), ('manager', 'row:delete'),
+			('manager', 'plan:read'), ('manager', 'plan:create'),
+			('manager', 'inventory:view'), ('manager', 'inventory:adjust'),
+			('manager', 'report:view'),
+			('buyer', 'session:create'), ('buyer', 'session:read'),
+			('buyer', 'session:update'), ('buyer', 'session:delete'),
+			('buyer', 'row:update'), ('buyer', 'row:delete'),
+			('buyer', 'plan:read'), ('buyer', 'plan:create'),
+			('buyer', 'inventory:view'),
+			('cashier', 'session:read'), ('cashier', 'plan:read')
+		ON CONFLICT DO NOTHING`,
 	}
 	for _, s := range stmts {
 		if _, err := pool.Exec(ctx, s); err != nil {

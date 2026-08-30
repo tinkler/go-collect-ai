@@ -9,11 +9,18 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/tinkler/collect-ai/internal/api/handler"
 	"github.com/tinkler/collect-ai/internal/api/middleware"
+	"github.com/tinkler/collect-ai/internal/auth"
 	"github.com/tinkler/collect-ai/internal/config"
 	"github.com/tinkler/collect-ai/internal/restock"
 )
 
-func NewRouter(h *handler.Handler, cfg *config.Config, restockSvc *restock.Service) *gin.Engine {
+// NewRouter 构造 router
+//   authSvc: 鉴权 service, 含 store + signer + wecom
+//
+// Gin 路由中间件顺序约定: 中间件在前, handler 在最后
+//   r.GET("/x", AuthMiddleware(), RequirePerm("p"), handler)
+//   → AuthMiddleware → RequirePerm → handler
+func NewRouter(h *handler.Handler, cfg *config.Config, restockSvc *restock.Service, authSvc *auth.Service, authSign *auth.Signer) *gin.Engine {
 	r := gin.New()
 	r.Use(gin.Recovery(), gin.Logger())
 
@@ -44,66 +51,88 @@ func NewRouter(h *handler.Handler, cfg *config.Config, restockSvc *restock.Servi
 	abs, _ := filepath.Abs(h.UploadDir)
 	r.Static("/uploads", abs)
 
+	// 鉴权 handler
+	authH := auth.NewHandler(authSvc, authSign, cfg.CookieDomain, cfg.CookieSecure)
+
+	// ============== /api/v1 ==============
 	api := r.Group("/api/v1")
 	{
+		// health (公开)
 		api.GET("/health", h.Health)
 
-		// suppliers
-		api.GET("/suppliers", h.ListSuppliers)
-		api.GET("/suppliers/by-brand", h.ListSuppliersByBrand)
+		// ============== 鉴权公开路由 ==============
+		api.POST("/auth/wecom/callback", authH.WeComCallback)
+		if cfg.DevMode {
+			api.POST("/auth/dev-login", authH.DevLogin)
+		}
+		api.POST("/auth/refresh", authH.Refresh)
 
-		// templates
-		api.GET("/templates", h.ListTemplates)         // 飞书: 只看 purchase + default
-		api.GET("/templates/all", h.ListAllTemplates)  // C# 管理
-		api.POST("/templates/sync", h.SyncTemplates)   // C# 整体同步
-
-		// parse (受限流保护)
-		parseGroup := api.Group("", limiter.Middleware(wait))
-		parseGroup.POST("/parse", h.Parse)                       // multipart file, 不存库
-		parseGroup.POST("/rematch", h.Rematch)                   // 用现有 rows + 新 supplier 重新跑 SkuMatcher
-		parseGroup.POST("/sessions", h.CreateSession)           // multipart, 存库 (含解析)
-
-		// 健康检查 + 限流 stats (不限流)
+		// ratelimit stats (公开, 监控用)
 		api.GET("/ratelimit/stats", func(c *gin.Context) {
 			active, max, wait, block := limiter.Stats()
 			c.JSON(200, gin.H{"active": active, "max": max, "total_wait": wait, "total_block": block})
 		})
 
-		// sessions (只读 + 改/删行 不限流, 因为不调 OCR/LLM)
-		api.GET("/sessions", h.ListSessions)
-		api.GET("/sessions/:id", h.GetSession)
-		api.DELETE("/sessions/:id", h.DeleteSession)
-		api.GET("/sessions/:id/export", h.ExportSession)
-		api.PUT("/sessions/:id/rows/:rowId", h.UpdateRow)
-		api.DELETE("/sessions/:id/rows/:rowId", h.DeleteRow)
+		// ============== 已登录路由 (AuthMiddleware) ==============
+		// 重要: gin 顺序: 中间件在前, handler 在最后
+		authed := api.Group("", auth.AuthMiddleware(authSvc, authSign))
+		{
+			// /auth/* (已登录部分)
+			authed.POST("/auth/logout", authH.Logout)
+			authed.GET("/auth/me", authH.Me)
 
-		// 采购计划(企微 H5 用, 按 supplier 反查 need_purchase) — 2026-08-28
-		api.GET("/purchase-plans", restock.PurchasePlansList(restockSvc))
+			// suppliers
+			authed.GET("/suppliers", auth.RequirePerm("session:read"), h.ListSuppliers)
+			authed.GET("/suppliers/by-brand", auth.RequirePerm("session:read"), h.ListSuppliersByBrand)
 
-		// 数据源切换(unified cube)
-		//   GET  /datasource              → 当前数据源
-		//   POST /datasource {name:"..."} → 切换数据源
-		api.GET("/datasource", h.GetDataSource)
-		api.POST("/datasource", h.SetDataSource)
+			// templates
+			authed.GET("/templates", auth.RequirePerm("session:read"), h.ListTemplates)
+			authed.GET("/templates/all", auth.RequirePerm("session:read"), h.ListAllTemplates)
+			authed.POST("/templates/sync", auth.RequirePerm("admin"), h.SyncTemplates)
 
-		// 业务层 API
-		//   GET  /datasources                   → 列出所有 (entity, datasource) 组合
-		//   GET  /products/search?datasource=&supplier=&limit= → 业务字段名商品搜索
-		api.GET("/datasources", h.ListDatasources)
-		api.GET("/products/search", h.SearchProducts)
+			// parse (受限流保护)
+			authed.POST("/parse", limiter.Middleware(wait), auth.RequirePerm("session:create"), h.Parse)
+			authed.POST("/rematch", limiter.Middleware(wait), auth.RequirePerm("session:update"), h.Rematch)
+			authed.POST("/sessions", limiter.Middleware(wait), auth.RequirePerm("session:create"), h.CreateSession)
 
-		// ============== restock 模块 ==============
-		// 管理类(GET 列表 / POST 手动触发)
-		api.GET("/restock/tasks", restock.RestockTasksList(restockSvc))
-		api.GET("/restock/need-purchase", restock.RestockNeedPurchaseList(restockSvc))
-		api.POST("/restock/cron/tick", restock.RestockManualTick(restockSvc))
-		api.GET("/restock/llm/plan", restock.RestockLlmPlanNow(restockSvc))
+			// sessions
+			authed.GET("/sessions", auth.RequirePerm("session:read"), h.ListSessions)
+			authed.GET("/sessions/:id", auth.RequirePerm("session:read"), h.GetSession)
+			authed.DELETE("/sessions/:id", auth.RequirePerm("session:delete"), h.DeleteSession)
+			authed.GET("/sessions/:id/export", auth.RequirePerm("session:read"), h.ExportSession)
+			authed.PUT("/sessions/:id/rows/:rowId", auth.RequirePerm("row:update"), h.UpdateRow)
+			authed.DELETE("/sessions/:id/rows/:rowId", auth.RequirePerm("row:delete"), h.DeleteRow)
 
-		// 企微 chat_id 管理(长连接模式下: 用户在群里发消息 → 自动发现 → 人工绑定 role)
-		api.GET("/restock/wecom/chats", restock.RestockListChats(restockSvc))
-		api.POST("/restock/wecom/chats/bind", restock.RestockBindChat(restockSvc))
-		api.POST("/restock/wecom/chats/bulk-bind", restock.RestockBulkBindChat(restockSvc))
-		api.POST("/restock/wecom/chats/test", restock.RestockTestChat(restockSvc))
+			// 采购计划
+			authed.GET("/purchase-plans", auth.RequirePerm("plan:read"), restock.PurchasePlansList(restockSvc))
+
+			// 数据源切换 (admin)
+			authed.GET("/datasource", auth.RequirePerm("admin"), h.GetDataSource)
+			authed.POST("/datasource", auth.RequirePerm("admin"), h.SetDataSource)
+
+			// 业务层 API
+			authed.GET("/datasources", auth.RequirePerm("session:read"), h.ListDatasources)
+			authed.GET("/products/search", auth.RequirePerm("session:read"), h.SearchProducts)
+
+			// restock
+			authed.GET("/restock/tasks", auth.RequirePerm("plan:read"), restock.RestockTasksList(restockSvc))
+			authed.GET("/restock/need-purchase", auth.RequirePerm("plan:read"), restock.RestockNeedPurchaseList(restockSvc))
+			authed.POST("/restock/cron/tick", auth.RequirePerm("admin"), restock.RestockManualTick(restockSvc))
+			authed.GET("/restock/llm/plan", auth.RequirePerm("plan:read"), restock.RestockLlmPlanNow(restockSvc))
+
+			// H5 视图 (2026-08-30): 替代企微群 button 交互, 按 user.group 决定返回粒度
+			authed.GET("/restock/h5/tasks", auth.RequirePerm("plan:read"), restock.RestockH5TasksList(restockSvc))
+			authed.POST("/restock/h5/tasks/:task_id/feedback", auth.RequirePerm("plan:read"), restock.RestockH5Feedback(restockSvc))
+			authed.GET("/restock/h5/categories", auth.RequirePerm("plan:read"), restock.RestockH5Categories(restockSvc))
+			authed.GET("/restock/h5/cls-map", auth.RequirePerm("plan:read"), restock.RestockH5ClsMap(restockSvc))
+			authed.GET("/restock/h5/purchase-plans", auth.RequirePerm("plan:read"), restock.RestockH5PurchasePlans(restockSvc))
+
+			// wecom chat 管理 (admin)
+			authed.GET("/restock/wecom/chats", auth.RequirePerm("admin"), restock.RestockListChats(restockSvc))
+			authed.POST("/restock/wecom/chats/bind", auth.RequirePerm("admin"), restock.RestockBindChat(restockSvc))
+			authed.POST("/restock/wecom/chats/bulk-bind", auth.RequirePerm("admin"), restock.RestockBulkBindChat(restockSvc))
+			authed.POST("/restock/wecom/chats/test", auth.RequirePerm("admin"), restock.RestockTestChat(restockSvc))
+		}
 	}
 
 	r.GET("/", func(c *gin.Context) {

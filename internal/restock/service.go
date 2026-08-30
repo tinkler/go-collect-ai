@@ -24,6 +24,18 @@ type Service struct {
 	LLM    *LlmPlanner
 	WeCom  *WeCom
 
+	// ClsDict 启动时一次性从 siss_sales_demo cube 拉的分类字典
+	//   clsno -> clsname (~150 行, 内存缓存)
+	//   用 sync.RWMutex 保护, 启动后只读
+	clsDict   map[string]string
+	clsDictMu sync.RWMutex
+
+	// ItemClsMap 启动时一次性从 items cube 拉的 SKU→分类映射
+	//   item_no -> clsno (~26485 行, 内存缓存)
+	//   H5 task API 用它直接拿到 task 的 item_clsno, 无需每次查 cube
+	itemClsMap   map[string]string
+	itemClsMapMu sync.RWMutex
+
 	stopCh   chan struct{}
 	stopOnce sync.Once
 	wg       sync.WaitGroup
@@ -37,12 +49,96 @@ func NewService(
 	wecom *WeCom,
 ) *Service {
 	return &Service{
-		Cfg:   cfg,
-		Store: NewStore(pool),
-		Cube:  cube,
-		LLM:   llm,
-		WeCom: wecom,
+		Cfg:         cfg,
+		Store:       NewStore(pool),
+		Cube:        cube,
+		LLM:         llm,
+		WeCom:       wecom,
+		clsDict:     map[string]string{},
+		itemClsMap:  map[string]string{},
 	}
+}
+
+// LoadClsDict 启动时一次性加载分类字典
+//   来源: siss_sales_demo cube GROUP BY item_clsno/item_clsname
+func (s *Service) LoadClsDict(ctx context.Context) error {
+	if s.Cube == nil || s.Cube.agent == nil {
+		return nil
+	}
+	rows, err := s.Cube.agent.Execute("siss_sales_demo",
+		[]string{"siss_sales_demo.count"},
+		[]string{"siss_sales_demo.item_clsno", "siss_sales_demo.item_clsname"},
+		nil, nil, 2000)
+	if err != nil {
+		return err
+	}
+	m := make(map[string]string, len(rows))
+	for _, r := range rows {
+		no := asString(r, "siss_sales_demo.item_clsno")
+		name := asString(r, "siss_sales_demo.item_clsname")
+		if no == "" || name == "" {
+			continue
+		}
+		m[no] = name
+	}
+	s.clsDictMu.Lock()
+	s.clsDict = m
+	s.clsDictMu.Unlock()
+	log.Printf("[restock] ClsDict loaded: %d entries", len(m))
+	return nil
+}
+
+// LoadItemClsMap 启动时一次性加载 item_no → item_clsno 映射
+//   来源: items cube (~26485 行)
+//   启动时调一次, 之后 H5 task 查 0 cube 调用
+func (s *Service) LoadItemClsMap(ctx context.Context) error {
+	if s.Cube == nil || s.Cube.agent == nil {
+		return nil
+	}
+	rows, err := s.Cube.agent.Execute("items",
+		[]string{"items.count"},
+		[]string{"items.item_no", "items.item_clsno"},
+		nil, nil, 30000)
+	if err != nil {
+		return err
+	}
+	m := make(map[string]string, len(rows))
+	for _, r := range rows {
+		ino := asString(r, "items.item_no")
+		cno := asString(r, "items.item_clsno")
+		if ino == "" || cno == "" {
+			continue
+		}
+		// 第一个出现的为准 (去重)
+		if _, exists := m[ino]; !exists {
+			m[ino] = cno
+		}
+	}
+	s.itemClsMapMu.Lock()
+	s.itemClsMap = m
+	s.itemClsMapMu.Unlock()
+	log.Printf("[restock] ItemClsMap loaded: %d entries", len(m))
+	return nil
+}
+
+// ClsNameOf 给一个 item_clsno 查 clsname (带锁)
+func (s *Service) ClsNameOf(clsno string) string {
+	if clsno == "" {
+		return ""
+	}
+	s.clsDictMu.RLock()
+	defer s.clsDictMu.RUnlock()
+	return s.clsDict[clsno]
+}
+
+// ItemClsNoOf 给一个 item_no 查 clsno (带锁)
+func (s *Service) ItemClsNoOf(itemNo string) string {
+	if itemNo == "" {
+		return ""
+	}
+	s.itemClsMapMu.RLock()
+	defer s.itemClsMapMu.RUnlock()
+	return s.itemClsMap[itemNo]
 }
 
 // Start 启动 3 个调度 goroutine(自实现,避免依赖 robfig/cron)
@@ -51,6 +147,18 @@ func NewService(
 //   - 每天 1,7,13,19 点 LlmPlanTick
 func (s *Service) Start() error {
 	s.stopCh = make(chan struct{})
+
+	// 启动时 + 每 1 小时刷新一次分类字典
+	initCtx, initCancel := context.WithTimeout(context.Background(), 60*time.Second)
+	if err := s.LoadClsDict(initCtx); err != nil {
+		log.Printf("[restock] LoadClsDict init failed: %v (分类名会显示空, 不阻断)", err)
+	}
+	if err := s.LoadItemClsMap(initCtx); err != nil {
+		log.Printf("[restock] LoadItemClsMap init failed: %v (item_clsno 会空, 不阻断)", err)
+	}
+	initCancel()
+	s.wg.Add(1)
+	go s.loopClsDictRefresh()
 
 	// Hourly tick:检查每分钟一次,匹配 cfg.HourlyCron 解析出的 hours
 	hours, err := parseHourlyHours(s.Cfg.HourlyCron)
@@ -79,6 +187,28 @@ func (s *Service) Start() error {
 	log.Printf("[restock] schedulers started: hourly=%v aggregate=%02d:%02d llm=%v",
 		hours, aggH, aggM, llmHours)
 	return nil
+}
+
+// loopClsDictRefresh 每小时刷一次分类字典 (防 siss_sales_demo cube 数据变化)
+func (s *Service) loopClsDictRefresh() {
+	defer s.wg.Done()
+	t := time.NewTicker(1 * time.Hour)
+	defer t.Stop()
+	for {
+		select {
+		case <-s.stopCh:
+			return
+		case <-t.C:
+			ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+			if err := s.LoadClsDict(ctx); err != nil {
+				log.Printf("[restock] LoadClsDict refresh: %v", err)
+			}
+			if err := s.LoadItemClsMap(ctx); err != nil {
+				log.Printf("[restock] LoadItemClsMap refresh: %v", err)
+			}
+			cancel()
+		}
+	}
 }
 
 func (s *Service) Stop() {
