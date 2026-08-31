@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"math"
 	"strconv"
 	"time"
 
@@ -248,14 +249,19 @@ func asInt(m map[string]any, key string) int {
 	}
 	switch x := v.(type) {
 	case float64:
-		return int(x)
+		return int(math.Round(x))
 	case int:
 		return x
 	case int64:
 		return int(x)
 	case string:
-		n, _ := strconv.Atoi(x)
-		return n
+		// 2026-09-01 修复: cube 端 DECIMAL 列以字符串返回 (e.g. "47.0000"),
+		// strconv.Atoi 不能解析小数串会返回 0, 导致 inv_snapshot 全部被存为 0
+		// 改用 ParseFloat + 四舍五入, 既兼容整数串("12")也兼容小数串("12.47")
+		if f, err := strconv.ParseFloat(x, 64); err == nil {
+			return int(math.Round(f))
+		}
+		return 0
 	}
 	return 0
 }

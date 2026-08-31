@@ -352,7 +352,9 @@ func (r *Registry) registerProducts() {
 					"supplier_name": "t_bd_item_info.supplier_name", // cube SQL 里已 LEFT JOIN
 					"category":      "t_bd_item_info.item_clsno",    // 简化:取 clsno,完整取 clsname 需要子查询
 					"brand":         "t_bd_item_info.item_brandname",
-					"stock_qty":     "",                          // 2026-08-31: t_bd_item_info cube 无库存 measure (qty/stock/inv 全无), 留空显 "-"
+					// 2026-09-01: cube 加了 stock_qty measure (Scalar Subquery SUM t_im_branch_stock)
+					//   扫商品场景不再显示"- (无库存字段)"
+					"stock_qty":     "t_bd_item_info.stock_qty",
 					"price":         "t_bd_item_info.sale_price", // 2026-08-31: 售价用 sale_price (原 price 是进价, sale_price 才是零售)
 				},
 			},

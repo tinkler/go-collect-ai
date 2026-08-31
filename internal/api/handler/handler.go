@@ -15,6 +15,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
+	"github.com/tinkler/collect-ai/internal/auth"
 	"github.com/tinkler/collect-ai/internal/business"
 	"github.com/tinkler/collect-ai/internal/model"
 	"github.com/tinkler/collect-ai/internal/parser"
@@ -1002,6 +1003,10 @@ func splitAndTrim(s string, seps string) []string {
 //   业务字段:barcode/product_name/supplier_id/supplier_name/category/brand/stock_qty
 //   业务字段查询(前端直接调)
 //   业务字段:barcode/product_name/supplier_id/supplier_name/category/brand/stock_qty
+//
+// 2026-09-01 权限隔离: stock_qty 字段需 inventory:view perm
+//   - 无 perm → stock_qty 既不入 query measures 也不入 response
+//   - meta.inv_viewable=false → 前端显"无权限"而不是"无库存字段"
 func (h *Handler) SearchProducts(c *gin.Context) {
 	if err := h.Agent.Ping(); err != nil {
 		c.JSON(503, gin.H{"error": "agent 不可达: " + err.Error()})
@@ -1037,8 +1042,21 @@ func (h *Handler) SearchProducts(c *gin.Context) {
 		return
 	}
 
+	// 2026-09-01: 权限隔离 — 无 inventory:view 则不查不返回 stock_qty
+	invViewable := auth.HasPerm(auth.RoleFromCtx(c), "inventory:view")
+
 	// 默认拉所有可用业务字段
 	bizFields := []string{"barcode", "product_name", "supplier_id", "supplier_name", "category", "brand", "stock_qty", "price"}
+	if !invViewable {
+		// 过滤掉 stock_qty: 既不进 query measures 也不进 response
+		filtered := bizFields[:0]
+		for _, bf := range bizFields {
+			if bf != "stock_qty" {
+				filtered = append(filtered, bf)
+			}
+		}
+		bizFields = filtered
+	}
 	measures := []string{}
 	dimensions := []string{}
 	for _, bf := range bizFields {
@@ -1094,5 +1112,8 @@ func (h *Handler) SearchProducts(c *gin.Context) {
 		"count":      len(bizRows),
 		"datasource": ds,
 		"cube":       src.Cube,
+		"meta": gin.H{
+			"inv_viewable": invViewable,
+		},
 	})
 }

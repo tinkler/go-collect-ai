@@ -19,6 +19,8 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/tinkler/collect-ai/internal/auth"
 )
 
 // userGroupFromDB 查 user.group (由 middleware 设置的 user_id 索引)
@@ -121,6 +123,8 @@ func RestockH5TasksList(svc *Service) gin.HandlerFunc {
 
 		// 3) 转 view
 		views := make([]H5TaskView, 0, len(tasks))
+		// 2026-09-01 权限隔离: 无 inventory:view 时隐藏 current_stock (库存数)
+		invViewable := permInventoryView(c)
 		for _, t := range tasks {
 			v := H5TaskView{
 				TaskID:       t.TaskID,
@@ -149,6 +153,9 @@ func RestockH5TasksList(svc *Service) gin.HandlerFunc {
 				v.LastPushAt = t.LastPushAt
 				v.CreatedAt = t.LastUpdateAt
 			}
+			if !invViewable {
+				v.CurrentStock = 0
+			}
 			views = append(views, v)
 		}
 
@@ -167,6 +174,9 @@ func RestockH5TasksList(svc *Service) gin.HandlerFunc {
 			"branch": branchNo,
 			"group":  actualGroup,
 			"full":   full,
+			"meta": gin.H{
+				"inv_viewable": invViewable,
+			},
 		})
 	}
 }
@@ -217,11 +227,23 @@ func RestockTasksList(svc *Service) gin.HandlerFunc {
 			return
 		}
 
+		// 2026-09-01 权限隔离: 无 inventory:view 时隐藏 inv_snapshot (库存数)
+		//   字段不返回 + meta.inv_viewable=false 通知前端
+		invViewable := permInventoryView(c)
+		if !invViewable {
+			for _, t := range tasks {
+				t.InvSnapshot = 0
+			}
+		}
+
 		c.JSON(200, gin.H{
 			"tasks":  tasks,
 			"count":  len(tasks),
 			"date":   date.Format("2006-01-02"),
 			"branch": branchNo,
+			"meta": gin.H{
+				"inv_viewable": invViewable,
+			},
 		})
 	}
 }
@@ -732,6 +754,41 @@ func RestockH5PurchasePlans(svc *Service) gin.HandlerFunc {
 }
 
 // ============== helpers ==============
+
+// 2026-09-01 权限隔离:
+//   "库存数" 字段 (inv_snapshot / current_stock) 是敏感数据
+//   只有持有 inventory:view perm 的角色才能看到
+//   无权限时:字段不返回 (前端拿 undefined) + meta.inv_viewable=false (前端显"无权限")
+//
+// 哪些角色有 inventory:view (查 roles 表):
+//   - owner/manager/buyer/office/floor_supervisor: 有
+//   - cashier/floor: 没有
+//
+// 设计取舍:
+//   - 不在路由 RequirePerm 上硬卡(那会 403 整页),而是在 handler 层做字段级过滤
+//     原因:扫商品/陈列表是日常高频操作,frontend 还要继续显示商品其他信息(名称/条码/价格)
+//   - 用 meta.inv_viewable 而不是 200/403,让前端能优雅降级
+
+// permInventoryView 检查当前请求用户是否有 inventory:view 权限
+//   返回 true → 可看库存数; false → 隐藏
+func permInventoryView(c *gin.Context) bool {
+	role := roleFromGin(c)
+	if role == "" {
+		return false
+	}
+	return auth.HasPerm(role, "inventory:view")
+}
+
+// roleFromGin 从 gin ctx 拿 role (auth middleware 设的)
+//   restock 包内 helper,跟 userIDFromGin 同源
+func roleFromGin(c *gin.Context) string {
+	if v, ok := c.Get("auth_role"); ok {
+		if s, ok := v.(string); ok {
+			return s
+		}
+	}
+	return ""
+}
 
 func userIDFromGin(c *gin.Context) string {
 	// auth middleware 设的 ctx key 是 "auth_user_id"
