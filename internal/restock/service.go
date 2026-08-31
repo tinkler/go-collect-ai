@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"math"
 	"strconv"
 	"strings"
 	"sync"
@@ -280,11 +281,26 @@ func (s *Service) DisplayRestockTick(ctx context.Context, period string) error {
 	if maxPush < 1 {
 		maxPush = 30
 	}
+	// 2026-08-31: 加诊断 log — 区分 "items 拉到了" 和 "实际写入"
+	//   items=45 但 DB 没数据 → 多半是 ws.SaleQty 都 <= 0 被过滤掉
+	skipZeroQtyCount := 0
+	writeCount := 0
+	saleQtySum := 0.0
 
 	for itemNo, ws := range windowSales {
-		if ws.SaleQty <= 0 {
+		// 2026-08-31: 业务过滤 — < 0.5 件忽略(0.1, 0.2 件太碎,不值得补货)
+		//   0.5 件及以上 Round 取整: 0.6→1, 1.3→1, 0.9→1, 1.5→2
+		//   0 件 / 退货 (-N) 也不补
+		if ws.SaleQty < 0.5 {
+			skipZeroQtyCount++
 			continue
 		}
+		// 取整:四舍五入
+		effQty := int(math.Round(ws.SaleQty))
+		if effQty < 1 {
+			effQty = 1
+		}
+		saleQtySum += ws.SaleQty
 
 		// 2a. 读 prev_inv(本次 tick 前)→ UpsertDisplaySuggest 累加
 		prev, _ := s.Store.GetDisplaySuggest(ctx, branch, itemNo, now)
@@ -299,10 +315,11 @@ func (s *Service) DisplayRestockTick(ctx context.Context, period string) error {
 			PeriodDate:  now,
 			InvSnapshot: ws.InvSnapshot,
 			LastPeriod:  period,
-		}, ws.SaleQty); err != nil {
+		}, effQty); err != nil {
 			log.Printf("[restock] UpsertDisplaySuggest %s: %v", itemNo, err)
 			continue
 		}
+		writeCount++
 
 		// 2b. 短补状态机
 		ss, _ := s.Store.GetShortState(ctx, branch, itemNo)
@@ -353,7 +370,7 @@ func (s *Service) DisplayRestockTick(ctx context.Context, period string) error {
 				SupplierName: ws.SupplierName,
 				Stock:        ws.InvSnapshot,
 			}
-			card := RenderFloorCard(sku, ws.SaleQty, "display-"+branch+"-"+itemNo)
+			card := RenderFloorCard(sku, int(math.Round(ws.SaleQty)), "display-"+branch+"-"+itemNo)
 			if err := s.WeCom.SendAppChat(ctx, "floor", card); err != nil {
 				log.Printf("[restock] push floor %s: %v", itemNo, err)
 			} else {
@@ -364,8 +381,8 @@ func (s *Service) DisplayRestockTick(ctx context.Context, period string) error {
 
 	// 3. tick_log
 	s.recordTickLog(ctx, branch, period, windowFrom, windowTo, TickStatusOK, "", len(windowSales))
-	log.Printf("[restock] DisplayRestockTick done period=%s items=%d pushed=%d",
-		period, len(windowSales), pushCount)
+	log.Printf("[restock] DisplayRestockTick done period=%s items=%d skipped_zero_qty=%d written=%d total_sale_qty=%.2f pushed=%d",
+		period, len(windowSales), skipZeroQtyCount, writeCount, saleQtySum, pushCount)
 	return nil
 }
 

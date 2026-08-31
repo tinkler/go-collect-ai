@@ -222,6 +222,7 @@ type DisplaySuggest struct {
 	LastSaleAt   *time.Time `json:"last_sale_at,omitempty"`
 	LastUpdateAt time.Time  `json:"last_update_at"`
 }
+// WindowSaleRow 定义在 cube_query.go (2026-08-31: SaleQty 改 float64)
 
 // ShortState 全局短补状态
 //   每店每商品 1 行,跨天持续
