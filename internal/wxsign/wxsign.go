@@ -49,11 +49,12 @@ type Service struct {
 
 	httpClient *http.Client
 
-	mu         sync.Mutex
-	accessTok  string
-	tokExpire  time.Time
+	mu          sync.Mutex
+	accessTok   string
+	tokExpire   time.Time
 	agentTicket string
-	tkExpire   time.Time
+	corpTicket  string
+	tkExpire    time.Time
 }
 
 // New 构造, dev 模式 corpID 空也没事, 调用时会返 503
@@ -71,14 +72,15 @@ func (s *Service) IsConfigured() bool {
 	return s.corpID != "" && s.agentID != "" && s.corpSecret != ""
 }
 
-// SignConfig 企业身份签名 (corpid)
+// SignConfig 企业身份签名 (corpid) — 必须用 corp 的 jsapi_ticket (不带 type=agent_config)
+//   2026-08-31: 之前误用 agent ticket, 导致 scanQRCode 报 nopermission
 func (s *Service) SignConfig(ctx context.Context, rawURL string) (corpid, timestamp, nonceStr, signature string, err error) {
 	if !s.IsConfigured() {
 		return "", "", "", "", fmt.Errorf("dev_mode: WeComCorpID/AgentID/CorpSecret 未配置")
 	}
-	tk, err := s.getAgentJsapiTicket(ctx)
+	tk, err := s.getCorpJsapiTicket(ctx)
 	if err != nil {
-		return "", "", "", "", fmt.Errorf("get agent jsapi_ticket: %w", err)
+		return "", "", "", "", fmt.Errorf("get corp jsapi_ticket: %w", err)
 	}
 	cleanURL := stripURLHash(rawURL)
 	timestamp, nonceStr = genNonce()
@@ -187,6 +189,51 @@ func (s *Service) getAgentJsapiTicket(ctx context.Context) (string, error) {
 	s.mu.Unlock()
 	log.Printf("[wxsign] agent jsapi_ticket refreshed, expires_in=%ds", r.Expires)
 	return s.agentTicket, nil
+}
+
+// getCorpJsapiTicket 拉取 corp 级别的 jsapi_ticket (用于 SignConfig 企业身份签名)
+//   接口: /cgi-bin/get_jsapi_ticket?access_token=XXX  (无 type 参数)
+//   2026-08-31: 之前 SignConfig 误用 agent ticket, 导致前端 ww.register 成功但 scanQRCode 报 nopermission
+func (s *Service) getCorpJsapiTicket(ctx context.Context) (string, error) {
+	s.mu.Lock()
+	if s.corpTicket != "" && time.Now().Add(5*time.Minute).Before(s.tkExpire) {
+		s.mu.Unlock()
+		return s.corpTicket, nil
+	}
+	s.mu.Unlock()
+
+	tok, err := s.getAccessToken(ctx)
+	if err != nil {
+		return "", err
+	}
+
+	apiURL := fmt.Sprintf("https://qyapi.weixin.qq.com/cgi-bin/get_jsapi_ticket?access_token=%s", tok)
+	req, _ := http.NewRequestWithContext(ctx, "GET", apiURL, nil)
+	resp, err := s.httpClient.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	var r struct {
+		ErrCode int    `json:"errcode"`
+		ErrMsg   string `json:"errmsg"`
+		Ticket   string `json:"ticket"`
+		Expires  int    `json:"expires_in"`
+	}
+	if err := json.Unmarshal(body, &r); err != nil {
+		return "", fmt.Errorf("decode: %w (body=%s)", err, truncate(string(body), 200))
+	}
+	if r.ErrCode != 0 || r.Ticket == "" {
+		return "", fmt.Errorf("wecom corp ticket errcode=%d errmsg=%s (检查 corpid + 应用 secret 是否对, 以及可信IP是否加白)", r.ErrCode, r.ErrMsg)
+	}
+
+	s.mu.Lock()
+	s.corpTicket = r.Ticket
+	s.tkExpire = time.Now().Add(time.Duration(r.Expires) * time.Second)
+	s.mu.Unlock()
+	log.Printf("[wxsign] corp jsapi_ticket refreshed, expires_in=%ds", r.Expires)
+	return s.corpTicket, nil
 }
 
 // stripURLHash 去掉 # 及其后面部分 (官方签名算法要求)
