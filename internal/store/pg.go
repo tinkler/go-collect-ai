@@ -184,6 +184,58 @@ func Migrate(ctx context.Context, pool *pgxpool.Pool) error {
 			PRIMARY KEY (supplier_name, item_no)
 		)`,
 
+		// ============== restock 模块新版 (2026-08-30) ==============
+		// 替代旧 restock_task / restock_sales_watch / supplier_reliability 的功能
+		// 旧表保留(加 deprecated_at 列标记软删),代码层不再写,7 天后由清理脚本 DROP
+		// 沿用:restock_need_purchase(trigger_kind 新增 'display_short' 枚举值)
+		// 沿用:restock_feedback(只用于审计)
+
+		`ALTER TABLE restock_task          ADD COLUMN IF NOT EXISTS deprecated_at TIMESTAMPTZ`,
+		`ALTER TABLE restock_sales_watch   ADD COLUMN IF NOT EXISTS deprecated_at TIMESTAMPTZ`,
+		`ALTER TABLE supplier_reliability  ADD COLUMN IF NOT EXISTS deprecated_at TIMESTAMPTZ`,
+
+		// ① 每日陈列补充建议(每店每商品每天 1 行,三次 tick 累加)
+		`CREATE TABLE IF NOT EXISTS restock_display_suggest (
+			branch_no      TEXT NOT NULL,
+			item_no        TEXT NOT NULL,
+			period_date    DATE NOT NULL,
+			suggest_qty    INT  NOT NULL DEFAULT 0,   -- 累加值,员工点完成时置 0
+			inv_snapshot   INT  NOT NULL DEFAULT 0,   -- 最新 tick 时的库存快照(用于解除 short 判定)
+			last_period    TEXT,                      -- 'eve' | 'morn' | 'aft' 上次 tick 哪个时段
+			last_sale_at   TIMESTAMPTZ,               -- 最近一次有销售的 tick 时间
+			last_update_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+			PRIMARY KEY (branch_no, item_no, period_date)
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_dsp_date ON restock_display_suggest(period_date)`,
+		`CREATE INDEX IF NOT EXISTS idx_dsp_sale ON restock_display_suggest(last_sale_at DESC) WHERE suggest_qty > 0`,
+
+		// ② 全局短补状态(每店每商品 1 行,跨天持续;短补中 ONCE 锁定)
+		`CREATE TABLE IF NOT EXISTS restock_short_state (
+			branch_no  TEXT NOT NULL,
+			item_no    TEXT NOT NULL,
+			is_short   BOOLEAN NOT NULL DEFAULT FALSE,
+			short_at   TIMESTAMPTZ,
+			short_user TEXT,                          -- 哪个员工标的(企微 user_id)
+			PRIMARY KEY (branch_no, item_no)
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_short_flag ON restock_short_state(is_short) WHERE is_short = TRUE`,
+
+		// ③ tick 执行日志(关键!用于错误恢复 + 审计;7 天清理)
+		`CREATE TABLE IF NOT EXISTS restock_tick_log (
+			id          BIGSERIAL PRIMARY KEY,
+			branch_no   TEXT NOT NULL,
+			period      TEXT NOT NULL,                -- 'eve' | 'morn' | 'aft'
+			tick_at     TIMESTAMPTZ NOT NULL,
+			window_from TIMESTAMPTZ NOT NULL,
+			window_to   TIMESTAMPTZ NOT NULL,
+			status      TEXT NOT NULL,                -- 'ok' | 'error'
+			error_msg   TEXT,
+			items_count INT NOT NULL DEFAULT 0,
+			created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_tick_branch_time ON restock_tick_log(branch_no, tick_at DESC)`,
+		`CREATE INDEX IF NOT EXISTS idx_tick_status ON restock_tick_log(status) WHERE status = 'error'`,
+
 		// ============== 鉴权 (2026-08-29) ==============
 		// users / role_permissions / auth_sessions / audit_log
 		`CREATE TABLE IF NOT EXISTS users (
@@ -333,7 +385,9 @@ func Migrate(ctx context.Context, pool *pgxpool.Pool) error {
 			('plan:read',        'plan',      'read',    '查看补货计划'),
 			('plan:create',      'plan',      'create',  '生成补货计划'),
 			('plan:approve',     'plan',      'approve', '审批补货计划'),
-			('restock:feedback', 'restock',   'feedback','反馈补货 (已补/缺货)'),
+			('restock:feedback', 'restock',   'feedback','反馈补货 (已补/缺货) [旧]'),
+			('display:short',    'display',   'short',   '陈列补货 - 点击缺货按钮 (新)'),
+			('display:done',     'display',   'done',    '陈列补货 - 点击完成按钮 (新)'),
 			('inventory:view',   'inventory', 'view',    '查看库存'),
 			('inventory:adjust', 'inventory', 'adjust',  '调整库存'),
 			('report:view',      'report',    'view',    '查看报表'),
@@ -343,6 +397,10 @@ func Migrate(ctx context.Context, pool *pgxpool.Pool) error {
 		ON CONFLICT (id) DO NOTHING`,
 
 		// 内置角色-权限映射 (新表)
+		//   2026-08-30: 加 display:short / display:done (陈列补货新版)
+		//     - floor:  营业员 → 全 2 个新 perm
+		//     - office: 办公室 → 全 2 个新 perm (后续可拆 read-only)
+		//     - cashier:收银 → 只 display:done (不能误标缺货, 收银台只需确认已补)
 		`INSERT INTO role_permissions (role_id, perm_id) VALUES
 			('owner',   '*'),
 			('owner',   'admin'),
@@ -351,6 +409,7 @@ func Migrate(ctx context.Context, pool *pgxpool.Pool) error {
 			('manager', 'row:update'),     ('manager', 'row:delete'),
 			('manager', 'plan:read'),      ('manager', 'plan:create'),
 			('manager', 'restock:feedback'),
+			('manager', 'display:short'),  ('manager', 'display:done'),
 			('manager', 'inventory:view'), ('manager', 'inventory:adjust'),
 			('manager', 'report:view'),    ('manager', 'user:manage'),
 			('buyer',   'session:create'), ('buyer',   'session:read'),
@@ -360,10 +419,13 @@ func Migrate(ctx context.Context, pool *pgxpool.Pool) error {
 			('buyer',   'plan:approve'),   ('buyer',   'inventory:view'),
 			('cashier', 'session:read'),   ('cashier', 'plan:read'),
 			('cashier', 'restock:feedback'),
+			('cashier', 'display:done'),
 			('floor',   'plan:read'),      ('floor',   'restock:feedback'),
+			('floor',   'display:short'),  ('floor',   'display:done'),
 			('office',  'plan:read'),      ('office',  'plan:create'),
 			('office',  'inventory:view'), ('office',  'report:view'),
-			('office',  'restock:feedback')
+			('office',  'restock:feedback'),
+			('office',  'display:short'),  ('office',  'display:done')
 		ON CONFLICT (role_id, perm_id) DO NOTHING`,
 
 		// 现有 dev 账号绑定到内置角色 (1:1)

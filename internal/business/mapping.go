@@ -1,9 +1,9 @@
 // Package business 业务字段映射层
 //
 // 职责:
-//   1. 维护"业务字段名" → "物理 cube 字段名" 的映射表(每个 entity × datasource 一份)
-//   2. 接收前端发来的业务查询(BusinessQuery),翻译成物理 query 调用 cube-agent-server
-//   3. 收到 cube-agent-server 物理响应,翻回业务字段名返回前端
+//  1. 维护"业务字段名" → "物理 cube 字段名" 的映射表(每个 entity × datasource 一份)
+//  2. 接收前端发来的业务查询(BusinessQuery),翻译成物理 query 调用 cube-agent-server
+//  3. 收到 cube-agent-server 物理响应,翻回业务字段名返回前端
 //
 // 不做:
 //   - 不连数据库(走 cube-agent-server)
@@ -57,21 +57,23 @@ type SourceMapping struct {
 
 // EntityMapping 一个业务实体的完整映射
 type EntityMapping struct {
-	Name        string                    // "products" / "suppliers"
-	Description string                    // 业务说明
-	Fields      map[string]FieldDef       // 业务字段名 → 定义
-	Sources     map[string]SourceMapping  // key = datasource (erp/hbpos)
+	Name        string                   // "products" / "suppliers"
+	Description string                   // 业务说明
+	Fields      map[string]FieldDef      // 业务字段名 → 定义
+	Sources     map[string]SourceMapping // key = datasource (erp/hbpos)
 }
 
 // Registry 业务映射注册表
-//   并发安全,启动时初始化一次,运行时只读
+//
+//	并发安全,启动时初始化一次,运行时只读
 type Registry struct {
 	mu       sync.RWMutex
 	entities map[string]*EntityMapping
 }
 
 // NewDefaultRegistry 默认注册 products + suppliers 两个业务实体
-//   hardcode 业务字段映射规则,后续可改用 config/field_mappings.yaml
+//
+//	hardcode 业务字段映射规则,后续可改用 config/field_mappings.yaml
 func NewDefaultRegistry() *Registry {
 	r := &Registry{entities: map[string]*EntityMapping{}}
 	r.registerProducts()
@@ -102,16 +104,18 @@ func (r *Registry) List() []string {
 // ToPhysicalQuery 把业务查询翻译成物理 query
 //
 // 输入:
-//   entity:     "products"
-//   datasource: "erp" | "hbpos"
-//   businessFields: ["barcode", "product_name", "supplier_name", "stock_qty"]
-//   filter:     [{Field: "supplier_name", Op: "contains", Value: "X"}]  (业务字段)
+//
+//	entity:     "products"
+//	datasource: "erp" | "hbpos"
+//	businessFields: ["barcode", "product_name", "supplier_name", "stock_qty"]
+//	filter:     [{Field: "supplier_name", Op: "contains", Value: "X"}]  (业务字段)
 //
 // 输出:
-//   cube:           物理 cube 名
-//   measures:       ["products.qty"]
-//   dimensions:     ["products.barcode", "products.name", "products.main_supp_name"]
-//   filterRefs:     [{Member: "products.main_supp_name", Op: "contains", Values: ["X"]}]
+//
+//	cube:           物理 cube 名
+//	measures:       ["products.qty"]
+//	dimensions:     ["products.barcode", "products.name", "products.main_supp_name"]
+//	filterRefs:     [{Member: "products.main_supp_name", Op: "contains", Values: ["X"]}]
 func (r *Registry) ToPhysicalQuery(
 	entity, datasource string,
 	businessFields []string,
@@ -179,9 +183,10 @@ func (r *Registry) ToPhysicalQuery(
 }
 
 // ToBusinessResponse 把物理响应翻回业务字段名
-//   data 形如 [{"products.main_supp_name": "X", "products.name": "Y"}, ...]
-//   businessFields 是请求里指定的业务字段清单
-//   返回: [{"supplier_name": "X", "product_name": "Y"}, ...] (业务字段名,不带 cube 前缀)
+//
+//	data 形如 [{"products.main_supp_name": "X", "products.name": "Y"}, ...]
+//	businessFields 是请求里指定的业务字段清单
+//	返回: [{"supplier_name": "X", "product_name": "Y"}, ...] (业务字段名,不带 cube 前缀)
 func (r *Registry) ToBusinessResponse(
 	entity, datasource string,
 	physicalRows []map[string]any,
@@ -283,8 +288,8 @@ func (r *Registry) AvailableFields(entity string) []string {
 
 // BusinessFilter 业务 filter(前端用)
 type BusinessFilter struct {
-	Field string   `json:"field"` // 业务字段名
-	Op    string   `json:"op"`    // operator (equals/contains/in/...)
+	Field  string `json:"field"` // 业务字段名
+	Op     string `json:"op"`    // operator (equals/contains/in/...)
 	Values []any  `json:"values"`
 }
 
@@ -320,6 +325,7 @@ func (r *Registry) registerProducts() {
 			"category":      {Name: "category", Type: FieldTypeDimension, Description: "商品分类"},
 			"brand":         {Name: "brand", Type: FieldTypeDimension, Description: "品牌"},
 			"stock_qty":     {Name: "stock_qty", Type: FieldTypeMeasure, Description: "库存数(已聚合)"},
+			"price":         {Name: "price", Type: FieldTypeMeasure, Description: "当前售价(已聚合)"},
 		},
 		Sources: map[string]SourceMapping{
 			"erp": {
@@ -332,6 +338,7 @@ func (r *Registry) registerProducts() {
 					"category":      "", // ERP 没分类字段
 					"brand":         "", // ERP 没品牌字段
 					"stock_qty":     "products.qty",
+					"price":         "", // ERP 当前没暴露售价字段, 留空 (返回空)
 				},
 			},
 			"hbpos": {
@@ -339,13 +346,14 @@ func (r *Registry) registerProducts() {
 				// 这里直接用物理字段 supplier_name
 				Cube: "t_bd_item_info",
 				FieldRefs: map[string]string{
-					"barcode":       "t_bd_item_info.item_no",       // HBPoS 无独立条码字段,用 item_no 兜底
+					"barcode":       "t_bd_item_info.item_no", // HBPoS 无独立条码字段,用 item_no 兜底
 					"product_name":  "t_bd_item_info.item_name",
 					"supplier_id":   "t_bd_item_info.main_supcust",
 					"supplier_name": "t_bd_item_info.supplier_name", // cube SQL 里已 LEFT JOIN
-					"category":      "t_bd_item_info.item_clsno",   // 简化:取 clsno,完整取 clsname 需要子查询
+					"category":      "t_bd_item_info.item_clsno",    // 简化:取 clsno,完整取 clsname 需要子查询
 					"brand":         "t_bd_item_info.item_brandname",
-					"stock_qty":     "t_bd_item_info.price",         // 简化:用 price 代替(实际库存需另起 cube)
+					"stock_qty":     "",                          // 2026-08-31: t_bd_item_info cube 无库存 measure (qty/stock/inv 全无), 留空显 "-"
+					"price":         "t_bd_item_info.sale_price", // 2026-08-31: 售价用 sale_price (原 price 是进价, sale_price 才是零售)
 				},
 			},
 		},

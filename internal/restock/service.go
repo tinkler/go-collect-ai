@@ -12,6 +12,8 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/tinkler/collect-ai/internal/auth"
 )
 
 // Service restock 业务编排
@@ -141,10 +143,11 @@ func (s *Service) ItemClsNoOf(itemNo string) string {
 	return s.itemClsMap[itemNo]
 }
 
-// Start 启动 3 个调度 goroutine(自实现,避免依赖 robfig/cron)
-//   - 每小时 HourlyTick (7-21 点内)
-//   - 每天 21:30 AggregateTick
-//   - 每天 1,7,13,19 点 LlmPlanTick
+// Start 启动 3 个陈列补货调度 goroutine(自实现,避免依赖 robfig/cron)
+//   - eve  (07:00): DisplayRestockTick(period=eve),窗口 昨日 20:30 ~ 今 07:00
+//   - morn (12:00): DisplayRestockTick(period=morn),窗口 今 07:00 ~ 12:00
+//   - aft  (20:30): DisplayRestockTick(period=aft),窗口 今 12:00 ~ 20:30
+//   替代旧 HourlyTick / AggregateTick / LlmPlanTick
 func (s *Service) Start() error {
 	s.stopCh = make(chan struct{})
 
@@ -160,32 +163,34 @@ func (s *Service) Start() error {
 	s.wg.Add(1)
 	go s.loopClsDictRefresh()
 
-	// Hourly tick:检查每分钟一次,匹配 cfg.HourlyCron 解析出的 hours
-	hours, err := parseHourlyHours(s.Cfg.HourlyCron)
+	// 启动 3 个 cron 调度(07:00 / 12:00 / 20:30)
+	mkTick := func(period string) func(context.Context) error {
+		return func(ctx context.Context) error { return s.DisplayRestockTick(ctx, period) }
+	}
+
+	eveH, eveM, err := parseHHMM(s.Cfg.DisplayRestockCronEve)
 	if err != nil {
-		return fmt.Errorf("parse HourlyCron: %w", err)
+		return fmt.Errorf("parse DisplayRestockCronEve: %w", err)
 	}
 	s.wg.Add(1)
-	go s.loopHourly(hours)
+	go s.loopDaily(eveH, eveM, mkTick(PeriodEve), "DisplayRestockTick-"+PeriodEve)
 
-	// Aggregate:21:30 每日
-	aggH, aggM, err := parseHHMM(s.Cfg.AggregateCron)
+	mornH, mornM, err := parseHHMM(s.Cfg.DisplayRestockCronMorn)
 	if err != nil {
-		return fmt.Errorf("parse AggregateCron: %w", err)
+		return fmt.Errorf("parse DisplayRestockCronMorn: %w", err)
 	}
 	s.wg.Add(1)
-	go s.loopDaily(aggH, aggM, s.AggregateTick, "AggregateTick")
+	go s.loopDaily(mornH, mornM, mkTick(PeriodMorn), "DisplayRestockTick-"+PeriodMorn)
 
-	// LLM Plan:每天 1,7,13,19 点
-	llmHours, err := parseLlmHours(s.Cfg.LlmPlanCron)
+	aftH, aftM, err := parseHHMM(s.Cfg.DisplayRestockCronAft)
 	if err != nil {
-		return fmt.Errorf("parse LlmPlanCron: %w", err)
+		return fmt.Errorf("parse DisplayRestockCronAft: %w", err)
 	}
 	s.wg.Add(1)
-	go s.loopDailyHours(llmHours, s.LlmPlanTick, "LlmPlanTick")
+	go s.loopDaily(aftH, aftM, mkTick(PeriodAft), "DisplayRestockTick-"+PeriodAft)
 
-	log.Printf("[restock] schedulers started: hourly=%v aggregate=%02d:%02d llm=%v",
-		hours, aggH, aggM, llmHours)
+	log.Printf("[restock] schedulers started: eve=%02d:%02d morn=%02d:%02d aft=%02d:%02d",
+		eveH, eveM, mornH, mornM, aftH, aftM)
 	return nil
 }
 
@@ -220,28 +225,188 @@ func (s *Service) Stop() {
 	s.wg.Wait()
 }
 
-// loopHourly 每分钟检查一次,在目标小时内的 :00 整点触发
-func (s *Service) loopHourly(hours []int) {
-	defer s.wg.Done()
-	t := time.NewTicker(60 * time.Second)
-	defer t.Stop()
-	for {
+// ============== 陈列补货新版 (2026-08-30,替代 HourlyTick/AggregateTick/LlmPlanTick) ==============
+
+// DisplayRestockTick 核心闭环(7:00 / 12:00 / 20:30 各自跑一次)
+//
+// 步骤:
+//   1. 拉窗口销售 + 库存快照(带重试 5s/15s/45s 指数退避)
+//   2. 遍历每个有销售的 item
+//   2a. 读 prev_inv(本次 tick 前的 inv_snapshot)→ UpsertDisplaySuggest 累加
+//   2b. 短补状态机
+//       - is_short=TRUE  → 覆盖 need_purchase(持续累加),且 current_inv > prev_inv 解除 short(不 close need_purchase)
+//       - is_short=FALSE → 推送到卖场群(节流 DisplayRestockMaxPush)
+//   3. 写 tick_log(成功或失败,启动时扫描 error 告警)
+func (s *Service) DisplayRestockTick(ctx context.Context, period string) error {
+	branch := s.Cfg.BranchNo
+	if branch == "" {
+		return fmt.Errorf("RESTOCK_BRANCH_NO 未配置")
+	}
+	now := time.Now()
+	windowFrom, windowTo := computeWindow(period, now)
+
+	log.Printf("[restock] DisplayRestockTick start period=%s window=[%s, %s] branch=%s",
+		period, windowFrom.Format("15:04"), windowTo.Format("15:04"), branch)
+
+	// 1. 拉窗口销售(带重试)
+	retryMax := s.Cfg.DisplayRestockRetryMax
+	if retryMax < 1 {
+		retryMax = 3
+	}
+	var windowSales map[string]*WindowSaleRow
+	var err error
+	for attempt := 1; attempt <= retryMax; attempt++ {
+		windowSales, err = s.Cube.SalesInWindow(ctx, branch, windowFrom, windowTo)
+		if err == nil {
+			break
+		}
+		if attempt == retryMax {
+			s.recordTickLog(ctx, branch, period, windowFrom, windowTo, TickStatusError, err.Error(), 0)
+			log.Printf("[restock] SalesInWindow final fail (attempt %d): %v", attempt, err)
+			return err
+		}
+		backoff := time.Duration(attempt*attempt) * 5 * time.Second // 5s, 20s, 45s
+		log.Printf("[restock] SalesInWindow attempt %d failed: %v, retry in %v", attempt, err, backoff)
 		select {
-		case <-s.stopCh:
-			return
-		case now := <-t.C:
-			if now.Second() != 0 {
-				continue // 整点对齐(已对齐 ticker,通常已为 0)
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(backoff):
+		}
+	}
+
+	// 2. 遍历每个有销售的 item
+	pushCount := 0
+	maxPush := s.Cfg.DisplayRestockMaxPush
+	if maxPush < 1 {
+		maxPush = 30
+	}
+
+	for itemNo, ws := range windowSales {
+		if ws.SaleQty <= 0 {
+			continue
+		}
+
+		// 2a. 读 prev_inv(本次 tick 前)→ UpsertDisplaySuggest 累加
+		prev, _ := s.Store.GetDisplaySuggest(ctx, branch, itemNo, now)
+		prevInv := 0
+		if prev != nil {
+			prevInv = prev.InvSnapshot
+		}
+
+		if err := s.Store.UpsertDisplaySuggest(ctx, &DisplaySuggest{
+			BranchNo:    branch,
+			ItemNo:      itemNo,
+			PeriodDate:  now,
+			InvSnapshot: ws.InvSnapshot,
+			LastPeriod:  period,
+		}, ws.SaleQty); err != nil {
+			log.Printf("[restock] UpsertDisplaySuggest %s: %v", itemNo, err)
+			continue
+		}
+
+		// 2b. 短补状态机
+		ss, _ := s.Store.GetShortState(ctx, branch, itemNo)
+		isShort := ss != nil && ss.IsShort
+
+		if isShort {
+			// 2b-1. 覆盖 need_purchase(用当前 display_suggest.suggest_qty,持续累加)
+			dsp, _ := s.Store.GetDisplaySuggest(ctx, branch, itemNo, now)
+			curQty := 0
+			if dsp != nil {
+				curQty = dsp.SuggestQty
 			}
-			if !containsInt(hours, now.Hour()) {
+			if curQty > 0 {
+				if err := s.Store.UpsertNeedPurchaseFromDisplay(ctx, &NeedPurchase{
+					BranchNo:     branch,
+					ItemNo:       itemNo,
+					ItemName:     ws.ItemName,
+					Barcode:      ws.Barcode,
+					SupplierName: ws.SupplierName,
+					SuggestQty:   curQty,
+					TriggerKind:  TriggerDisplayShort,
+				}); err != nil {
+					log.Printf("[restock] UpsertNeedPurchase %s: %v", itemNo, err)
+				}
+			}
+
+			// 2b-2. 解除 short:current_inv > 上次 tick 时的 inv_snapshot
+			// need_purchase 不 close(选项 A,等员工点完成时清 0)
+			if ws.InvSnapshot > prevInv {
+				if err := s.Store.ClearShortState(ctx, branch, itemNo); err != nil {
+					log.Printf("[restock] ClearShortState %s: %v", itemNo, err)
+				} else {
+					log.Printf("[restock] short cleared: %s inv %d→%d (purchase kept pending)",
+						itemNo, prevInv, ws.InvSnapshot)
+				}
+			}
+			// 短补中不推 floor(已经走采购流程,推了反而干扰员工)
+		} else {
+			// 2b-3. 未短补,推送到卖场群(节流)
+			if pushCount >= maxPush {
 				continue
 			}
-			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
-			if err := s.HourlyTick(ctx); err != nil {
-				log.Printf("[restock] HourlyTick: %v", err)
+			sku := &SkuSnapshot{
+				BranchNo:     branch,
+				ItemNo:       itemNo,
+				ItemName:     ws.ItemName,
+				Barcode:      ws.Barcode,
+				SupplierName: ws.SupplierName,
+				Stock:        ws.InvSnapshot,
 			}
-			cancel()
+			card := RenderFloorCard(sku, ws.SaleQty, "display-"+branch+"-"+itemNo)
+			if err := s.WeCom.SendAppChat(ctx, "floor", card); err != nil {
+				log.Printf("[restock] push floor %s: %v", itemNo, err)
+			} else {
+				pushCount++
+			}
 		}
+	}
+
+	// 3. tick_log
+	s.recordTickLog(ctx, branch, period, windowFrom, windowTo, TickStatusOK, "", len(windowSales))
+	log.Printf("[restock] DisplayRestockTick done period=%s items=%d pushed=%d",
+		period, len(windowSales), pushCount)
+	return nil
+}
+
+// computeWindow 根据 period 计算本次 tick 的销售窗口
+//   eve  (07:00 tick): 昨日 20:30 ~ 今 07:00 (10.5h,跨天)
+//   morn (12:00 tick): 今 07:00 ~ 12:00 (5h)
+//   aft  (20:30 tick): 今 12:00 ~ 20:30 (8.5h)
+//   manual(手动重跑): 最近 1h 兜底
+func computeWindow(period string, now time.Time) (from, to time.Time) {
+	loc := now.Location()
+	switch period {
+	case PeriodEve:
+		to = time.Date(now.Year(), now.Month(), now.Day(), 7, 0, 0, 0, loc)
+		from = to.Add(-10*time.Hour - 30*time.Minute)
+	case PeriodMorn:
+		from = time.Date(now.Year(), now.Month(), now.Day(), 7, 0, 0, 0, loc)
+		to = time.Date(now.Year(), now.Month(), now.Day(), 12, 0, 0, 0, loc)
+	case PeriodAft:
+		from = time.Date(now.Year(), now.Month(), now.Day(), 12, 0, 0, 0, loc)
+		to = time.Date(now.Year(), now.Month(), now.Day(), 20, 30, 0, 0, loc)
+	default: // manual: 兜底 1h 窗口
+		to = now
+		from = now.Add(-1 * time.Hour)
+	}
+	return
+}
+
+// recordTickLog 记一次 tick 结果(成功 / 失败都记)
+func (s *Service) recordTickLog(ctx context.Context, branch, period string, from, to time.Time, status, errMsg string, itemsCount int) {
+	err := s.Store.RecordTickLog(ctx, &TickLog{
+		BranchNo:   branch,
+		Period:     period,
+		TickAt:     time.Now(),
+		WindowFrom: from,
+		WindowTo:   to,
+		Status:     status,
+		ErrorMsg:   errMsg,
+		ItemsCount: itemsCount,
+	})
+	if err != nil {
+		log.Printf("[restock] RecordTickLog failed: %v", err)
 	}
 }
 
@@ -261,70 +426,13 @@ func (s *Service) loopDaily(hh, mm int, fn func(context.Context) error, name str
 			t.Stop()
 			return
 		case <-t.C:
-			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 			if err := fn(ctx); err != nil {
 				log.Printf("[restock] %s: %v", name, err)
 			}
 			cancel()
 		}
 	}
-}
-
-// loopDailyHours 每天多个指定小时整点触发
-func (s *Service) loopDailyHours(hours []int, fn func(context.Context) error, name string) {
-	defer s.wg.Done()
-	lastDay := -1
-	lastHour := -1
-	t := time.NewTicker(60 * time.Second)
-	defer t.Stop()
-	for {
-		select {
-		case <-s.stopCh:
-			return
-		case now := <-t.C:
-			if now.Second() != 0 {
-				continue
-			}
-			if !containsInt(hours, now.Hour()) {
-				continue
-			}
-			if now.Day() == lastDay && now.Hour() == lastHour {
-				continue
-			}
-			lastDay, lastHour = now.Day(), now.Hour()
-			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
-			if err := fn(ctx); err != nil {
-				log.Printf("[restock] %s: %v", name, err)
-			}
-			cancel()
-		}
-	}
-}
-
-// parseHourlyHours 解析 "0 7-21 * * *" 形式 → [7,8,...,21]
-func parseHourlyHours(spec string) ([]int, error) {
-	// 简化:只解析 "0 H-H * * *" 或 "0 h,h,h * * *"
-	parts := strings.Fields(spec)
-	if len(parts) < 2 {
-		return nil, fmt.Errorf("bad spec: %s", spec)
-	}
-	hourPart := parts[1]
-	if strings.Contains(hourPart, "-") {
-		segs := strings.SplitN(hourPart, "-", 2)
-		from, _ := strconv.Atoi(segs[0])
-		to, _ := strconv.Atoi(segs[1])
-		out := make([]int, 0, to-from+1)
-		for i := from; i <= to; i++ {
-			out = append(out, i)
-		}
-		return out, nil
-	}
-	var out []int
-	for _, s := range strings.Split(hourPart, ",") {
-		n, _ := strconv.Atoi(s)
-		out = append(out, n)
-	}
-	return out, nil
 }
 
 // parseHHMM 解析 "0 30 21 * * *" → (21, 30)
@@ -336,21 +444,6 @@ func parseHHMM(spec string) (int, int, error) {
 	mm, _ := strconv.Atoi(parts[0])
 	hh, _ := strconv.Atoi(parts[1])
 	return hh, mm, nil
-}
-
-// parseLlmHours 解析 "0 0 1,7,13,19 * * *" → [1,7,13,19]
-func parseLlmHours(spec string) ([]int, error) {
-	parts := strings.Fields(spec)
-	if len(parts) < 3 {
-		return nil, fmt.Errorf("bad spec: %s", spec)
-	}
-	hourPart := parts[2]
-	var out []int
-	for _, s := range strings.Split(hourPart, ",") {
-		n, _ := strconv.Atoi(s)
-		out = append(out, n)
-	}
-	return out, nil
 }
 
 func containsInt(arr []int, v int) bool {
@@ -616,125 +709,245 @@ func (s *Service) pushOffice(ctx context.Context, event string, sku *SkuSnapshot
 	}
 }
 
-// OnButtonClick 企微按钮点击 → 写 Feedback + 改 task 状态 + in-place 更新卡片为"已确认"无按钮版
-//   reqID: 原 callback event 的 req_id,用于 aibot_respond_update_msg 帧(5 秒内)
+// OnButtonClick 企微按钮点击(2026-08-30 新版,陈列补货建议)
+//
+// 解析 eventKey:
+//   - "short"  → 员工点缺货(ONCE 锁定,已 short 的静默 ACK)
+//   - "done"   → 员工点完成(清 0 suggest_qty + 解除 short + close need_purchase)
+//
+// 参数:
+//   - reqID:   原 callback event 的 req_id,用于 aibot_respond_update_msg 帧(5 秒内)
+//   - chatID:  群 ID
+//   - userID:  员工企微 user_id
+//   - taskID:  旧版兼容字段,新版从 eventKey 解析(格式 "display-<branch>-<item>")
+//   - eventKey:"short" / "done" / "display-<branch>-<item>:short" / "display-<branch>-<item>:done"
 func (s *Service) OnButtonClick(reqID, chatID, userID, taskID, eventKey string) {
-	kind, realTaskID := parseButtonKey2(eventKey)
+	kind, branch, itemNo := parseDisplayButtonKey(eventKey)
 	if kind == "" {
+		log.Printf("[restock] OnButtonClick: unparsed eventKey=%q taskID=%q, treat as done", eventKey, taskID)
 		kind = FeedbackDone
 	}
-	if realTaskID == "" {
-		realTaskID = taskID
+	if branch == "" || itemNo == "" {
+		// 退化:从 taskID 解析("display-<branch>-<item>" 格式)
+		branch, itemNo = parseDisplayTaskID(taskID)
 	}
+	if branch == "" {
+		branch = s.Cfg.BranchNo
+	}
+
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	// 1) 写 Feedback
-	fb := &Feedback{
-		TaskID:       realTaskID,
-		FeedbackType: kind,
+	now := time.Now()
+
+	// 2026-08-30 修: parseDisplayButtonKey 返小写 ("short"/"done"), 跟 FeedbackDone/FeedbackShort 大写常量不匹配
+	//   用 .ToUpper() 兼容 (旧 eventKey DONE|SHORT 也是大写, 都过)
+	switch strings.ToUpper(kind) {
+	case FeedbackShort:
+		s.handleShortClick(ctx, reqID, chatID, userID, branch, itemNo, now)
+	case FeedbackDone:
+		s.handleDoneClick(ctx, reqID, chatID, userID, branch, itemNo, now)
+	default:
+		log.Printf("[restock] OnButtonClick: unknown kind=%q (eventKey=%q), ignore", kind, eventKey)
+	}
+}
+
+// handleShortClick 员工点缺货
+//   - 幂等检查:已 short 的静默 ACK
+//   - suggest_qty=0 的无需标(没销售 = 没缺货需求)
+//   - 写 short_state(is_short=TRUE)
+//   - 立即 upsert need_purchase(suggest_qty = current display_suggest.suggest_qty)
+func (s *Service) handleShortClick(ctx context.Context, reqID, chatID, userID, branch, itemNo string, now time.Time) {
+	// 1) 幂等检查
+	ss, _ := s.Store.GetShortState(ctx, branch, itemNo)
+	if ss != nil && ss.IsShort {
+		log.Printf("[restock] short already set: branch=%s item=%s (silent ack)", branch, itemNo)
+		s.ackCard(reqID, "已标记缺货")
+		return
+	}
+
+	// 2) 拿当前 display_suggest.suggest_qty(没有销售 = 无需标)
+	dsp, _ := s.Store.GetDisplaySuggest(ctx, branch, itemNo, now)
+	curQty := 0
+	if dsp != nil {
+		curQty = dsp.SuggestQty
+	}
+	if curQty == 0 {
+		log.Printf("[restock] short clicked but suggest_qty=0: branch=%s item=%s (silent ack)", branch, itemNo)
+		s.ackCard(reqID, "暂无销售,无需标记缺货")
+		return
+	}
+
+	// 3) 写 short_state
+	if err := s.Store.SetShortState(ctx, branch, itemNo, userID, true); err != nil {
+		log.Printf("[restock] SetShortState %s: %v", itemNo, err)
+		s.ackCard(reqID, "标记失败")
+		return
+	}
+
+	// 4) 立即 upsert need_purchase(避免空窗期)
+	_ = s.Store.UpsertNeedPurchaseFromDisplay(ctx, &NeedPurchase{
+		BranchNo:     branch,
+		ItemNo:       itemNo,
+		ItemName:     ifStr(dsp != nil, dsp.ItemName, ""),
+		SuggestQty:   curQty,
+		TriggerKind:  TriggerDisplayShort,
+	})
+
+	// 5) 写 Feedback(审计)
+	_ = s.Store.InsertFeedback(ctx, &Feedback{
+		TaskID:       "display-" + branch + "-" + itemNo,
+		FeedbackType: FeedbackShort,
 		FeedbackUser: userID,
-		FeedbackTime: time.Now(),
-	}
-	if err := s.Store.InsertFeedback(ctx, fb); err != nil {
-		log.Printf("[restock] insert feedback: %v", err)
+		FeedbackTime: now,
+	})
+
+	log.Printf("[restock] short set: branch=%s item=%s qty=%d user=%s", branch, itemNo, curQty, userID)
+	s.ackCard(reqID, "已标记缺货")
+}
+
+// handleDoneClick 员工点完成
+//   - 清 0 display_suggest.suggest_qty(当日)
+//   - 解除 short_state(允许下一轮短补)
+//   - close need_purchase(pending → cancelled, suggest_qty=0)
+func (s *Service) handleDoneClick(ctx context.Context, reqID, chatID, userID, branch, itemNo string, now time.Time) {
+	// 1) 清 display_suggest.suggest_qty
+	if err := s.Store.ClearDisplaySuggestQty(ctx, branch, itemNo, now); err != nil {
+		log.Printf("[restock] ClearDisplaySuggestQty %s: %v", itemNo, err)
 	}
 
-	// 2) 改 task 状态
-	status := TaskStatusAcked
-	if kind == FeedbackShort {
-		status = TaskStatusShort
+	// 2) 解除 short_state
+	if err := s.Store.ClearShortState(ctx, branch, itemNo); err != nil {
+		log.Printf("[restock] ClearShortState %s: %v", itemNo, err)
 	}
-	_ = s.Store.UpdateStatus(ctx, realTaskID, status)
-	log.Printf("[restock] button click: chat=%s user=%s task=%s kind=%s",
-		chatID, userID, realTaskID, kind)
 
-	// 3) in-place 更新原卡片为"已确认"无按钮版(必须在 5 秒内)
+	// 3) close need_purchase(pending → cancelled, suggest_qty=0;sent_to_supplier 不动)
+	if err := s.Store.ClearNeedPurchase(ctx, branch, itemNo); err != nil {
+		log.Printf("[restock] ClearNeedPurchase %s: %v", itemNo, err)
+	}
+
+	// 4) 写 Feedback(审计)
+	_ = s.Store.InsertFeedback(ctx, &Feedback{
+		TaskID:       "display-" + branch + "-" + itemNo,
+		FeedbackType: FeedbackDone,
+		FeedbackUser: userID,
+		FeedbackTime: now,
+	})
+
+	log.Printf("[restock] done click: branch=%s item=%s user=%s (purchase cancelled)", branch, itemNo, userID)
+	s.ackCard(reqID, "已补货")
+}
+
+// ackCard in-place 更新原卡片为"已确认"无按钮版(必须在 5 秒内)
+//   用 RenderFloorCardAfterConfirm 复用旧版的渲染逻辑
+func (s *Service) ackCard(reqID, msg string) {
 	if reqID == "" {
-		log.Printf("[restock] update card skipped: no req_id in callback")
+		log.Printf("[restock] ack card skipped: no req_id")
 		return
 	}
 	go func() {
-		// 查 task 拿 item_name / suggest_qty 用于新卡片
-		task, err := s.Store.GetTask(ctx, realTaskID)
-		if err != nil || task == nil {
-			log.Printf("[restock] update card: task %s not found: %v", realTaskID, err)
-			return
+		// 简化:直接发一个 ack 文本卡(5s 内必须到)
+		ackCard := []byte(`{"msgtype":"text","text":{"content":"` + msg + `"}}`)
+		updCtx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+		defer cancel()
+		if err := s.WeCom.SendUpdateCard(updCtx, reqID, ackCard); err != nil {
+			log.Printf("[restock] ack card failed: %v (req_id=%s msg=%s)", err, reqID, msg)
 		}
-		sku := &SkuSnapshot{
-			BranchNo:  task.BranchNo,
-			ItemNo:    task.ItemNo,
-			ItemName:  task.ItemName,
-			Stock:     task.CurrentStock,
-			YesterdaySales: task.YesterdaySales,
-		}
-		newCard := RenderFloorCardAfterConfirm(sku, task.SuggestQty, kind)
-		updCtx, cancelUpd := context.WithTimeout(context.Background(), 4*time.Second)
-		defer cancelUpd()
-		if err := s.WeCom.SendUpdateCard(updCtx, reqID, newCard); err != nil {
-			log.Printf("[restock] update card failed: %v (req_id=%s)", err, reqID)
-			return
-		}
-		log.Printf("[restock] card updated to %s: task=%s", kind, realTaskID)
 	}()
+}
+
+// parseDisplayButtonKey 解析新版 eventKey (2026-08-30 兼容旧版)
+//   输入:
+//     新版 (陈列补货):
+//       "short" / "done"
+//       "display-<branch>-<item>:short" / ":done"
+//     旧版 (兼容, 不删):
+//       "restock-<branch>-<item>:DONE" / ":SHORT"
+//       "DONE|<uuid>" / "SHORT|<uuid>"  (旧卡片 button_list 格式)
+//   输出: (kind, branch, itemNo) — kind 已统一小写
+func parseDisplayButtonKey(eventKey string) (kind, branch, itemNo string) {
+	if eventKey == "" {
+		return "", "", ""
+	}
+	// 1) 裸 short / done
+	low := strings.ToLower(strings.TrimSpace(eventKey))
+	if low == "short" || low == "done" {
+		return low, "", ""
+	}
+	// 2) 旧版 "DONE|<uuid>" / "SHORT|<uuid>" — 拿不到 branch/item, 留给 OnButtonClick 用 taskID 退化
+	if strings.HasPrefix(eventKey, "DONE|") || strings.HasPrefix(eventKey, "SHORT|") ||
+		strings.HasPrefix(eventKey, "done|") || strings.HasPrefix(eventKey, "short|") {
+		idx := strings.Index(eventKey, "|")
+		if idx < 0 {
+			return "", "", ""
+		}
+		return strings.ToLower(eventKey[:idx]), "", ""
+	}
+	// 3) "<prefix>:<kind>" — 通用 (display- / restock- 都适用)
+	idx := strings.LastIndex(eventKey, ":")
+	if idx < 0 {
+		return "", "", ""
+	}
+	prefix := eventKey[:idx]
+	suffix := strings.ToLower(eventKey[idx+1:])
+	if suffix != "short" && suffix != "done" {
+		return "", "", ""
+	}
+	// 3a) 新版 display-<branch>-<item>
+	prefix = strings.TrimPrefix(prefix, "display-")
+	// 3b) 旧版 restock-<branch>-<item>
+	prefix = strings.TrimPrefix(prefix, "restock-")
+	if prefix == eventKey[:idx] {
+		// 既不是 display- 也不是 restock- 前缀, 不识别
+		return "", "", ""
+	}
+	// 最后一个 '-' 分割 branch 和 item
+	sep := strings.LastIndex(prefix, "-")
+	if sep < 0 {
+		return suffix, prefix, ""
+	}
+	return suffix, prefix[:sep], prefix[sep+1:]
+}
+
+// parseDisplayTaskID 从 taskID "display-<branch>-<item>" 解析 (branch, item)
+func parseDisplayTaskID(taskID string) (branch, itemNo string) {
+	prefix := strings.TrimPrefix(taskID, "display-")
+	sep := strings.LastIndex(prefix, "-")
+	if sep < 0 {
+		return "", ""
+	}
+	return prefix[:sep], prefix[sep+1:]
+}
+
+// hasPermForUser 查 user 的主 role 是否含指定 perm
+//   2026-08-30: 加的 helper, 给 RestockFeedback 按 kind 拆 perm 用
+//   走主 role 即可 (auth.HasPerm 一致), 不并集 user_roles
+func (s *Service) hasPermForUser(ctx context.Context, userID, perm string) bool {
+	if userID == "" {
+		return false
+	}
+	var role string
+	if err := s.Store.pool.QueryRow(ctx, `SELECT COALESCE(role,'') FROM users WHERE id=$1`, userID).Scan(&role); err != nil {
+		return false
+	}
+	if role == "" {
+		return false
+	}
+	// 调 auth.HasPerm (从 users.role 查)
+	return auth.HasPerm(role, perm)
+}
+
+// ifStr 三元 helper(b == true 返 a,否则 "")
+func ifStr(b bool, a, _ string) string {
+	if b {
+		return a
+	}
+	return ""
 }
 
 // ============== HTTP Handlers (供 router 调用) ==============
 
-// RestockTasksList GET /api/v1/restock/tasks?status=open&limit=50
-func RestockTasksList(svc *Service) gin.HandlerFunc {
-	return func(c *gin.Context) {
-		ctx := c.Request.Context()
-		status := c.DefaultQuery("status", "open")
-		limit, _ := strconv.Atoi(c.Query("limit"))
-		if limit <= 0 || limit > 500 {
-			limit = 50
-		}
-
-		var tasks []*Task
-		var err error
-		if status == "open" {
-			tasks, err = svc.Store.ListOpenTasks(ctx, svc.Cfg.BranchNo)
-		} else {
-			// 其它状态:简化处理,直接拉所有(后续可加 ListByStatus)
-			rows, qErr := svc.Store.pool.Query(ctx, `
-				SELECT task_id, branch_no, item_no, item_name, COALESCE(supplier_name,''),
-					current_stock, safety_stock, yesterday_sales, suggest_qty,
-					COALESCE(reason,''), priority, status, first_push_at, last_push_at,
-					last_update_at, closed_at, COALESCE(closed_reason,''), push_count
-				FROM restock_task WHERE branch_no=$1 AND status=$2
-				ORDER BY last_update_at DESC LIMIT $3
-			`, svc.Cfg.BranchNo, status, limit)
-			if qErr != nil {
-				err = qErr
-			} else {
-				defer rows.Close()
-				for rows.Next() {
-					t := &Task{}
-					if err2 := rows.Scan(&t.TaskID, &t.BranchNo, &t.ItemNo, &t.ItemName, &t.SupplierName,
-						&t.CurrentStock, &t.SafetyStock, &t.YesterdaySales, &t.SuggestQty,
-						&t.Reason, &t.Priority, &t.Status, &t.FirstPushAt, &t.LastPushAt,
-						&t.LastUpdateAt, &t.ClosedAt, &t.ClosedReason, &t.PushCount); err2 != nil {
-						err = err2
-						break
-					}
-					tasks = append(tasks, t)
-				}
-				if err == nil {
-					err = rows.Err()
-				}
-			}
-		}
-		if err != nil {
-			c.JSON(500, gin.H{"error": err.Error()})
-			return
-		}
-		if len(tasks) > limit {
-			tasks = tasks[:limit]
-		}
-		c.JSON(200, gin.H{"tasks": tasks, "count": len(tasks), "status": status})
-	}
-}
+// RestockTasksList 已在 http_h5.go 中重写 (2026-08-30 新版陈列补货数据源)
 
 // RestockNeedPurchaseList GET /api/v1/restock/need-purchase
 func RestockNeedPurchaseList(svc *Service) gin.HandlerFunc {
@@ -749,31 +962,25 @@ func RestockNeedPurchaseList(svc *Service) gin.HandlerFunc {
 	}
 }
 
-// RestockManualTick POST /api/v1/restock/cron/tick
-//   手动触发一次 HourlyTick(调试用)
+// RestockManualTick POST /api/v1/restock/cron/tick?period=morn
+//   手动触发一次 DisplayRestockTick(调试用,默认 period="manual" 拉最近 1h 窗口)
 func RestockManualTick(svc *Service) gin.HandlerFunc {
 	return func(c *gin.Context) {
+		period := c.DefaultQuery("period", "manual")
 		ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Minute)
 		defer cancel()
-		if err := svc.HourlyTick(ctx); err != nil {
+		if err := svc.DisplayRestockTick(ctx, period); err != nil {
 			c.JSON(500, gin.H{"error": err.Error()})
 			return
 		}
-		c.JSON(200, gin.H{"ok": true, "ts": time.Now().Unix()})
+		c.JSON(200, gin.H{"ok": true, "period": period, "ts": time.Now().Unix()})
 	}
 }
 
-// RestockLlmPlanNow GET /api/v1/restock/llm/plan
-//   手动触发一次 LLM 批量规划(调试用)
+// RestockLlmPlanNow 旧版 LLM 手动重跑,新版陈列补货已不再用 LLM,保留路由占位
 func RestockLlmPlanNow(svc *Service) gin.HandlerFunc {
 	return func(c *gin.Context) {
-		ctx, cancel := context.WithTimeout(c.Request.Context(), 3*time.Minute)
-		defer cancel()
-		if err := svc.LlmPlanTick(ctx); err != nil {
-			c.JSON(500, gin.H{"error": err.Error()})
-			return
-		}
-		c.JSON(200, gin.H{"ok": true, "ts": time.Now().Unix()})
+		c.JSON(410, gin.H{"error": "陈列补货新版不再用 LLM,改用 RestockManualTick?period=morn"})
 	}
 }
 

@@ -171,7 +171,193 @@ func RestockH5TasksList(svc *Service) gin.HandlerFunc {
 	}
 }
 
-// RestockH5Feedback POST /api/v1/restock/h5/tasks/:task_id/feedback
+// RestockTasksList GET /api/v1/restock/tasks?date=YYYY-MM-DD
+//   新版陈列补货任务列表 (2026-08-30):
+//   数据源: restock_display_suggest (建议量, 7/12/20:30 三次 tick 累加)
+//          + restock_short_state    (短补锁定, ONCE)
+//          + restock_need_purchase  (缺货后立即 upsert, 等完成才 close)
+//
+//   query:
+//     date      = YYYY-MM-DD   (默认 today, 0 时区用本地时间)
+//     branch_no = xxx           (默认 svc.Cfg.BranchNo)
+//
+//   返回: { tasks: [H5TaskItem...], count, date, branch }
+//   H5TaskItem 字段(见 types.go):
+//     item_no, item_name, branch_no, suggest_qty, inv_snapshot,
+//     is_short, short_at, short_user, need_qty, need_status,
+//     last_period, period_date, last_update_at
+//
+//   前端按钮逻辑:
+//     is_short=false → [缺货] [已完成]
+//     is_short=true  → [已完成] (防重复点缺货)
+//   按钮 event_key 格式: "display-<branch>-<item>:short" / ":done"
+func RestockTasksList(svc *Service) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		ctx := c.Request.Context()
+
+		dateStr := strings.TrimSpace(c.Query("date"))
+		var date time.Time
+		if dateStr == "" {
+			date = time.Now()
+		} else {
+			t, err := time.ParseInLocation("2006-01-02", dateStr, time.Local)
+			if err != nil {
+				c.JSON(400, gin.H{"error": "date 格式 YYYY-MM-DD, got: " + dateStr})
+				return
+			}
+			date = t
+		}
+
+		branchNo := strings.TrimSpace(c.DefaultQuery("branch_no", svc.Cfg.BranchNo))
+
+		tasks, err := svc.Store.ListH5Tasks(ctx, branchNo, date)
+		if err != nil {
+			log.Printf("[restock.tasks] ListH5Tasks: %v", err)
+			c.JSON(500, gin.H{"error": err.Error()})
+			return
+		}
+
+		c.JSON(200, gin.H{
+			"tasks":  tasks,
+			"count":  len(tasks),
+			"date":   date.Format("2006-01-02"),
+			"branch": branchNo,
+		})
+	}
+}
+
+// RestockFeedback POST /api/v1/restock/feedback
+//   新版陈列补货反馈 (2026-08-30), 统一 H5 + 企微 callback 入参
+//
+//   body:
+//     {
+//       "req_id":    "wecom-xxx"   // 企微 callback 才需要, H5 调可省
+//       "chat_id":   "wrwxxx"     // 同上
+//       "user_id":   "u_xxx",     // H5 调可省 (从 ctx auth_user_id 取)
+//       "task_id":   "display-<branch>-<item>"  // 新版
+//                  | "<旧 uuid>"                // 旧版兼容
+//       "event_key": "display-<branch>-<item>:done"   // 新版
+//                  | "display-<branch>-<item>:short"
+//                  | "restock-<branch>-<item>:DONE"    // 旧版
+//                  | "restock-<branch>-<item>:SHORT"
+//                  | "done" | "short"                  // 兼容
+//     }
+//
+//   权限 (按 kind 分别校验, 不能一个 perm 通杀):
+//     kind=short → 需要 display:short     (cashier 无, 拒绝)
+//     kind=done  → 需要 display:done      (所有有 restock:feedback 的都有 display:done)
+//   fallback: 旧 event_key 走通用 restock:feedback
+//
+//   流程:
+//     1) 解析 event_key → (kind, branch, itemNo)
+//     2) 按 kind 校验 perm
+//     3) 调 svc.OnButtonClick
+//     4) 返回 200 + {ok, kind, is_short, need_purchase_id}
+func RestockFeedback(svc *Service) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		var req struct {
+			ReqID    string `json:"req_id"`
+			ChatID   string `json:"chat_id"`
+			UserID   string `json:"user_id"`
+			TaskID   string `json:"task_id"`
+			EventKey string `json:"event_key"`
+		}
+		if err := c.ShouldBindJSON(&req); err != nil {
+			c.JSON(400, gin.H{"error": "bad json: " + err.Error()})
+			return
+		}
+		if req.EventKey == "" {
+			c.JSON(400, gin.H{"error": "event_key 必填"})
+			return
+		}
+
+		// user_id 兜底
+		uid := req.UserID
+		if uid == "" {
+			uid = userIDFromGin(c)
+		}
+
+		// 解析 event_key
+		kind, branch, itemNo := parseDisplayButtonKey(req.EventKey)
+		if kind == "" {
+			c.JSON(400, gin.H{"error": "event_key 无法解析: " + req.EventKey})
+			return
+		}
+		if branch == "" || itemNo == "" {
+			branch, itemNo = parseDisplayTaskID(req.TaskID)
+		}
+		if branch == "" {
+			branch = svc.Cfg.BranchNo
+		}
+		if branch == "" || itemNo == "" {
+			c.JSON(400, gin.H{"error": "无法确定 branch/item, event_key=" + req.EventKey + " task_id=" + req.TaskID})
+			return
+		}
+
+		// 权限: 按 kind 分别校验
+		//   - new eventKey (display-...:short/done): 严格要求 display:short / display:done
+		//   - legacy eventKey (DONE|SHORT, restock-...:DONE/SHORT): 用通用 restock:feedback
+		isLegacyUpper := false
+		if idx := strings.LastIndex(req.EventKey, ":"); idx > 0 {
+			suf := req.EventKey[idx+1:]
+			if suf == "DONE" || suf == "SHORT" {
+				isLegacyUpper = true
+			}
+		}
+		if strings.HasPrefix(req.EventKey, "DONE|") || strings.HasPrefix(req.EventKey, "SHORT|") {
+			isLegacyUpper = true
+		}
+		required := "restock:feedback"
+		if !isLegacyUpper {
+			// 新版: 按 kind 取 perm (parseDisplayButtonKey 返小写 "short"/"done")
+			if kind == "short" {
+				required = "display:short"
+			} else {
+				required = "display:done"
+			}
+		}
+
+		// 直接查 user role 检查 (绕过 RequirePerm, 因为它只支持单 perm)
+		if !svc.hasPermForUser(c.Request.Context(), uid, required) {
+			c.JSON(403, gin.H{
+				"code":    "FORBIDDEN",
+				"message": "需要 " + required + " 权限 (kind=" + kind + ")",
+			})
+			return
+		}
+
+		// 调 OnButtonClick
+		svc.OnButtonClick(req.ReqID, req.ChatID, uid, req.TaskID, req.EventKey)
+
+		// 查最新状态
+		now := time.Now()
+		isShort := false
+		needPurchaseID := int64(0)
+		ctx := c.Request.Context()
+		if kind == FeedbackShort {
+			if ss, _ := svc.Store.GetShortState(ctx, branch, itemNo); ss != nil {
+				isShort = ss.IsShort
+			}
+		}
+		if kind == FeedbackShort || kind == FeedbackDone {
+			_ = svc.Store.pool.QueryRow(ctx,
+				`SELECT id FROM restock_need_purchase WHERE branch_no=$1 AND item_no=$2 AND status IN ('pending','sent_to_supplier') ORDER BY id DESC LIMIT 1`,
+				branch, itemNo).Scan(&needPurchaseID)
+		}
+
+		c.JSON(200, gin.H{
+			"ok":               true,
+			"task_id":          req.TaskID,
+			"event_key":        req.EventKey,
+			"kind":             kind,
+			"branch_no":        branch,
+			"item_no":          itemNo,
+			"is_short":         isShort,
+			"need_purchase_id": needPurchaseID,
+			"tick_at":          now.Format(time.RFC3339),
+		})
+	}
+}
 //   body: {"type":"DONE"|"SHORT"}
 //   替代企微按钮, H5 页面用
 //   - DONE  → task.status='acked'

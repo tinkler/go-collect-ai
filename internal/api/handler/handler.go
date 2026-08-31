@@ -1096,6 +1096,8 @@ func (h *Handler) SearchProducts(c *gin.Context) {
 		ds = h.Agent.GetDataSource()
 	}
 	supplier := c.Query("supplier")
+	barcode := strings.TrimSpace(c.Query("barcode")) // 2026-08-31: 扫码查商品
+	itemNo  := strings.TrimSpace(c.Query("item_no"))  // 别名, 跟 barcode 等价 (HBPoS 用 item_no 当 barcode)
 	limit, _ := strconv.Atoi(c.Query("limit"))
 	if limit == 0 {
 		limit = 100
@@ -1118,7 +1120,7 @@ func (h *Handler) SearchProducts(c *gin.Context) {
 	}
 
 	// 默认拉所有可用业务字段
-	bizFields := []string{"barcode", "product_name", "supplier_id", "supplier_name", "category", "brand", "stock_qty"}
+	bizFields := []string{"barcode", "product_name", "supplier_id", "supplier_name", "category", "brand", "stock_qty", "price"}
 	measures := []string{}
 	dimensions := []string{}
 	for _, bf := range bizFields {
@@ -1139,6 +1141,23 @@ func (h *Handler) SearchProducts(c *gin.Context) {
 			filters = append(filters, map[string]any{
 				"member": supplierNameRef, "operator": "contains", "values": []string{supplier},
 			})
+		}
+	}
+	// 2026-08-31: barcode / item_no 过滤 (扫码查商品, 返回 1 条精准结果)
+	barcodeQuery := barcode
+	if barcodeQuery == "" {
+		barcodeQuery = itemNo
+	}
+	if barcodeQuery != "" {
+		barcodeRef := src.FieldRefs["barcode"]
+		if barcodeRef != "" {
+			filters = append(filters, map[string]any{
+				"member": barcodeRef, "operator": "equals", "values": []string{barcodeQuery},
+			})
+			// 精准查询: 限定 1 条
+			if limit > 1 {
+				limit = 1
+			}
 		}
 	}
 

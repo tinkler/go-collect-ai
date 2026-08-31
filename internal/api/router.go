@@ -13,6 +13,7 @@ import (
 	"github.com/tinkler/collect-ai/internal/config"
 	"github.com/tinkler/collect-ai/internal/rbac"
 	"github.com/tinkler/collect-ai/internal/restock"
+	"github.com/tinkler/collect-ai/internal/wxsign"
 )
 
 // NewRouter 构造 router
@@ -21,7 +22,7 @@ import (
 // Gin 路由中间件顺序约定: 中间件在前, handler 在最后
 //   r.GET("/x", AuthMiddleware(), RequirePerm("p"), handler)
 //   → AuthMiddleware → RequirePerm → handler
-func NewRouter(h *handler.Handler, cfg *config.Config, restockSvc *restock.Service, authSvc *auth.Service, authSign *auth.Signer, rbacStore *rbac.Store) *gin.Engine {
+func NewRouter(h *handler.Handler, cfg *config.Config, restockSvc *restock.Service, authSvc *auth.Service, authSign *auth.Signer, rbacStore *rbac.Store, wxSvc *wxsign.Service) *gin.Engine {
 	r := gin.New()
 	r.Use(gin.Recovery(), gin.Logger())
 
@@ -60,6 +61,13 @@ func NewRouter(h *handler.Handler, cfg *config.Config, restockSvc *restock.Servi
 	{
 		// health (公开)
 		api.GET("/health", h.Health)
+
+		// WECOM JS-SDK 签名 (公开, 走企业微信 H5 自建应用调用)
+		//   dev 模式: 返 503 + reason=dev_mode, 前端 fallback 手动输入
+		//   生产: 需配 WECOM_CORP_ID / WECOM_AGENT_ID / WECOM_CORP_SECRET
+		api.GET("/wx/sign", wxsign.SignConfigHandler(wxSvc))
+		api.GET("/wx/agent-sign", wxsign.SignAgentHandler(wxSvc))
+		api.GET("/wx/status", wxsign.StatusHandler(wxSvc))
 
 		// ============== 鉴权公开路由 ==============
 		api.POST("/auth/wecom/callback", authH.WeComCallback)
@@ -116,7 +124,11 @@ func NewRouter(h *handler.Handler, cfg *config.Config, restockSvc *restock.Servi
 			authed.GET("/products/search", auth.RequirePerm("session:read"), h.SearchProducts)
 
 			// restock
+			//   新版陈列补货 (2026-08-30): 走 display_suggest + short_state + need_purchase 三表 join
+			//     GET  /restock/tasks?date=YYYY-MM-DD
+			//     POST /restock/feedback  (event_key 统一入参, H5 + 企微 callback 同路)
 			authed.GET("/restock/tasks", auth.RequirePerm("plan:read"), restock.RestockTasksList(restockSvc))
+			authed.POST("/restock/feedback", auth.RequirePerm("restock:feedback"), restock.RestockFeedback(restockSvc))
 			authed.GET("/restock/need-purchase", auth.RequirePerm("plan:read"), restock.RestockNeedPurchaseList(restockSvc))
 			authed.POST("/restock/cron/tick", auth.RequirePerm("admin"), restock.RestockManualTick(restockSvc))
 			authed.GET("/restock/llm/plan", auth.RequirePerm("plan:read"), restock.RestockLlmPlanNow(restockSvc))

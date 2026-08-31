@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"strconv"
+	"time"
 
 	"github.com/tinkler/collect-ai/internal/parser/agent"
 )
@@ -121,6 +122,76 @@ func (q *CubeQuerier) Promotion7d(ctx context.Context, branchNo string) (map[str
 		}
 		out[itemNo] = true
 	}
+	return out, nil
+}
+
+// ============== Display Restock Window (2026-08-30 新增) ==============
+
+// WindowSaleRow 时间窗口销量 + 库存快照的一行
+type WindowSaleRow struct {
+	ItemNo       string
+	ItemName     string
+	Barcode      string
+	SupplierName string
+	SaleQty      int
+	InvSnapshot  int
+}
+
+// SalesInWindow 拉指定时间窗口的销量 + 当前库存快照
+//   适配 cube-agent-server 上 display_restock_window cube
+//   from/to 用 RFC3339 格式(子 session 文档约定)
+//   返回: map[item_no] -> WindowSaleRow(SaleQty 是窗口内合计,InvSnapshot 是当前值)
+//   性能:< 10s / 次(子 session 实测 100-208ms,3.18M 行)
+func (q *CubeQuerier) SalesInWindow(ctx context.Context, branchNo string, from, to time.Time) (map[string]*WindowSaleRow, error) {
+	cube := q.cfg.DisplayRestockCubeName
+	if cube == "" {
+		cube = "display_restock_window"
+	}
+	timeDimensions := []map[string]any{
+		{
+			"dimension": cube + ".oper_date",
+			"dateRange": []string{
+				from.UTC().Format(time.RFC3339),
+				to.UTC().Format(time.RFC3339),
+			},
+		},
+	}
+	rows, err := q.agent.ExecuteWithTime(cube,
+		[]string{
+			cube + ".sale_qty",
+			cube + ".inv_snapshot",
+		},
+		[]string{
+			cube + ".branch_no",
+			cube + ".item_no",
+			cube + ".item_name",
+			cube + ".barcode",
+			cube + ".supplier_name",
+		},
+		[]map[string]any{
+			{"member": cube + ".branch_no", "operator": "equals", "values": []string{branchNo}},
+		},
+		nil, 10000, timeDimensions)
+	if err != nil {
+		return nil, fmt.Errorf("cube %s SalesInWindow: %w", cube, err)
+	}
+	out := make(map[string]*WindowSaleRow, len(rows))
+	for _, r := range rows {
+		itemNo := asString(r, cube+".item_no")
+		if itemNo == "" {
+			continue
+		}
+		out[itemNo] = &WindowSaleRow{
+			ItemNo:       itemNo,
+			ItemName:     asString(r, cube+".item_name"),
+			Barcode:      asString(r, cube+".barcode"),
+			SupplierName: asString(r, cube+".supplier_name"),
+			SaleQty:      asInt(r, cube+".sale_qty"),
+			InvSnapshot:  asInt(r, cube+".inv_snapshot"),
+		}
+	}
+	log.Printf("[restock] SalesInWindow(%s) [%s ~ %s] branch=%s items=%d",
+		cube, from.Format("15:04"), to.Format("15:04"), branchNo, len(out))
 	return out, nil
 }
 

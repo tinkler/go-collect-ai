@@ -22,6 +22,7 @@ import (
 	"github.com/tinkler/collect-ai/internal/parser/bigmodel"
 	"github.com/tinkler/collect-ai/internal/rbac"
 	"github.com/tinkler/collect-ai/internal/restock"
+	"github.com/tinkler/collect-ai/internal/wxsign"
 	"github.com/tinkler/collect-ai/internal/store"
 	"github.com/gin-gonic/gin"
 )
@@ -180,7 +181,12 @@ func main() {
 	defer restockWeCom.Stop()
 
 	rbacStore := rbac.NewStore(pool)
-	r := api.NewRouter(h, cfg, restockSvc, authSvc, authSign, rbacStore)
+
+	// 2026-08-31: WECOM JS-SDK 签名 (H5 自建应用调原生扫码用)
+	wxSvc := wxsign.New(cfg.WeComCorpID, cfg.WeComAgentID, cfg.WeComCorpSecret)
+	log.Printf("[main] wxsign: configured=%v (corp_id=%q agent_id=%q)", wxSvc.IsConfigured(), cfg.WeComCorpID, cfg.WeComAgentID)
+
+	r := api.NewRouter(h, cfg, restockSvc, authSvc, authSign, rbacStore, wxSvc)
 	log.Printf("[main] 限流: max_concurrent_parse=%d, wait_sec=%d", cfg.MaxConcurrentParse, cfg.RateLimitWaitSec)
 	log.Printf("[main] auth: dev_mode=%v, cookie_domain=%s, cookie_secure=%v, access_ttl=%ds, refresh_ttl=%ds",
 		cfg.DevMode, cfg.CookieDomain, cfg.CookieSecure, cfg.AccessTokenTTLSec, cfg.RefreshTokenTTLSec)
