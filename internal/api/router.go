@@ -118,12 +118,7 @@ func NewRouter(h *handler.Handler, cfg *config.Config, restockSvc *restock.Servi
 			// 采购计划
 			authed.GET("/purchase-plans", auth.RequirePerm("plan:read"), restock.PurchasePlansList(restockSvc))
 
-			// 数据源切换 (admin)
-			authed.GET("/datasource", auth.RequirePerm("admin"), h.GetDataSource)
-			authed.POST("/datasource", auth.RequirePerm("admin"), h.SetDataSource)
-
-			// 业务层 API
-			authed.GET("/datasources", auth.RequirePerm("session:read"), h.ListDatasources)
+			// 业务层 API(2026-08-31: /datasources 端点删除,数据源启动后即固定)
 			authed.GET("/products/search", auth.RequirePerm("session:read"), h.SearchProducts)
 
 			// restock

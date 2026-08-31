@@ -239,7 +239,6 @@ location /api/ {
 | `DELETE /sessions/:id/rows/:rowId` | `row:delete` |
 | `GET /purchase-plans` | `plan:read` |
 | `GET /datasources`, `/products/search` | `session:read` |
-| `GET /datasource`, `POST /datasource` | `admin` |
 | `GET /restock/tasks`, `/restock/need-purchase`, `/restock/llm/plan` | `plan:read` |
 | `POST /restock/cron/tick` | `admin` |
 | `/restock/wecom/chats/*` (GET/POST) | `admin` |

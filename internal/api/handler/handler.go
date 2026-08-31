@@ -16,7 +16,6 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/tinkler/collect-ai/internal/business"
-	"github.com/tinkler/collect-ai/internal/dsstate"
 	"github.com/tinkler/collect-ai/internal/model"
 	"github.com/tinkler/collect-ai/internal/parser"
 	"github.com/tinkler/collect-ai/internal/parser/agent"
@@ -42,8 +41,6 @@ type Handler struct {
 	DefaultLlmModel  string
 	DefaultUseLlm    bool
 	DefaultFuzzyDist int
-	// 2026-08-29: 数据源状态持久化路径 (空 = 不持久化)
-	DataSourceStatePath string
 }
 
 // resolveTemplateConfig 根据 template_id 查 PG, 合并兜底值
@@ -102,10 +99,8 @@ func (h *Handler) ListSuppliers(c *gin.Context) {
 	if limit == 0 {
 		limit = 20000
 	}
-	ds := c.Query("datasource")
-	if ds == "" {
-		ds = h.Agent.GetDataSource()
-	}
+	// 数据源启动后即固定(2026-08-31),不再接受 ?datasource= 覆盖
+	ds := h.Agent.GetDataSource()
 	if h.BusinessReg == nil {
 		c.JSON(500, gin.H{"error": "business registry not configured"})
 		return
@@ -202,10 +197,8 @@ func (h *Handler) ListSuppliersByBrand(c *gin.Context) {
 		c.JSON(500, gin.H{"error": "business registry not configured"})
 		return
 	}
-	ds := c.Query("datasource")
-	if ds == "" {
-		ds = h.Agent.GetDataSource()
-	}
+	// 数据源启动后即固定(2026-08-31),不再接受 ?datasource= 覆盖
+	ds := h.Agent.GetDataSource()
 	limit, _ := strconv.Atoi(c.Query("limit"))
 	if limit == 0 {
 		limit = 50000
@@ -841,59 +834,10 @@ func (s *stringBuilder) WriteString(str string) {
 }
 func (s *stringBuilder) String() string { return string(s.buf) }
 
-// ============== 数据源切换 (unified cube) ==============
-
-// GetDataSource GET /api/v1/datasource
-//   返回当前数据源名(erp / hbpos)
-func (h *Handler) GetDataSource(c *gin.Context) {
-	if h.Agent == nil {
-		c.JSON(503, gin.H{"error": "agent client not configured"})
-		return
-	}
-	c.JSON(200, gin.H{
-		"datasource": h.Agent.GetDataSource(),
-	})
-}
-
-// SetDataSource POST /api/v1/datasource
-//   body: {"datasource": "erp" | "hbpos"}
-//   切换 agent client 的数据源(下次 /v1/load 自动用新 ds)
-func (h *Handler) SetDataSource(c *gin.Context) {
-	if h.Agent == nil {
-		c.JSON(503, gin.H{"error": "agent client not configured"})
-		return
-	}
-	var body struct {
-		DataSource string `json:"datasource"`
-	}
-	if err := c.BindJSON(&body); err != nil {
-		c.JSON(400, gin.H{"error": "invalid body: " + err.Error()})
-		return
-	}
-	ds := strings.ToLower(strings.TrimSpace(body.DataSource))
-	if ds == "" {
-		// 允许空 = 重置默认
-		ds = "erp"
-	}
-	if ds != "erp" && ds != "hbpos" {
-		c.JSON(400, gin.H{
-			"error": "datasource must be 'erp' or 'hbpos'",
-			"got":   body.DataSource,
-		})
-		return
-	}
-	h.Agent.SetDataSource(ds)
-	// 持久化(2026-08-29): 重启后不丢失
-	if h.DataSourceStatePath != "" {
-		if err := dsstate.Save(h.DataSourceStatePath, ds); err != nil {
-			log.Printf("[SetDataSource] save state: %v (继续运行)", err)
-		}
-	}
-	c.JSON(200, gin.H{
-		"datasource": ds,
-		"status":     "ok",
-	})
-}
+// ============== 数据源 (2026-08-31 彻底移除) ==============
+//   /api/v1/datasource 路由删除,GetDataSource / SetDataSource 函数删除
+//   数据源启动后即固定(从 .env / cfg),不再有任何运行时 API
+//   前端不需要知道当前数据源,也不允许切换
 
 // ============== 业务层(业务字段 ↔ 物理字段 翻译) ==============
 
@@ -1053,33 +997,9 @@ func splitAndTrim(s string, seps string) []string {
 
 // ============== 业务 API(供前端直接调用) ==============
 
-// ListDatasources GET /api/v1/datasources
-//   返回 collect-ai 当前支持的所有 (entity, datasource) 组合
-//   供前端做数据源选择下拉
-func (h *Handler) ListDatasources(c *gin.Context) {
-	if h.BusinessReg == nil {
-		c.JSON(500, gin.H{"error": "business registry not configured"})
-		return
-	}
-	out := []gin.H{}
-	for _, entName := range h.BusinessReg.List() {
-		ent, _ := h.BusinessReg.Get(entName)
-		dsList := h.BusinessReg.AvailableDataSources(entName)
-		fields := h.BusinessReg.AvailableFields(entName)
-		out = append(out, gin.H{
-			"entity":        entName,
-			"description":   ent.Description,
-			"datasources":   dsList,
-			"fields":        fields,
-		})
-	}
-	c.JSON(200, gin.H{
-		"entities":      out,
-		"current_ds":    h.Agent.GetDataSource(),
-	})
-}
-
-// SearchProducts GET /api/v1/products/search?datasource=xxx&supplier=xxx&limit=100
+// SearchProducts GET /api/v1/products/search?supplier=xxx&limit=100
+//   数据源启动后即固定(2026-08-31),不再接受 ?datasource= 覆盖
+//   业务字段:barcode/product_name/supplier_id/supplier_name/category/brand/stock_qty
 //   业务字段查询(前端直接调)
 //   业务字段:barcode/product_name/supplier_id/supplier_name/category/brand/stock_qty
 func (h *Handler) SearchProducts(c *gin.Context) {
@@ -1091,10 +1011,8 @@ func (h *Handler) SearchProducts(c *gin.Context) {
 		c.JSON(500, gin.H{"error": "business registry not configured"})
 		return
 	}
-	ds := c.Query("datasource")
-	if ds == "" {
-		ds = h.Agent.GetDataSource()
-	}
+	// 数据源启动后即固定(2026-08-31),不再接受 ?datasource= 覆盖
+	ds := h.Agent.GetDataSource()
 	supplier := c.Query("supplier")
 	barcode := strings.TrimSpace(c.Query("barcode")) // 2026-08-31: 扫码查商品
 	itemNo  := strings.TrimSpace(c.Query("item_no"))  // 别名, 跟 barcode 等价 (HBPoS 用 item_no 当 barcode)

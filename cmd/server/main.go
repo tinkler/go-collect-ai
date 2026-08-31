@@ -14,9 +14,7 @@ import (
 	"github.com/tinkler/collect-ai/internal/auth"
 	"github.com/tinkler/collect-ai/internal/business"
 	"github.com/tinkler/collect-ai/internal/config"
-	"github.com/tinkler/collect-ai/internal/dsstate"
 
-	"path/filepath"
 	"github.com/tinkler/collect-ai/internal/parser"
 	"github.com/tinkler/collect-ai/internal/parser/agent"
 	"github.com/tinkler/collect-ai/internal/parser/bigmodel"
@@ -63,17 +61,9 @@ func main() {
 
 	ocrClient := bigmodel.NewOcrClient(cfg.BigModelAPIKey, cfg.BigModelBase, cfg.OcrTimeoutSec)
 	llmClient := bigmodel.NewLlmClient(cfg.BigModelAPIKey, cfg.BigModelBase, cfg.LlmTimeoutSec)
-	// 数据源: 优先用 .datasource.state 持久化值, 其次 env/cfg 默认值 (2026-08-29)
-	// 绝对路径: cwd 不依赖 (run_in_background 启的进程 cwd 可能不是项目目录)
-	absExe, _ := filepath.Abs(os.Args[0])
-	dsStatePath := filepath.Join(filepath.Dir(absExe), "datasource.state")
+	// 数据源: 启动后即固定,只走 .env / cfg 配置 (2026-08-31 简化,移除 dsstate 持久化 + 切换 API)
 	initialDS := cfg.DataSource
-	if savedDS := dsstate.Load(dsStatePath); savedDS != "" {
-		initialDS = savedDS
-		log.Printf("[main] datasource loaded from state: %s", initialDS)
-	} else {
-		log.Printf("[main] datasource from cfg: %s", initialDS)
-	}
+	log.Printf("[main] datasource: %s (from env/cfg, 启动后即固定)", initialDS)
 	agentClient := agent.NewClient(cfg.AgentURL, cfg.AgentToken, 30, initialDS)
 	businessReg := business.NewDefaultRegistry()
 
@@ -112,6 +102,13 @@ func main() {
 		WeComBotSecret:         cfg.WeComBotSecret,
 		WeComWSURL:             cfg.WeComWSURL,
 		WeComBindFile:          cfg.WeComBindFile,
+		// 陈列补货新版 (2026-08-30)
+		DisplayRestockCronEve:  cfg.DisplayRestockCronEve,
+		DisplayRestockCronMorn: cfg.DisplayRestockCronMorn,
+		DisplayRestockCronAft:  cfg.DisplayRestockCronAft,
+		DisplayRestockCubeName: cfg.DisplayRestockCubeName,
+		DisplayRestockRetryMax: cfg.DisplayRestockRetryMax,
+		DisplayRestockMaxPush:  cfg.DisplayRestockMaxPush,
 	}
 	restockCube := restock.NewCubeQuerier(agentClient, restockCfg)
 	restockLLM := restock.NewLlmPlanner(llmClient, cfg.RestockLLMModel, cfg.RestockLLMPlanEnabled, cfg.RestockLLMPlanCacheHrs)
@@ -149,7 +146,6 @@ func main() {
 		DefaultLlmModel:     cfg.LLMModel,
 		DefaultUseLlm:       cfg.UseLlm,
 		DefaultFuzzyDist:    cfg.FuzzyDistance,
-		DataSourceStatePath: dsStatePath, // 2026-08-29: 数据源状态持久化
 	}
 
 	// 注册企微按钮点击回调 → 复用 Service.OnButtonClick(写 Feedback + 改状态 + in-place 更新卡片)

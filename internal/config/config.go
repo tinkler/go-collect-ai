@@ -88,6 +88,14 @@ type Config struct {
 	RestockAggregateCron string `mapstructure:"RESTOCK_CRON_AGGREGATE"`
 	RestockLlmPlanCron   string `mapstructure:"RESTOCK_CRON_LLM_PLAN"`
 
+	// 陈列补货新版 cron (2026-08-30 替代 RestockHourlyCron)
+	DisplayRestockCronEve  string `mapstructure:"DISPLAY_RESTOCK_CRON_EVE"`
+	DisplayRestockCronMorn string `mapstructure:"DISPLAY_RESTOCK_CRON_MORN"`
+	DisplayRestockCronAft  string `mapstructure:"DISPLAY_RESTOCK_CRON_AFT"`
+	DisplayRestockCubeName string `mapstructure:"DISPLAY_RESTOCK_CUBE_NAME"`
+	DisplayRestockRetryMax int    `mapstructure:"DISPLAY_RESTOCK_RETRY_MAX"`
+	DisplayRestockMaxPush  int    `mapstructure:"DISPLAY_RESTOCK_MAX_PUSH"`
+
 	// cube 名(env 覆盖,空 = 用默认)
 	RestockCubeSales     string `mapstructure:"RESTOCK_CUBE_SALES"`
 	RestockCubeInventory string `mapstructure:"RESTOCK_CUBE_INVENTORY"`
@@ -144,6 +152,8 @@ var leaves = []string{
 	"RESTOCK_MAX_PUSH_PER_TICK",
 	"RESTOCK_ESCALATE_P2_TO_P1_HOURS", "RESTOCK_ESCALATE_P1_TO_P0_HOURS",
 	"RESTOCK_CRON_HOURLY", "RESTOCK_CRON_AGGREGATE", "RESTOCK_CRON_LLM_PLAN",
+	"DISPLAY_RESTOCK_CRON_EVE", "DISPLAY_RESTOCK_CRON_MORN", "DISPLAY_RESTOCK_CRON_AFT",
+	"DISPLAY_RESTOCK_CUBE_NAME", "DISPLAY_RESTOCK_RETRY_MAX", "DISPLAY_RESTOCK_MAX_PUSH",
 	"RESTOCK_CUBE_SALES", "RESTOCK_CUBE_INVENTORY", "RESTOCK_CUBE_PROMOTION",
 	"RESTOCK_LLM_ENABLED", "RESTOCK_LLM_PLAN_ENABLED", "RESTOCK_LLM_MODEL", "RESTOCK_LLM_PLAN_CACHE_HRS",
 	"WECOM_BOT_ID", "WECOM_BOT_SECRET", "WECOM_WS_URL", "WECOM_BIND_FILE",
@@ -220,6 +230,8 @@ func Load() (*Config, error) {
 
 	v.SetDefault("AGENT_URL", "http://127.0.0.1:8088")
 	v.SetDefault("AGENT_TOKEN", "")
+	// 数据源(2026-08-31 简化):启动后即固定,不可运行时切换,默认 hbpos(用户当前部署)
+	v.SetDefault("DATA_SOURCE", "hbpos")
 
 	v.SetDefault("OCR_TIMEOUT_SEC", 60)
 	v.SetDefault("LLM_TIMEOUT_SEC", 60)
@@ -248,6 +260,15 @@ func Load() (*Config, error) {
 	v.SetDefault("RESTOCK_CRON_HOURLY", "0 7-21 * * *")
 	v.SetDefault("RESTOCK_CRON_AGGREGATE", "0 30 21 * * *")
 	v.SetDefault("RESTOCK_CRON_LLM_PLAN", "0 0 1,7,13,19 * * *")
+
+	// 陈列补货新版 (2026-08-30 起)
+	//   cron 是 5 字段 "分 时 日 月 周",parseHHMM 拿 parts[0]=mm, parts[1]=hh
+	v.SetDefault("DISPLAY_RESTOCK_CRON_EVE", "0 7 * * *")    // 07:00 tick
+	v.SetDefault("DISPLAY_RESTOCK_CRON_MORN", "0 12 * * *")  // 12:00 tick
+	v.SetDefault("DISPLAY_RESTOCK_CRON_AFT", "30 20 * * *") // 20:30 tick
+	v.SetDefault("DISPLAY_RESTOCK_CUBE_NAME", "display_restock_window")
+	v.SetDefault("DISPLAY_RESTOCK_RETRY_MAX", 3)
+	v.SetDefault("DISPLAY_RESTOCK_MAX_PUSH", 30)
 	v.SetDefault("RESTOCK_CUBE_SALES", "sales_yesterday")
 	v.SetDefault("RESTOCK_CUBE_INVENTORY", "inventory_current")
 	v.SetDefault("RESTOCK_CUBE_PROMOTION", "promotion_plan_7d")
