@@ -139,7 +139,8 @@ type WindowSaleRow struct {
 
 // SalesInWindow 拉指定时间窗口的销量 + 当前库存快照
 //   适配 cube-agent-server 上 display_restock_window cube
-//   from/to 用 RFC3339 格式(子 session 文档约定)
+//   from/to 用 mssql 通用 datetime 格式 (yyyy-MM-dd HH:mm:ss)
+//   ⚠️ 不要用 RFC3339 / ISO 8601:SQL Server 2008 R2 无法解析 '2026-08-31T12:34:56Z'
 //   返回: map[item_no] -> WindowSaleRow(SaleQty 是窗口内合计,InvSnapshot 是当前值)
 //   性能:< 10s / 次(子 session 实测 100-208ms,3.18M 行)
 func (q *CubeQuerier) SalesInWindow(ctx context.Context, branchNo string, from, to time.Time) (map[string]*WindowSaleRow, error) {
@@ -147,12 +148,14 @@ func (q *CubeQuerier) SalesInWindow(ctx context.Context, branchNo string, from, 
 	if cube == "" {
 		cube = "display_restock_window"
 	}
+	// mssql 2008 R2 通用 datetime 格式 (任何 locale 都认)
+	const mssqlTimeFmt = "2006-01-02 15:04:05"
 	timeDimensions := []map[string]any{
 		{
 			"dimension": cube + ".oper_date",
 			"dateRange": []string{
-				from.UTC().Format(time.RFC3339),
-				to.UTC().Format(time.RFC3339),
+				from.UTC().Format(mssqlTimeFmt),
+				to.UTC().Format(mssqlTimeFmt),
 			},
 		},
 	}
