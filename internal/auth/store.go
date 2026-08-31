@@ -198,6 +198,39 @@ func (s *Store) ReloadRolePerms(ctx context.Context) error {
 	return s.LoadAllRolePerms(ctx)
 }
 
+// ============== Last Page (2026-08-31) ==============
+//
+// 用户最后访问的页面, 用于登录后自动跳回.
+// 设计:
+//   - 一行 per user, 覆盖式写入, 无历史
+//   - 路径白名单在 handler 层校验, 这里只做持久化
+//   - 不存在的 user_id 由 FK 保证, 不会孤儿
+
+// GetLastPage 读某 user 最后访问的页 (无记录返回 "")
+func (s *Store) GetLastPage(ctx context.Context, userID string) (string, error) {
+	var page string
+	err := s.pool.QueryRow(ctx, `
+		SELECT last_page FROM user_last_page WHERE user_id = $1`, userID).Scan(&page)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return "", nil
+		}
+		return "", err
+	}
+	return page, nil
+}
+
+// SetLastPage 写最后访问页 (UPSERT 幂等, 防前端重复点)
+func (s *Store) SetLastPage(ctx context.Context, userID, page string) error {
+	_, err := s.pool.Exec(ctx, `
+		INSERT INTO user_last_page (user_id, last_page, updated_at)
+		VALUES ($1, $2, now())
+		ON CONFLICT (user_id) DO UPDATE
+		SET last_page = EXCLUDED.last_page, updated_at = now()`,
+		userID, page)
+	return err
+}
+
 // HasPerm 检查 role 是否有 perm
 //   - role 有 "*" → 任何 perm 都过
 //   - 否则精确匹配

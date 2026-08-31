@@ -117,6 +117,25 @@ func (s *Service) Me(ctx context.Context, userID string) (*User, error) {
 	return u, nil
 }
 
+// GetLastPage 拿 user 最后访问的页 (无记录返回 "")
+//   2026-08-31: 登录后自动跳回
+func (s *Service) GetLastPage(ctx context.Context, userID string) (string, error) {
+	if userID == "" {
+		return "", errors.New("user_id required")
+	}
+	return s.store.GetLastPage(ctx, userID)
+}
+
+// SetLastPage 写最后访问页
+//   2026-08-31: 前端每次打开页面异步上报
+//   handler 已校验白名单, 这里不再重复
+func (s *Service) SetLastPage(ctx context.Context, userID, page string) error {
+	if userID == "" {
+		return errors.New("user_id required")
+	}
+	return s.store.SetLastPage(ctx, userID, page)
+}
+
 // ============== 内部 ==============
 
 // issueTokens 签 access + refresh, 写 session

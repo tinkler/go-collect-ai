@@ -5,6 +5,7 @@ import (
 	"errors"
 	"log"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -16,6 +17,17 @@ type Handler struct {
 	sign         *Signer
 	cookieDomain string
 	cookieSecure bool
+}
+
+// allowedPages 允许记录为 last_page 的白名单 (2026-08-31)
+//   防止前端被 XSS 后写入任意路径 (虽然前端只走 api, 但后端兜底)
+//   格式: "file.html" 或 "subdir/file.html"
+var allowedPages = map[string]bool{
+	"index.html":                        true, // 欢迎页 (默认)
+	"purchase.html":                     true, // 采购收货单
+	"scan.html":                         true, // 扫商品
+	"restock.html":                      true, // 陈列补货
+	"admin/permissions.html":            true, // 权限管理
 }
 
 // NewHandler
@@ -43,7 +55,7 @@ func userView(u *User) gin.H {
 
 // WeComCallback POST /auth/wecom/callback
 //   body: { "code": "..." }
-//   resp: { access_token, token_type, expires_in, user }
+//   resp: { access_token, token_type, expires_in, user, last_page }
 func (h *Handler) WeComCallback(c *gin.Context) {
 	var req struct {
 		Code  string `json:"code"`
@@ -66,11 +78,13 @@ func (h *Handler) WeComCallback(c *gin.Context) {
 		return
 	}
 	SetRefreshCookie(c, h.cookieDomain, h.cookieSecure, int(h.sign.RefreshTTL().Seconds()), refresh)
+	lastPage, _ := h.svc.GetLastPage(ctx, result.User.ID)
 	c.JSON(http.StatusOK, gin.H{
 		"access_token": result.AccessToken,
 		"token_type":   "Bearer",
 		"expires_in":   result.ExpiresIn,
 		"user":         userView(result.User),
+		"last_page":    lastPage, // 2026-08-31: 登录后跳回
 	})
 }
 
@@ -88,11 +102,13 @@ func (h *Handler) DevLogin(c *gin.Context) {
 		return
 	}
 	SetRefreshCookie(c, h.cookieDomain, h.cookieSecure, int(h.sign.RefreshTTL().Seconds()), refresh)
+	lastPage, _ := h.svc.GetLastPage(c.Request.Context(), result.User.ID)
 	c.JSON(http.StatusOK, gin.H{
 		"access_token": result.AccessToken,
 		"token_type":   "Bearer",
 		"expires_in":   result.ExpiresIn,
 		"user":         userView(result.User),
+		"last_page":    lastPage, // 2026-08-31: 登录后跳回
 	})
 }
 
@@ -147,6 +163,57 @@ func (h *Handler) Me(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"user": userView(u)})
+}
+
+// GetLastPage GET /auth/last-page
+//   拿当前 user 最后访问的页; 无记录返回空字符串
+//   200: { "last_page": "purchase.html" | "" }
+func (h *Handler) GetLastPage(c *gin.Context) {
+	userID := UserIDFromCtx(c)
+	if userID == "" {
+		apiError(c, 401, CodeUnauthorized, "auth required", nil)
+		return
+	}
+	page, err := h.svc.GetLastPage(c.Request.Context(), userID)
+	if err != nil {
+		log.Printf("[auth] get last page failed: %v", err)
+		apiError(c, 500, CodeInternal, "fetch last page failed", nil)
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"last_page": page})
+}
+
+// SetLastPage POST /auth/last-page
+//   body: { "page": "purchase.html" }
+//   2026-08-31: 前端每次打开页面异步上报, 用于登录后自动跳转
+//   白名单校验: 只允许白名单内的页 (防 XSS 写入任意路径)
+func (h *Handler) SetLastPage(c *gin.Context) {
+	userID := UserIDFromCtx(c)
+	if userID == "" {
+		apiError(c, 401, CodeUnauthorized, "auth required", nil)
+		return
+	}
+	var req struct {
+		Page string `json:"page"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		apiError(c, 400, CodeBadRequest, "invalid json: "+err.Error(), nil)
+		return
+	}
+	page := strings.TrimSpace(req.Page)
+	if page == "" {
+		// 空值 = 清空记录, 让下次登录回 index.html
+		page = ""
+	} else if !allowedPages[page] {
+		apiError(c, 400, CodeBadRequest, "page not in whitelist: "+page, map[string]any{"page": page})
+		return
+	}
+	if err := h.svc.SetLastPage(c.Request.Context(), userID, page); err != nil {
+		log.Printf("[auth] set last page failed: %v", err)
+		apiError(c, 500, CodeInternal, "save last page failed", nil)
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"ok": true, "last_page": page})
 }
 
 // writeAuthError 把 AuthError 映射成 JSON 响应, 其它 500

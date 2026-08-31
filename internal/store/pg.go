@@ -351,6 +351,16 @@ func Migrate(ctx context.Context, pool *pgxpool.Pool) error {
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_audit_log_user_ts ON audit_log(user_id, ts DESC)`,
 
+		// ============== 用户最后访问页 (2026-08-31) ==============
+		//   登录后自动跳回上次访问的页; 权限不够时降级到 index.html
+		//   单行覆盖, 无历史, 防止数据膨胀
+		`CREATE TABLE IF NOT EXISTS user_last_page (
+			user_id     TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+			last_page   TEXT NOT NULL,
+			updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_ulp_updated ON user_last_page(updated_at DESC)`,
+
 		// seed 4 个 dev 账号 (2026-08-30: 加 group 分组: office=管理者,floor=卖场员工)
 		`INSERT INTO users (id, name, role, tenant_id, source, "group") VALUES
 			('u_owner',   '梁老板(店主)', 'owner',   't_dev', 'dev', 'office'),

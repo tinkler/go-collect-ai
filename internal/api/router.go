@@ -89,6 +89,9 @@ func NewRouter(h *handler.Handler, cfg *config.Config, restockSvc *restock.Servi
 			// /auth/* (已登录部分)
 			authed.POST("/auth/logout", authH.Logout)
 			authed.GET("/auth/me", authH.Me)
+			// 2026-08-31: 用户最后访问页 (登录后自动跳回)
+			authed.GET("/auth/last-page", authH.GetLastPage)
+			authed.POST("/auth/last-page", authH.SetLastPage)
 
 			// suppliers
 			authed.GET("/suppliers", auth.RequirePerm("session:read"), h.ListSuppliers)
