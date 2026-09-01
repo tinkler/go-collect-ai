@@ -117,6 +117,21 @@ type Session struct {
 	CreatedAt    time.Time `json:"created_at"`
 	UpdatedAt    time.Time `json:"updated_at"`
 	Rows         []SkuRow  `json:"rows,omitempty"`
+	// 2026-09-01 W3.2: 智能提醒 (purchasealert 规则引擎产出)
+	Alerts       []AlertItem `json:"alerts,omitempty"`
+}
+
+// AlertItem 采购订单智能提醒 (W3.2)
+//   跟 purchasealert.Alert 同字段,放 model 包避免循环依赖
+type AlertItem struct {
+	AlertID  int64      `json:"alert_id"`
+	RowID    int64      `json:"row_id"`
+	Rule     string     `json:"rule"`
+	Severity string     `json:"severity"`
+	Message  string     `json:"message"`
+	AckedAt  *time.Time `json:"acked_at,omitempty"`
+	AckedBy  string     `json:"acked_by,omitempty"`
+	CreatedAt time.Time `json:"created_at,omitempty"`
 }
 
 type SessionSummary struct {

@@ -21,6 +21,7 @@ import (
 	"github.com/tinkler/collect-ai/internal/parser"
 	"github.com/tinkler/collect-ai/internal/parser/agent"
 	"github.com/tinkler/collect-ai/internal/parser/matcher"
+	"github.com/tinkler/collect-ai/internal/purchasealert"
 	"github.com/tinkler/collect-ai/internal/restock"
 	"github.com/tinkler/collect-ai/internal/store"
 )
@@ -35,7 +36,8 @@ type Handler struct {
 	BusinessReg   *business.Registry // 业务字段映射(products / suppliers 跨数据源)
 	Sessions      *store.SessionRepo
 	Templates     *store.TemplateRepo
-	RestockSvc    *restock.Service // 2026-08-28: 采购收货单附加 plan_qty
+	RestockSvc    *restock.Service       // 2026-08-28: 采购收货单附加 plan_qty
+	AlertSvc      *purchasealert.Service // 2026-09-01 W3.2: 采购订单智能提醒
 	FuzzyDistance int // rematch 用 (旧接口保留)
 	// 兜底值 (per-template 没配时, 用这几个)
 	DefaultOcrModel  string
@@ -698,7 +700,42 @@ func (h *Handler) GetSession(c *gin.Context) {
 	if s.Mode == model.ModePurchase && h.RestockSvc != nil {
 		_ = h.RestockSvc.AttachPlanQtyToRows(c.Request.Context(), s.SupplierName, s.Rows)
 	}
+	// W3.2: 采购模式 + Alert 服务 → 跑规则引擎 (幂等: 已有 alerts 跳过)
+	if s.Mode == model.ModePurchase && h.AlertSvc != nil {
+		ctx := c.Request.Context()
+		existing, _ := h.AlertSvc.ListAlertsBySession(ctx, id)
+		if len(existing) == 0 {
+			_, _ = h.AlertSvc.Apply(ctx, s)
+			existing, _ = h.AlertSvc.ListAlertsBySession(ctx, id)
+		}
+		s.Alerts = convertAlertsToModel(existing)
+	}
 	c.JSON(200, s)
+}
+
+// convertAlertsToModel purchasealert.Alert → model.AlertItem (避免 handler 依赖 purchasealert.Alert 类型)
+func convertAlertsToModel(in []purchasealert.Alert) []model.AlertItem {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make([]model.AlertItem, 0, len(in))
+	for _, a := range in {
+		it := model.AlertItem{
+			AlertID:  a.AlertID,
+			RowID:    a.RowID,
+			Rule:     a.Rule,
+			Severity: a.Severity,
+			Message:  a.Message,
+			AckedBy:  a.AckedBy,
+			CreatedAt: a.CreatedAt,
+		}
+		if !a.AckedAt.IsZero() {
+			t := a.AckedAt
+			it.AckedAt = &t
+		}
+		out = append(out, it)
+	}
+	return out
 }
 
 func (h *Handler) DeleteSession(c *gin.Context) {

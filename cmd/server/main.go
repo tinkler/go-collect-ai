@@ -20,6 +20,7 @@ import (
 	"github.com/tinkler/collect-ai/internal/parser"
 	parseragent "github.com/tinkler/collect-ai/internal/parser/agent"
 	"github.com/tinkler/collect-ai/internal/parser/bigmodel"
+	"github.com/tinkler/collect-ai/internal/purchasealert"
 	"github.com/tinkler/collect-ai/internal/rbac"
 	"github.com/tinkler/collect-ai/internal/restock"
 	"github.com/tinkler/collect-ai/internal/wxsign"
@@ -116,6 +117,7 @@ func main() {
 	restockLLM := restock.NewLlmPlanner(llmClient, cfg.RestockLLMModel, cfg.RestockLLMPlanEnabled, cfg.RestockLLMPlanCacheHrs)
 	restockWeCom := restock.NewWeCom(restockCfg)
 	restockSvc := restock.NewService(restockCfg, pool, restockCube, restockLLM, restockWeCom)
+	alertSvc := purchasealert.NewService(pool) // W3.2: 采购订单智能提醒
 
 	// ============== 鉴权 (2026-08-29) ==============
 	authStore := auth.NewStore(pool)
@@ -143,6 +145,7 @@ func main() {
 		Sessions:            sessionRepo,
 		Templates:           templateRepo,
 		RestockSvc:          restockSvc, // 2026-08-28: 采购收货单附加 plan_qty
+		AlertSvc:            alertSvc,   // 2026-09-01 W3.2: 采购订单智能提醒
 		FuzzyDistance:       cfg.FuzzyDistance,
 		DefaultOcrModel:     cfg.OCRModel,
 		DefaultLlmModel:     cfg.LLMModel,

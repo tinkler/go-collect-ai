@@ -151,6 +151,25 @@ func Migrate(ctx context.Context, pool *pgxpool.Pool) error {
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_promotion_fee_supplier ON promotion_fee(supplier_name, period_end DESC)`,
 		`CREATE INDEX IF NOT EXISTS idx_promotion_fee_period ON promotion_fee(period_start, period_end)`,
+
+		// ============================================================
+		// 采购订单智能提醒 (W3.2, 2026-09-01) — agent-purchase-plan.md §4
+		// 规则引擎产出: 限入场 / 季节不匹配 / 节假日 lead_days
+		// ============================================================
+		`CREATE TABLE IF NOT EXISTS purchase_session_alert (
+			id              BIGSERIAL PRIMARY KEY,
+			session_id      UUID NOT NULL REFERENCES parse_session(id) ON DELETE CASCADE,
+			row_id          BIGINT REFERENCES parse_row(id) ON DELETE CASCADE,
+			rule            TEXT NOT NULL,    -- 'block_entry' | 'no_return' | 'offseason' | 'holiday_lead'
+			severity        TEXT NOT NULL,    -- 'block' | 'warn' | 'info'
+			message         TEXT NOT NULL,
+			acked_at        TIMESTAMPTZ,
+			acked_by        TEXT NOT NULL DEFAULT '',
+			created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_psalert_session ON purchase_session_alert(session_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_psalert_rule ON purchase_session_alert(rule, severity)`,
+		`CREATE INDEX IF NOT EXISTS idx_psalert_pending ON purchase_session_alert(session_id) WHERE acked_at IS NULL`,
 	}
 	for _, s := range stmts {
 		if _, err := pool.Exec(ctx, s); err != nil {
