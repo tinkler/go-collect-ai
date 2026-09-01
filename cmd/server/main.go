@@ -23,6 +23,7 @@ import (
 	"github.com/tinkler/collect-ai/internal/promotionalert"
 	"github.com/tinkler/collect-ai/internal/purchasealert"
 	"github.com/tinkler/collect-ai/internal/rbac"
+	"github.com/tinkler/collect-ai/internal/supplierpayment"
 	"github.com/tinkler/collect-ai/internal/restock"
 	"github.com/tinkler/collect-ai/internal/wxsign"
 	"github.com/tinkler/collect-ai/internal/store"
@@ -122,6 +123,7 @@ func main() {
 	seasonClassifier := buildSeasonClassifier(llmClient)
 	alertSvc := purchasealert.NewServiceWithClassifier(pool, seasonClassifier) // W3.2+W3.5
 	promoAlertSvc := promotionalert.NewService(pool, strings.TrimSpace(os.Getenv("PROMOTION_ALERT_CHAT_ID"))) // W3.3: 堆头费到期预警 (空=禁用)
+	supplierPaySvc := supplierpayment.NewService(pool, strings.TrimSpace(os.Getenv("OWNER_CHAT_ID")))          // W4.3: 供应商结算 cron
 	cashRepo := store.NewCashBalanceRepo(pool)        // W4
 	payRepo := store.NewSupplierPaymentRepo(pool)     // W4
 
@@ -235,6 +237,18 @@ func main() {
 		log.Printf("[main] PROMOTION_ALERT_CHAT_ID 未配置, 堆头费到期预警禁用")
 	}
 
+	// W4.3: 供应商结算 cron (4 任务, 独立开关)
+	supplierPayCtx, supplierPayCancel := context.WithCancel(context.Background())
+	defer supplierPayCancel()
+	if strings.TrimSpace(os.Getenv("OWNER_CHAT_ID")) != "" {
+		go runSupplierPayCron(supplierPayCtx, supplierPaySvc, restockWeCom, agent.NewWecomSender(restockWeCom))
+		log.Printf("[main] W4.3 供应商结算 cron 启动 (owner=%s)", os.Getenv("OWNER_CHAT_ID"))
+	} else {
+		log.Printf("[main] OWNER_CHAT_ID 未配置, 供应商结算 cron 禁用 (但 weekly/monthly 仍会写库, 只不发群)")
+		// 仍然写库(forecast/suggestion/share), 只是不推群
+		go runSupplierPayCronNoPush(supplierPayCtx, supplierPaySvc)
+	}
+
 	// restock cron(独立开关: 没门店不跑)
 	if cfg.RestockBranchNo != "" {
 		if err := restockSvc.Start(); err != nil {
@@ -327,4 +341,157 @@ func buildSeasonClassifier(llmClient *bigmodel.LlmClient) purchasealert.SeasonCl
 	chained := purchasealert.NewChainedSeasonClassifier(keyword, cached)
 	log.Printf("[main] Season classifier: keyword + LLM (cached 6h/1000)")
 	return chained
+}
+
+// runSupplierPayCron W4.3 启动 4 个 cron 任务
+//   启动时立即跑 forecast + weekly
+//   每日 21:00 跑 forecast
+//   每周一 09:00 跑 weekly
+//   每月 1 号 02:00 跑 monthly share
+//   每日 22:00 跑 cash check
+func runSupplierPayCron(ctx context.Context, svc *supplierpayment.Service, _ *restock.WeCom, sender agent.Sender) {
+	// 启动立即跑
+	if _, err := svc.RunDailyForecast(ctx); err != nil {
+		log.Printf("[supplierpay.DailyForecast] err: %v", err)
+	}
+	if _, err := svc.RunWeeklySuggestions(ctx); err != nil {
+		log.Printf("[supplierpay.WeeklySuggestions] err: %v", err)
+	}
+
+	// 4 个 ticker 共享 24h 大循环 + 各自对齐
+	runDaily(ctx, func(ctx context.Context) {
+		if _, err := svc.RunDailyForecast(ctx); err != nil {
+			log.Printf("[supplierpay.DailyForecast] err: %v", err)
+		}
+	}, 21, 0) // 每日 21:00
+
+	runWeekly(ctx, func(ctx context.Context) {
+		if _, err := svc.RunWeeklySuggestions(ctx); err != nil {
+			log.Printf("[supplierpay.WeeklySuggestions] err: %v", err)
+		}
+	}, time.Monday, 9, 0) // 周一 09:00
+
+	runMonthly(ctx, func(ctx context.Context) {
+		if _, err := svc.RunMonthlyShare(ctx); err != nil {
+			log.Printf("[supplierpay.MonthlyShare] err: %v", err)
+		}
+	}, 1, 2, 0) // 每月 1 号 02:00
+
+	runDaily(ctx, func(ctx context.Context) {
+		if _, err := svc.RunDailyCashCheck(ctx, sender); err != nil {
+			log.Printf("[supplierpay.DailyCashCheck] err: %v", err)
+		}
+	}, 22, 0) // 每日 22:00
+}
+
+// runSupplierPayCronNoPush 同上但 cash check 不推群
+func runSupplierPayCronNoPush(ctx context.Context, svc *supplierpayment.Service) {
+	if _, err := svc.RunDailyForecast(ctx); err != nil {
+		log.Printf("[supplierpay] err: %v", err)
+	}
+	if _, err := svc.RunWeeklySuggestions(ctx); err != nil {
+		log.Printf("[supplierpay] err: %v", err)
+	}
+	runDaily(ctx, func(ctx context.Context) {
+		_, _ = svc.RunDailyForecast(ctx)
+	}, 21, 0)
+	runWeekly(ctx, func(ctx context.Context) {
+		_, _ = svc.RunWeeklySuggestions(ctx)
+	}, time.Monday, 9, 0)
+	runMonthly(ctx, func(ctx context.Context) {
+		_, _ = svc.RunMonthlyShare(ctx)
+	}, 1, 2, 0)
+	runDaily(ctx, func(ctx context.Context) {
+		_, _ = svc.RunDailyCashCheck(ctx, nil) // sender nil = 不推
+	}, 22, 0)
+}
+
+// runDaily 每日定时 HH:MM (本地时间)
+func runDaily(ctx context.Context, fn func(context.Context), hour, minute int) {
+	now := time.Now()
+	next := time.Date(now.Year(), now.Month(), now.Day(), hour, minute, 0, 0, now.Location())
+	if !next.After(now) {
+		next = next.Add(24 * time.Hour)
+	}
+	wait := time.Until(next)
+	timer := time.NewTimer(wait)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return
+	case <-timer.C:
+	}
+	for {
+		fn(ctx)
+		timer.Reset(24 * time.Hour)
+		select {
+		case <-ctx.Done():
+			return
+		case <-timer.C:
+		}
+	}
+}
+
+// runWeekly 每周周几 HH:MM
+func runWeekly(ctx context.Context, fn func(context.Context), weekday time.Weekday, hour, minute int) {
+	now := time.Now()
+	daysUntil := int(weekday - now.Weekday())
+	if daysUntil < 0 || (daysUntil == 0 && (now.Hour() > hour || (now.Hour() == hour && now.Minute() >= minute))) {
+		daysUntil += 7
+	}
+	next := time.Date(now.Year(), now.Month(), now.Day()+daysUntil, hour, minute, 0, 0, now.Location())
+	wait := time.Until(next)
+	timer := time.NewTimer(wait)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return
+	case <-timer.C:
+	}
+	for {
+		fn(ctx)
+		// 下周同时间
+		next = next.Add(7 * 24 * time.Hour)
+		wait = time.Until(next)
+		if wait < 0 {
+			wait = 0
+		}
+		timer.Reset(wait)
+		select {
+		case <-ctx.Done():
+			return
+		case <-timer.C:
+		}
+	}
+}
+
+// runMonthly 每月第几天 HH:MM
+func runMonthly(ctx context.Context, fn func(context.Context), day, hour, minute int) {
+	now := time.Now()
+	next := time.Date(now.Year(), now.Month(), day, hour, minute, 0, 0, now.Location())
+	if !next.After(now) {
+		next = time.Date(now.Year(), now.Month()+1, day, hour, minute, 0, 0, now.Location())
+	}
+	wait := time.Until(next)
+	timer := time.NewTimer(wait)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return
+	case <-timer.C:
+	}
+	for {
+		fn(ctx)
+		next = time.Date(next.Year(), next.Month()+1, day, hour, minute, 0, 0, next.Location())
+		wait = time.Until(next)
+		if wait < 0 {
+			wait = 0
+		}
+		timer.Reset(wait)
+		select {
+		case <-ctx.Done():
+			return
+		case <-timer.C:
+		}
+	}
 }
