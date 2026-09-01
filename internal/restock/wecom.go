@@ -56,6 +56,7 @@ type WeCom struct {
 	// 事件回调(由 service.go 注册)
 	OnButtonClick func(reqID, chatID, userID, taskID, eventKey string) // 按钮点击(req_id 用于回发 update 帧)
 	OnMessage     func(chatID, userID, text string)                    // 文本消息(用于自动发现)
+	OnAgentMessage func(chatID, userID, text string)                   // 文本消息(智能采购 Agent, W2 接入)
 	OnConnect     func()                                               // 连接成功
 
 	// 内部
@@ -558,8 +559,15 @@ func (w *WeCom) handleTextMsg(f *ChatFrame) {
 	if f.Body.ChatID != "" {
 		w.recordChat(f.Body.ChatID)
 	}
-	if f.Body.Text != nil && w.OnMessage != nil {
-		w.OnMessage(f.Body.ChatID, f.Body.From.UserID, f.Body.Text.Content)
+	if f.Body.Text != nil {
+		if w.OnMessage != nil {
+			w.OnMessage(f.Body.ChatID, f.Body.From.UserID, f.Body.Text.Content)
+		}
+		// 2026-09-01 W2: 智能采购 Agent 桥接(同事件,OnAgentMessage 跟 OnMessage 并存,
+		// 桥内部按 chat_id 白名单过滤,只接管显式指定的群)
+		if w.OnAgentMessage != nil {
+			w.OnAgentMessage(f.Body.ChatID, f.Body.From.UserID, f.Body.Text.Content)
+		}
 	}
 }
 
