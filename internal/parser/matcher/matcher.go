@@ -7,32 +7,45 @@ import (
 	"github.com/tinkler/collect-ai/internal/model"
 )
 
-// SkuMatcher 5 级级联匹配
+// SkuMatcher 6 级级联匹配 (W3.1: 新增 L3 段位)
 // 1) barcode exact
 // 2) name exact (with/without space, case-insensitive)
-// 3) name no-space + Levenshtein <= fuzzy
-// 4) substring (收紧: 任一端 >= 4 字符, 长度差 <= 3, 取长度差最小)
-// 5) 失败 → IsNew
+// 3) barcode suffix(4) + name jaccard ≥ 0.6   (2026-09-01 W3.1: L3 段位,OCR 漏掉前缀场景)
+// 4) name no-space + Levenshtein <= fuzzy
+// 5) substring (收紧: 任一端 >= 4 字符, 长度差 <= 3, 取长度差最小)
+// 6) 失败 → IsNew
 type SkuMatcher struct {
-	skus         []model.SkuRecord
-	fuzzyDist    int
-	byBarcode    map[string]model.SkuRecord
-	byName       map[string]model.SkuRecord
-	byNameNoSp   map[string]model.SkuRecord
+	skus             []model.SkuRecord
+	fuzzyDist        int
+	byBarcode        map[string]model.SkuRecord
+	byName           map[string]model.SkuRecord
+	byNameNoSp       map[string]model.SkuRecord
+	byBarcodeSuffix4 map[string][]model.SkuRecord // W3.1: barcode 后 4 位桶
 }
+
+const (
+	// L3 名称相似度阈值 (Jaccard 字符 2-gram)
+	l3JaccardThreshold = 0.6
+)
 
 func New(skus []model.SkuRecord, fuzzyDist int) *SkuMatcher {
 	m := &SkuMatcher{
-		skus:       skus,
-		fuzzyDist:  maxInt(0, fuzzyDist),
-		byBarcode:  make(map[string]model.SkuRecord, len(skus)),
-		byName:     make(map[string]model.SkuRecord, len(skus)),
-		byNameNoSp: make(map[string]model.SkuRecord, len(skus)),
+		skus:             skus,
+		fuzzyDist:        maxInt(0, fuzzyDist),
+		byBarcode:        make(map[string]model.SkuRecord, len(skus)),
+		byName:           make(map[string]model.SkuRecord, len(skus)),
+		byNameNoSp:       make(map[string]model.SkuRecord, len(skus)),
+		byBarcodeSuffix4: make(map[string][]model.SkuRecord),
 	}
 	for _, s := range skus {
 		if s.Barcode != "" {
 			if _, exists := m.byBarcode[s.Barcode]; !exists {
 				m.byBarcode[s.Barcode] = s
+			}
+			// W3.1 L3: barcode 后 4 位入桶
+			if len(s.Barcode) >= 4 {
+				suf := s.Barcode[len(s.Barcode)-4:]
+				m.byBarcodeSuffix4[suf] = append(m.byBarcodeSuffix4[suf], s)
 			}
 		}
 		if s.Name != "" {
@@ -80,7 +93,16 @@ func (m *SkuMatcher) Match(ocr model.ParsedOcrRow, seq int) model.SkuRow {
 			m.applyMatch(&row, hit, "修正(名称)")
 			return row
 		}
-		// 3) name no-space exact
+		// 3) W3.1 L3: barcode 后 4 位 + 名称 Jaccard ≥ 0.6
+		//    场景: OCR 漏掉条码前缀(打印不清/裁切),只识别到后几位
+		//    桶预计算 → 同桶的 sku 与 OCR name 做相似度,取最高分且 ≥ 0.6
+		if ocr.Barcode != "" {
+			if hit := m.findByBarcodeSuffix4(ocr.Barcode, n); hit != nil {
+				m.applyMatch(&row, *hit, "修正(条码后缀+名称模糊)")
+				return row
+			}
+		}
+		// 4) name no-space exact
 		ns := removeSpaces(n)
 		if ns != "" {
 			if hit, ok := m.byNameNoSp[ns]; ok {
@@ -88,14 +110,14 @@ func (m *SkuMatcher) Match(ocr model.ParsedOcrRow, seq int) model.SkuRow {
 				return row
 			}
 		}
-		// 4) fuzzy (Levenshtein)
+		// 5) fuzzy (Levenshtein)
 		if m.fuzzyDist > 0 && ns != "" {
 			if best := m.findFuzzy(ns, m.fuzzyDist); best != nil {
 				m.applyMatch(&row, *best, "修正(模糊)")
 				return row
 			}
 		}
-		// 5) substring (收紧版)
+		// 6) substring (收紧版)
 		if ns != "" {
 			if best := m.findSubstring(ns); best != nil {
 				m.applyMatch(&row, *best, "修正(子串)")
@@ -124,8 +146,9 @@ func (m *SkuMatcher) applyMatch(row *model.SkuRow, hit model.SkuRecord, status s
 func (m *SkuMatcher) findFuzzy(s string, maxDist int) *model.SkuRecord {
 	var best *model.SkuRecord
 	bestDist := math.MaxInt32
+	slen := kLen(s) // W3.1 fix: 用 rune 数,非字节数(中文 4 字 = 12 字节会误剪枝)
 	for k, v := range m.byNameNoSp {
-		if absInt(kLen(k)-len(s)) > maxDist {
+		if absInt(kLen(k)-slen) > maxDist {
 			continue
 		}
 		d := levenshtein(k, s, maxDist)
@@ -146,15 +169,16 @@ func (m *SkuMatcher) findFuzzy(s string, maxDist int) *model.SkuRecord {
 func (m *SkuMatcher) findSubstring(s string) *model.SkuRecord {
 	var best *model.SkuRecord
 	bestDiff := math.MaxInt32
+	slen := kLen(s) // W3.1 fix: rune 数,非字节数
 	for k, v := range m.byNameNoSp {
-		if kLen(k) < 4 || len(s) < 4 {
+		if kLen(k) < 4 || slen < 4 {
 			continue
 		}
-		if absInt(kLen(k)-len(s)) > 3 {
+		if absInt(kLen(k)-slen) > 3 {
 			continue
 		}
 		if strings.Contains(s, k) || strings.Contains(k, s) {
-			diff := absInt(kLen(k) - len(s))
+			diff := absInt(kLen(k) - slen)
 			if diff < bestDiff {
 				bestDiff = diff
 				best = &v
@@ -162,6 +186,78 @@ func (m *SkuMatcher) findSubstring(s string) *model.SkuRecord {
 		}
 	}
 	return best
+}
+
+// findByBarcodeSuffix4 W3.1 L3 段位
+//   场景: OCR 漏掉条码前缀(打印不全/裁切/手写),只识别到后 N 位
+//   算法:
+//     1) 取 ocr.Barcode 后 4 位 → 在 byBarcodeSuffix4 桶里找候选
+//     2) 对每个候选,跟 ocr.Name 做 Jaccard 字符 2-gram 相似度
+//     3) 取最高分且 ≥ 0.6 的候选返回
+//   阈值可通过 l3JaccardThreshold 调整
+func (m *SkuMatcher) findByBarcodeSuffix4(barcode, name string) *model.SkuRecord {
+	if len(barcode) < 4 || name == "" {
+		return nil
+	}
+	suf := barcode[len(barcode)-4:]
+	candidates, ok := m.byBarcodeSuffix4[suf]
+	if !ok || len(candidates) == 0 {
+		return nil
+	}
+	ocrGrams := bigrams(removeSpaces(strings.TrimSpace(name)))
+	if len(ocrGrams) == 0 {
+		return nil
+	}
+	var best *model.SkuRecord
+	bestScore := 0.0
+	for i := range candidates {
+		c := &candidates[i]
+		if c.Name == "" {
+			continue
+		}
+		score := nameJaccard(ocrGrams, removeSpaces(c.Name))
+		if score > bestScore {
+			bestScore = score
+			best = c
+		}
+	}
+	if bestScore >= l3JaccardThreshold {
+		return best
+	}
+	return nil
+}
+
+// bigrams 字符 2-gram 集合(中文 OK,按 rune 切)
+//   例: "可口可乐" → {"可口","口可","可乐"}
+func bigrams(s string) map[string]struct{} {
+	runes := []rune(s)
+	if len(runes) < 2 {
+		return nil
+	}
+	set := make(map[string]struct{}, len(runes))
+	for i := 0; i < len(runes)-1; i++ {
+		set[string(runes[i:i+2])] = struct{}{}
+	}
+	return set
+}
+
+// nameJaccard 计算 name 与 grams 的 Jaccard 相似度
+func nameJaccard(grams map[string]struct{}, name string) float64 {
+	candGrams := bigrams(name)
+	if candGrams == nil {
+		return 0
+	}
+	inter := 0
+	for k := range grams {
+		if _, ok := candGrams[k]; ok {
+			inter++
+		}
+	}
+	union := len(grams) + len(candGrams) - inter
+	if union == 0 {
+		return 0
+	}
+	return float64(inter) / float64(union)
 }
 
 // ----- helpers -----
