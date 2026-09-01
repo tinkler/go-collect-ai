@@ -20,6 +20,7 @@ import (
 	"github.com/tinkler/collect-ai/internal/parser"
 	parseragent "github.com/tinkler/collect-ai/internal/parser/agent"
 	"github.com/tinkler/collect-ai/internal/parser/bigmodel"
+	"github.com/tinkler/collect-ai/internal/promotionalert"
 	"github.com/tinkler/collect-ai/internal/purchasealert"
 	"github.com/tinkler/collect-ai/internal/rbac"
 	"github.com/tinkler/collect-ai/internal/restock"
@@ -117,7 +118,8 @@ func main() {
 	restockLLM := restock.NewLlmPlanner(llmClient, cfg.RestockLLMModel, cfg.RestockLLMPlanEnabled, cfg.RestockLLMPlanCacheHrs)
 	restockWeCom := restock.NewWeCom(restockCfg)
 	restockSvc := restock.NewService(restockCfg, pool, restockCube, restockLLM, restockWeCom)
-	alertSvc := purchasealert.NewService(pool) // W3.2: 采购订单智能提醒
+	alertSvc := purchasealert.NewService(pool)            // W3.2: 采购订单智能提醒
+	promoAlertSvc := promotionalert.NewService(pool, strings.TrimSpace(os.Getenv("PROMOTION_ALERT_CHAT_ID"))) // W3.3: 堆头费到期预警 (空=禁用)
 
 	// ============== 鉴权 (2026-08-29) ==============
 	authStore := auth.NewStore(pool)
@@ -184,6 +186,47 @@ func main() {
 		}
 	} else {
 		log.Printf("[main] Agent Bridge 未启动 (enabled=%v, chats=%d)", agentEnabled, len(agentChatIDs))
+	}
+
+	// W3.3 堆头费到期 cron: 启动时跑一次 + 每日 21:00 跑
+	promoAlertCtx, promoAlertCancel := context.WithCancel(context.Background())
+	defer promoAlertCancel()
+	if strings.TrimSpace(os.Getenv("PROMOTION_ALERT_CHAT_ID")) != "" {
+		// 启动时立即跑一次 (捕获已到期的)
+		go func() {
+			_ = promoAlertSvc.RunAndPush(promoAlertCtx, agent.NewWecomSender(restockWeCom))
+		}()
+		// 每日 21:00 跑
+		go func() {
+			ticker := time.NewTicker(24 * time.Hour)
+			defer ticker.Stop()
+			// 第一次等下次 21:00 整点
+			now := time.Now()
+			next := time.Date(now.Year(), now.Month(), now.Day(), 21, 0, 0, 0, now.Location())
+			if next.Before(now) {
+				next = next.Add(24 * time.Hour)
+			}
+			wait := time.Until(next)
+			first := time.NewTimer(wait)
+			defer first.Stop()
+			select {
+			case <-promoAlertCtx.Done():
+				return
+			case <-first.C:
+				_ = promoAlertSvc.RunAndPush(promoAlertCtx, agent.NewWecomSender(restockWeCom))
+			}
+			for {
+				select {
+				case <-promoAlertCtx.Done():
+					return
+				case <-ticker.C:
+					_ = promoAlertSvc.RunAndPush(promoAlertCtx, agent.NewWecomSender(restockWeCom))
+				}
+			}
+		}()
+		log.Printf("[main] W3.3 堆头费到期预警: 启动时跑一次 + 每日 21:00 (chat_id=%s)", os.Getenv("PROMOTION_ALERT_CHAT_ID"))
+	} else {
+		log.Printf("[main] PROMOTION_ALERT_CHAT_ID 未配置, 堆头费到期预警禁用")
 	}
 
 	// restock cron(独立开关: 没门店不跑)
