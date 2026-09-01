@@ -6,9 +6,11 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
+	"github.com/tinkler/collect-ai/internal/agent"
 	"github.com/tinkler/collect-ai/internal/api"
 	"github.com/tinkler/collect-ai/internal/api/handler"
 	"github.com/tinkler/collect-ai/internal/auth"
@@ -16,7 +18,7 @@ import (
 	"github.com/tinkler/collect-ai/internal/config"
 
 	"github.com/tinkler/collect-ai/internal/parser"
-	"github.com/tinkler/collect-ai/internal/parser/agent"
+	parseragent "github.com/tinkler/collect-ai/internal/parser/agent"
 	"github.com/tinkler/collect-ai/internal/parser/bigmodel"
 	"github.com/tinkler/collect-ai/internal/rbac"
 	"github.com/tinkler/collect-ai/internal/restock"
@@ -64,7 +66,7 @@ func main() {
 	// 数据源: 启动后即固定,只走 .env / cfg 配置 (2026-08-31 简化,移除 dsstate 持久化 + 切换 API)
 	initialDS := cfg.DataSource
 	log.Printf("[main] datasource: %s (from env/cfg, 启动后即固定)", initialDS)
-	agentClient := agent.NewClient(cfg.AgentURL, cfg.AgentToken, 30, initialDS)
+	agentClient := parseragent.NewClient(cfg.AgentURL, cfg.AgentToken, 30, initialDS)
 	businessReg := business.NewDefaultRegistry()
 
 	psr := parser.New(ocrClient, llmClient, agentClient)
@@ -154,6 +156,33 @@ func main() {
 		log.Printf("[wecom] msg from chat=%s user=%s: %s", chatID, userID, text)
 	}
 
+	// ============== 智能采购 Agent 桥接 (W2, 2026-09-01) ==============
+	//   显式白名单 chat_ids 才接管(避免误接管 restock 群)
+	//   env: COLLECTAI_AGENT_CHAT_IDS=chat_id1,chat_id2 (逗号或空格分隔)
+	//        COLLECTAI_AGENT_ENABLED=true|false (默认 true, 需时显式关)
+	agentEnabled := !strings.EqualFold(strings.TrimSpace(os.Getenv("COLLECTAI_AGENT_ENABLED")), "false")
+	agentChatIDs := splitIDs(os.Getenv("COLLECTAI_AGENT_CHAT_IDS"))
+	if agentEnabled && len(agentChatIDs) > 0 {
+		agentCfg := agent.LoadConfigFromEnv(os.Getenv)
+		agentRunner, err := agent.NewRunner(context.Background(), agentCfg, pool)
+		if err != nil {
+			log.Printf("[main] agent.NewRunner 失败: %v (Bridge 不启动)", err)
+		} else {
+			bridge := agent.NewBridge(agent.DefaultBridgeConfig(), agentRunner, agent.NewWecomSender(restockWeCom))
+			// 白名单 set 覆盖默认
+			bridge = agent.NewBridge(agent.BridgeConfig{
+				ChatIDs:       agentChatIDs,
+				MaxReplyChars: 200,
+				PerMinuteRate: 25,
+				RunTimeout:    60 * time.Second,
+			}, agentRunner, agent.NewWecomSender(restockWeCom))
+			restockWeCom.OnAgentMessage = bridge.Handle
+			log.Printf("[main] Agent Bridge ready: chats=%d llm=%v model=%s", len(agentChatIDs), agentRunner.Enabled(), agentCfg.ModelName)
+		}
+	} else {
+		log.Printf("[main] Agent Bridge 未启动 (enabled=%v, chats=%d)", agentEnabled, len(agentChatIDs))
+	}
+
 	// restock cron(独立开关: 没门店不跑)
 	if cfg.RestockBranchNo != "" {
 		if err := restockSvc.Start(); err != nil {
@@ -210,4 +239,24 @@ func main() {
 		log.Printf("shutdown: %v", err)
 	}
 	// restockSvc.Stop() / restockWeCom.Stop() 通过 line 134/146 的 defer 自动调用
+}
+
+// splitIDs 按逗号/空格/分号/换行分隔 ID 列表,trim + 去重
+func splitIDs(s string) []string {
+	seen := make(map[string]struct{})
+	out := []string{}
+	for _, f := range strings.FieldsFunc(s, func(r rune) bool {
+		return r == ',' || r == ';' || r == ' ' || r == '\n' || r == '\r' || r == '\t'
+	}) {
+		v := strings.TrimSpace(f)
+		if v == "" {
+			continue
+		}
+		if _, ok := seen[v]; ok {
+			continue
+		}
+		seen[v] = struct{}{}
+		out = append(out, v)
+	}
+	return out
 }
