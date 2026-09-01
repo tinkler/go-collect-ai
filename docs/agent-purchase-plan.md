@@ -348,39 +348,66 @@ LLM 不参与分类,只参与 **"该商品是否应季"** 这种语义模糊的�
 
 ---
 
-## 5. 模块 D:对账 + 堆头费 + 借款建议
+## 5. 模块 D:对账 + 堆头费 + 结算供应商货款建议
 
 ### 5.1 目标
+
+> **术语纠正**:`借款建议` 是错词,正确含义是 **`结算供应商货款建议`** —— 即"按这家供应商的投入(堆头/端架/促销支持)+ 你的动销节奏,该给对方结多少货款"。
 
 月底对账时,系统主动告诉老板:
 - **堆头费/端架费** 应分摊到哪些供应商,金额多少
 - **哪些供应商的堆头费即将到期** (剩 ≤ 7 天)
-- **下月预计采购额** 多少,对应**建议借款额** (采购额 × 1.5 buffer + 7 天回款延迟)
-- **现金日报** 显示可用资金 < 建议借款,推 owner 群
+- **每个供应商的待结算货款建议金额** —— 基于**供应商费用支持力度、产品促销力度、产品动销率**三维度
+- **现金日报** 显示可用资金 < 应付待结算,推 owner 群
 
-### 5.2 Function Tools(本模块 4 个)
+### 5.2 三维度输入(LLM 参考)
+
+LLM 在生成结算建议时,**必须**消费以下三类数据(从 PG + cube 拉,LLM 不直接拼 SQL,走 Function Tool):
+
+| 维度 | 含义 | 数据来源 | 用法 |
+|---|---|---|---|
+| **供应商费用支持力度** | 该供应商给了多少堆头/端架/陈列/DM 费等"投入" | `promotion_fee` 表 | 投入越多 → 越倾向优先结算(感情账 + 关系维护) |
+| **产品促销力度** | 该供应商的 SKU 在我们的促销档期(满减/特价/堆码)中的活跃度 | `v_prom_saleflow` cube(已建)+ 节假日窗口 | 促销 SKU 多 → 销售快 → 备货多 → 待结算大 |
+| **产品动销率** | 近 7/30 天该供应商 SKU 的销售速率 + 售罄率 | `siss_saleflow` / `t_rm_saleflow` cube | 动销高 → 资金周转快 → 适度多结;动销低 → 现金压力大 → 少结压货 |
+
+**单家供应商结算建议公式**(LLM 调工具,工具返回原始数;LLM 解释成"为什么结这个数"):
+
+```
+suggested_settlement(supplier, period_days) =
+    base_forecast_30d                    -- cube: 近 30 天该 supplier 采购额 × (period/30)
+  × investment_weight                    -- 0.8 ~ 1.5,基于 promotion_fee 当月分摊占比
+  × promo_weight                         -- 0.9 ~ 1.3,基于过去 30 天促销 SKU 销售额占比
+  × sellthrough_weight                   -- 0.7 ~ 1.2,基于近 30 天动销率 vs 采购到货率
+  × payment_cycle_factor                 -- 该供应商账期(7/15/30/60 天)对应的资金占用补偿
+```
+
+> ⚠️ 这套系数是**初版估算**,W4 跑数据后让业务调权。LLM 在 Phase 4 解释时也要把"为什么这个数"标清楚系数来源。
+
+### 5.3 Function Tools(本模块 4 个)
 
 | 工具 | 作用 | 算法 |
 |---|---|---|
 | `compute_promotion_fee_share(supplier, month)` | 算该供应商当月堆头+端架费分摊 | 简单求和 `promotion_fee` 表 |
 | `upcoming_promotion_expiry(days_ahead)` | 查未来 N 天到期的堆头费 | `period_end - today ≤ N` |
-| `forecast_purchase_amount(supplier, days)` | 预测 N 天内采购额 | cube: `近 30 天 supplier 采购额 × (N/30)` |
-| `suggest_loan_amount(days, buffer_factor)` | 借款建议 | `forecast_purchase × buffer × (1 + 7/30 cash_lag)` |
+| `forecast_purchase_amount(supplier, days)` | 预测 N 天内采购额(动销基准) | cube: `近 30 天 supplier 采购额 × (N/30)` |
+| `suggest_supplier_payment(supplier, period_days)` | **结算供应商货款建议** | 调上面 3 个 + 拉促销/动销/账期,组装 5.2 公式,返回结构化数字 + LLM 解释 |
 
-### 5.3 数据流
+### 5.4 数据流
 
 ```
 1) 每日 21:00 cron → 算 forecast_purchase_amount(30) → 写 supplier_forecast 表
 2) 每日 21:00 cron → 查 upcoming_promotion_expiry(7) → 如有 → 推 office 群
-3) 每周一 09:00 cron → 算 suggest_loan_amount(30, 1.5) → 写 loan_suggestion 表
-4) 每日 22:00 cron → 拉现金日报(新数据源)→ 算 cash_available → 如 < suggest → 推 owner
+3) 每周一 09:00 cron → 算 suggest_supplier_payment(per supplier, period_days=30) → 写 supplier_payment_suggestion 表
+4) 每日 22:00 cron → 拉现金日报(新数据源)→ 算 cash_available → 如 < sum(supplier_payment_suggestion) → 推 owner
 5) 每月 1 号 02:00 → 跑上月 promotion_fee_share → 写 promotion_fee_share 表
+6) (可选) 每周一 10:00 → LLM Agent 总结"本周该结谁、为什么" → 推 office 群(短摘要,3 行内)
 ```
 
-### 5.4 LLM 介入点(可选,Phase 4)
+### 5.5 LLM 介入点(可选,Phase 4)
 
-- 借款建议输出时,LLM 给一句"为什么这个数"(可读性),默认 1 句
-- 老板问"为什么这个供应商采购预测这么高" → LLM 拉近 30 天趋势 + 节假日 → 自然语言解释
+- 结算建议输出时,LLM 给一句"为什么这个数"(可读性),引用三维度系数来源,默认 ≤ 3 句
+- 老板问"为什么这个供应商结算建议这么高/低" → LLM 拉投资/促销/动销明细 → 自然语言解释
+- 老板问"如果我现在结清 vs 拖 7 天,哪个划算" → LLM 套账期/资金成本对比(走 cash_balance + supplier_payment_cycle)
 
 ### 5.5 现金日报数据源
 
@@ -464,14 +491,24 @@ CREATE TABLE supplier_forecast (
     created_at TIMESTAMPTZ DEFAULT NOW()
 );
 
-CREATE TABLE loan_suggestion (
+CREATE TABLE supplier_payment_suggestion (
     id BIGSERIAL PRIMARY KEY,
-    horizon_days INT NOT NULL,
-    buffer_factor NUMERIC(4,2) NOT NULL,
-    amount NUMERIC(12,2) NOT NULL,
-    basis JSONB NOT NULL,               -- 各项 forecast 明细
+    supplier_name TEXT NOT NULL,        -- 哪个供应商
+    period_days INT NOT NULL,           -- 建议覆盖的结算周期(7/15/30/60)
+    base_forecast NUMERIC(12,2) NOT NULL,  -- 5.2 公式里的 base_forecast_30d
+    investment_weight NUMERIC(4,2) NOT NULL,   -- 供应商费用支持力度系数
+    promo_weight NUMERIC(4,2) NOT NULL,        -- 产品促销力度系数
+    sellthrough_weight NUMERIC(4,2) NOT NULL,  -- 产品动销率系数
+    payment_cycle_days INT NOT NULL,    -- 该供应商账期
+    amount NUMERIC(12,2) NOT NULL,      -- 最终建议结算金额
+    basis JSONB NOT NULL,               -- 各项 forecast / 系数明细 + LLM 解释
+    status TEXT NOT NULL DEFAULT 'pending',  -- pending / acknowledged / settled / cancelled
+    acked_by TEXT,
+    acked_at TIMESTAMPTZ,
     created_at TIMESTAMPTZ DEFAULT NOW()
 );
+CREATE INDEX ON supplier_payment_suggestion(supplier_name, created_at DESC);
+CREATE INDEX ON supplier_payment_suggestion(status) WHERE status = 'pending';
 
 CREATE TABLE cash_balance (
     id BIGSERIAL PRIMARY KEY,
@@ -495,7 +532,7 @@ CREATE TABLE cash_balance (
 | A 企微对话 Agent | ✅ 核心 | LLMAgent + 6 Function Tools + Memory | 必做 |
 | B OCR 多级匹配 | ❌ 不直接用 | 纯规则 | LLM 仅可选"OCR 错误纠正"(远期) |
 | C 智能提醒 | ✅ GraphAgent | 规则节点 + 1 个 LLM 子调用(应季判定) | 必做 |
-| D 对账 + 借款 | ✅ 部分 | Function Tools(4 个)+ 1 个解释 LLM | 可选 |
+| D 对账 + 结算供应商货款 | ✅ 部分 | Function Tools(4 个)+ 1 个解释 LLM | 可选 |
 | 现有 restock | ❌ 不动 | 现有 bigmodel.LlmClient 继续 | 不破坏 |
 | 现有 parser | ❌ 不动 | 现有 bigmodel.LlmClient 继续 | 不破坏 |
 
@@ -513,7 +550,7 @@ CREATE TABLE cash_balance (
 | **W1** | (1) 引入 trpc-agent-go 依赖<br>(2) `internal/agent/` 子包骨架<br>(3) supplier_policy / special_calendar / promotion_fee 三张表 migration<br>(4) 模块 A 的 6 个工具实现 + 单元测试 | go build 通过;每个工具单测覆盖正常+异常路径 |
 | **W2** | (5) PurchaseAgent (LLMAgent) + Runner<br>(6) 接入 wecom OnMessage → runner.Run → 文本回复<br>(7) 真实对话测试:"汇一自采+堆头" / "榄菊不让退" | E2E:用户在群里说一句话,supplier_policy 表新增/更新,Agent 文字确认 |
 | **W3** | (8) matcher.go 加 L3 (条码后缀+名称模糊)<br>(9) 模块 C 规则引擎 + GraphAgent<br>(10) purchase_session_alert 表 + H5 端显示<br>(11) cron:堆头费到期预警 | 50 单历史跑 L1~L5 命中率统计;新单打开有 alert 显示 |
-| **W4** | (12) D 模块 4 个工具 + cron<br>(13) 现金日报手动录入入口<br>(14) OpenTelemetry + Langfuse 接入(可选)<br>(15) 端到端冒烟 | 借款建议出数;堆头费到期推 office 群;现金 < 借款推 owner |
+| **W4** | (12) D 模块 4 个工具 + cron<br>(13) 现金日报手动录入入口<br>(14) OpenTelemetry + Langfuse 接入(可选)<br>(15) 端到端冒烟 | 结算供应商货款建议出数(三维度系数可读);堆头费到期推 office 群;现金 < 应付待结算推 owner |
 
 **W1 风险最高**(trpc-agent-go 首次引入),W2-W4 都是叠加。
 
@@ -539,7 +576,7 @@ CREATE TABLE cash_balance (
 - [ ] 模块 A:用户在企微说"汇一自采+堆头自付",`supplier_policy` 表新增 2 行,Agent 文字确认收到
 - [ ] 模块 B:历史 50 个采购单,跑通 L1-L5,新 SKU 比例 < 5%,L3 命中率有数据
 - [ ] 模块 C:含黑名单供应商的 session 打开,H5 显示红色 alert;P0 alert 推 office 群
-- [ ] 模块 D:cron 跑完,loan_suggestion 表有数,堆头费到期前 7 天有企微推
+- [ ] 模块 D:cron 跑完,`supplier_payment_suggestion` 表有数(三维度系数可读),堆头费到期前 7 天有企微推
 - [ ] 端到端:从企微对话 → 数据库写 → H5 显示 → 推送,全链路 < 5s
 - [ ] RBAC:无权限用户调 Agent 工具,返回 403,LLM 收到错误自我修正
 - [ ] 重启恢复:服务重启后 Runner state / chat bindings / memory 不丢
