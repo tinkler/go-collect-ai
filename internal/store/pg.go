@@ -170,6 +170,65 @@ func Migrate(ctx context.Context, pool *pgxpool.Pool) error {
 		`CREATE INDEX IF NOT EXISTS idx_psalert_session ON purchase_session_alert(session_id)`,
 		`CREATE INDEX IF NOT EXISTS idx_psalert_rule ON purchase_session_alert(rule, severity)`,
 		`CREATE INDEX IF NOT EXISTS idx_psalert_pending ON purchase_session_alert(session_id) WHERE acked_at IS NULL`,
+
+		// ============================================================
+		// 现金日报 + 供应商结算 (W4, 2026-09-01) — agent-purchase-plan.md §5
+		// D 模块数据源: cash_balance (短期手动 / 中期 RPA / 长期 cube)
+		// ============================================================
+		`CREATE TABLE IF NOT EXISTS cash_balance (
+			id              BIGSERIAL PRIMARY KEY,
+			balance_date    DATE NOT NULL UNIQUE,
+			amount          NUMERIC(14,2) NOT NULL,
+			source          TEXT NOT NULL,    -- 'manual' | 'rpa' | 'cube'
+			note            TEXT NOT NULL DEFAULT '',
+			created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_cash_balance_date ON cash_balance(balance_date DESC)`,
+
+		// 供应商结算建议 (W4)
+		`CREATE TABLE IF NOT EXISTS supplier_forecast (
+			id              BIGSERIAL PRIMARY KEY,
+			supplier_name   TEXT NOT NULL,
+			forecast_date   DATE NOT NULL,
+			horizon_days    INT NOT NULL,    -- 7 / 30 / 90
+			amount          NUMERIC(12,2) NOT NULL,
+			basis           TEXT NOT NULL DEFAULT '',
+			created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_supplier_forecast_supplier ON supplier_forecast(supplier_name, created_at DESC)`,
+
+		`CREATE TABLE IF NOT EXISTS supplier_payment_suggestion (
+			id                    BIGSERIAL PRIMARY KEY,
+			supplier_name         TEXT NOT NULL,
+			period_days           INT NOT NULL,
+			base_forecast         NUMERIC(12,2) NOT NULL,
+			investment_weight     NUMERIC(4,2) NOT NULL,
+			promo_weight          NUMERIC(4,2) NOT NULL,
+			sellthrough_weight    NUMERIC(4,2) NOT NULL,
+			payment_cycle_days    INT NOT NULL,
+			amount                NUMERIC(12,2) NOT NULL,
+			basis                 JSONB NOT NULL DEFAULT '{}'::jsonb,
+			status                TEXT NOT NULL DEFAULT 'pending',
+			acked_by              TEXT NOT NULL DEFAULT '',
+			acked_at              TIMESTAMPTZ,
+			created_at            TIMESTAMPTZ NOT NULL DEFAULT NOW()
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_sps_supplier ON supplier_payment_suggestion(supplier_name, created_at DESC)`,
+		`CREATE INDEX IF NOT EXISTS idx_sps_status ON supplier_payment_suggestion(status) WHERE status = 'pending'`,
+
+		`CREATE TABLE IF NOT EXISTS promotion_fee_share (
+			id              BIGSERIAL PRIMARY KEY,
+			supplier_name   TEXT NOT NULL,
+			share_month     DATE NOT NULL,    -- 月初, e.g. 2026-09-01
+			kind            TEXT NOT NULL,    -- 堆头/端架/陈列/DM/条码费
+			amount          NUMERIC(12,2) NOT NULL,
+			period_start    DATE NOT NULL,
+			period_end      DATE NOT NULL,
+			days_in_month   INT NOT NULL,    -- 当月在 period 内的天数 (按月分摊)
+			note            TEXT NOT NULL DEFAULT '',
+			created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_pfs_supplier ON promotion_fee_share(supplier_name, share_month DESC)`,
 	}
 	for _, s := range stmts {
 		if _, err := pool.Exec(ctx, s); err != nil {

@@ -102,6 +102,11 @@ func NewRouter(h *handler.Handler, cfg *config.Config, restockSvc *restock.Servi
 			authed.GET("/templates/all", auth.RequirePerm("session:read"), h.ListAllTemplates)
 			authed.POST("/templates/sync", auth.RequirePerm("admin"), h.SyncTemplates)
 
+			// W4: 现金日报 + 供应商结算建议
+			authed.POST("/cash/balance", auth.RequirePerm("cash:write"), h.SetCashBalance)
+			authed.GET("/cash/balance", auth.RequirePerm("cash:read"), h.GetCashBalance)
+			authed.GET("/payments/pending", auth.RequirePerm("payment:read"), h.ListPendingPayments)
+
 			// parse (受限流保护)
 			authed.POST("/parse", limiter.Middleware(wait), auth.RequirePerm("session:create"), h.Parse)
 			authed.POST("/rematch", limiter.Middleware(wait), auth.RequirePerm("session:update"), h.Rematch)

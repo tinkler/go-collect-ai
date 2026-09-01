@@ -36,8 +36,10 @@ type Handler struct {
 	BusinessReg   *business.Registry // 业务字段映射(products / suppliers 跨数据源)
 	Sessions      *store.SessionRepo
 	Templates     *store.TemplateRepo
-	RestockSvc    *restock.Service       // 2026-08-28: 采购收货单附加 plan_qty
-	AlertSvc      *purchasealert.Service // 2026-09-01 W3.2: 采购订单智能提醒
+	CashRepo      *store.CashBalanceRepo         // W4: 现金日报
+	PayRepo       *store.SupplierPaymentRepo     // W4: 供应商结算建议
+	RestockSvc    *restock.Service               // 2026-08-28: 采购收货单附加 plan_qty
+	AlertSvc      *purchasealert.Service         // 2026-09-01 W3.2: 采购订单智能提醒
 	FuzzyDistance int // rematch 用 (旧接口保留)
 	// 兜底值 (per-template 没配时, 用这几个)
 	DefaultOcrModel  string
@@ -714,6 +716,96 @@ func (h *Handler) GetSession(c *gin.Context) {
 }
 
 // convertAlertsToModel purchasealert.Alert → model.AlertItem (避免 handler 依赖 purchasealert.Alert 类型)
+// W4: 现金日报 endpoint
+func (h *Handler) SetCashBalance(c *gin.Context) {
+	var body struct {
+		Date   string  `json:"date" binding:"required"`
+		Amount float64 `json:"amount" binding:"required"`
+		Source string  `json:"source"`
+		Note   string  `json:"note"`
+	}
+	if err := c.ShouldBindJSON(&body); err != nil {
+		c.JSON(400, gin.H{"error": "bad json: " + err.Error()})
+		return
+	}
+	date, err := time.Parse("2006-01-02", body.Date)
+	if err != nil {
+		c.JSON(400, gin.H{"error": "date 格式错误 YYYY-MM-DD"})
+		return
+	}
+	if body.Source == "" {
+		body.Source = "manual"
+	}
+	if err := h.CashRepo.Upsert(c.Request.Context(), date, body.Amount, body.Source, body.Note, ""); err != nil {
+		c.JSON(500, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(200, gin.H{"date": body.Date, "amount": body.Amount, "source": body.Source, "note": body.Note})
+}
+
+func (h *Handler) GetCashBalance(c *gin.Context) {
+	dateStr := c.Query("date")
+	daysStr := c.DefaultQuery("days", "")
+	if dateStr != "" {
+		date, err := time.Parse("2006-01-02", dateStr)
+		if err != nil {
+			c.JSON(400, gin.H{"error": "date 格式错误"})
+			return
+		}
+		cb, err := h.CashRepo.GetByDate(c.Request.Context(), date)
+		if err != nil {
+			c.JSON(500, gin.H{"error": err.Error()})
+			return
+		}
+		if cb == nil {
+			c.JSON(404, gin.H{"error": "not found"})
+			return
+		}
+		c.JSON(200, cb)
+		return
+	}
+	if daysStr != "" {
+		days := 7
+		_, _ = fmt.Sscanf(daysStr, "%d", &days)
+		out, err := h.CashRepo.GetLatest(c.Request.Context(), days)
+		if err != nil {
+			c.JSON(500, gin.H{"error": err.Error()})
+			return
+		}
+		c.JSON(200, gin.H{"balances": out, "count": len(out)})
+		return
+	}
+	// default: today
+	date := time.Now().UTC().Truncate(24 * time.Hour)
+	cb, err := h.CashRepo.GetByDate(c.Request.Context(), date)
+	if err != nil {
+		c.JSON(500, gin.H{"error": err.Error()})
+		return
+	}
+	if cb == nil {
+		c.JSON(200, gin.H{"date": date.Format("2006-01-02"), "amount": 0, "source": "none", "note": "尚未录入"})
+		return
+	}
+	c.JSON(200, cb)
+}
+
+func (h *Handler) ListPendingPayments(c *gin.Context) {
+	if h.PayRepo == nil {
+		c.JSON(503, gin.H{"error": "payment repo 未配置"})
+		return
+	}
+	limit := 50
+	if v := c.Query("limit"); v != "" {
+		fmt.Sscanf(v, "%d", &limit)
+	}
+	out, err := h.PayRepo.ListPending(c.Request.Context(), limit)
+	if err != nil {
+		c.JSON(500, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(200, gin.H{"suggestions": out, "count": len(out)})
+}
+
 func convertAlertsToModel(in []purchasealert.Alert) []model.AlertItem {
 	if len(in) == 0 {
 		return nil

@@ -122,6 +122,8 @@ func main() {
 	seasonClassifier := buildSeasonClassifier(llmClient)
 	alertSvc := purchasealert.NewServiceWithClassifier(pool, seasonClassifier) // W3.2+W3.5
 	promoAlertSvc := promotionalert.NewService(pool, strings.TrimSpace(os.Getenv("PROMOTION_ALERT_CHAT_ID"))) // W3.3: 堆头费到期预警 (空=禁用)
+	cashRepo := store.NewCashBalanceRepo(pool)        // W4
+	payRepo := store.NewSupplierPaymentRepo(pool)     // W4
 
 	// ============== 鉴权 (2026-08-29) ==============
 	authStore := auth.NewStore(pool)
@@ -148,6 +150,8 @@ func main() {
 		BusinessReg:         businessReg,
 		Sessions:            sessionRepo,
 		Templates:           templateRepo,
+		CashRepo:            cashRepo,    // W4
+		PayRepo:             payRepo,     // W4
 		RestockSvc:          restockSvc, // 2026-08-28: 采购收货单附加 plan_qty
 		AlertSvc:            alertSvc,   // 2026-09-01 W3.2: 采购订单智能提醒
 		FuzzyDistance:       cfg.FuzzyDistance,
