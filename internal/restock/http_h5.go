@@ -124,7 +124,9 @@ func RestockH5TasksList(svc *Service) gin.HandlerFunc {
 		// 3) 转 view
 		views := make([]H5TaskView, 0, len(tasks))
 		// 2026-09-01 权限隔离: 无 inventory:view 时隐藏 current_stock (库存数)
+		//                       无 supplier:view 时隐藏 supplier_name (供应商)
 		invViewable := permInventoryView(c)
+		supplierViewable := permSupplierView(c)
 		for _, t := range tasks {
 			v := H5TaskView{
 				TaskID:       t.TaskID,
@@ -158,6 +160,9 @@ func RestockH5TasksList(svc *Service) gin.HandlerFunc {
 			if !invViewable {
 				v.CurrentStock = 0
 			}
+			if !supplierViewable {
+				v.SupplierName = ""
+			}
 			views = append(views, v)
 		}
 
@@ -177,7 +182,8 @@ func RestockH5TasksList(svc *Service) gin.HandlerFunc {
 			"group":  actualGroup,
 			"full":   full,
 			"meta": gin.H{
-				"inv_viewable": invViewable,
+				"inv_viewable":      invViewable,
+				"supplier_viewable": supplierViewable,
 			},
 		})
 	}
@@ -241,6 +247,8 @@ func RestockTasksList(svc *Service) gin.HandlerFunc {
 
 		// 2026-09-01 权限隔离: 无 inventory:view 时隐藏 inv_snapshot (库存数)
 		//   字段不返回 + meta.inv_viewable=false 通知前端
+		//   2026-09-01 注: supplier 字段 floor 端点 (H5TaskItem) 本来就不返回,
+		//   只 office 端点 (H5TaskView) 需要 perm 检查 — 见 RestockH5TasksList 上方
 		invViewable := permInventoryView(c)
 		if !invViewable {
 			for _, t := range tasks {
@@ -789,6 +797,19 @@ func permInventoryView(c *gin.Context) bool {
 		return false
 	}
 	return auth.HasPerm(role, "inventory:view")
+}
+
+// permSupplierView 检查当前请求用户是否有 supplier:view 权限
+//   2026-09-01: 供应商名是采购敏感数据, 跟库存数一样做字段级隐藏
+//   哪些角色有 supplier:view (查 role_permissions 表):
+//   - owner/manager/buyer: 有
+//   - cashier/floor/office: 没有 (办公室只看汇总, 不需要逐条看供应商)
+func permSupplierView(c *gin.Context) bool {
+	role := roleFromGin(c)
+	if role == "" {
+		return false
+	}
+	return auth.HasPerm(role, "supplier:view")
 }
 
 // roleFromGin 从 gin ctx 拿 role (auth middleware 设的)

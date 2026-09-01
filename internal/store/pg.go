@@ -400,6 +400,7 @@ func Migrate(ctx context.Context, pool *pgxpool.Pool) error {
 			('display:done',     'display',   'done',    '陈列补货 - 点击完成按钮 (新)'),
 			('inventory:view',   'inventory', 'view',    '查看库存'),
 			('inventory:adjust', 'inventory', 'adjust',  '调整库存'),
+			('supplier:view',    'supplier',  'view',    '查看供应商 (采购敏感)'),
 			('report:view',      'report',    'view',    '查看报表'),
 			('user:manage',      'user',      'manage',  '管理员工/授权'),
 			('role:manage',      'role',      'manage',  '管理角色'),
@@ -421,12 +422,14 @@ func Migrate(ctx context.Context, pool *pgxpool.Pool) error {
 			('manager', 'restock:feedback'),
 			('manager', 'display:short'),  ('manager', 'display:done'),
 			('manager', 'inventory:view'), ('manager', 'inventory:adjust'),
+			('manager', 'supplier:view'),
 			('manager', 'report:view'),    ('manager', 'user:manage'),
 			('buyer',   'session:create'), ('buyer',   'session:read'),
 			('buyer',   'session:update'), ('buyer',   'session:delete'),
 			('buyer',   'row:update'),     ('buyer',   'row:delete'),
 			('buyer',   'plan:read'),      ('buyer',   'plan:create'),
 			('buyer',   'plan:approve'),   ('buyer',   'inventory:view'),
+			('buyer',   'supplier:view'),
 			('cashier', 'session:read'),   ('cashier', 'plan:read'),
 			('cashier', 'restock:feedback'),
 			('cashier', 'display:done'),
@@ -436,6 +439,7 @@ func Migrate(ctx context.Context, pool *pgxpool.Pool) error {
 			('office',  'inventory:view'), ('office',  'report:view'),
 			('office',  'restock:feedback'),
 			('office',  'display:short'),  ('office',  'display:done')
+			-- 2026-09-01: office 不给 supplier:view (办公室只看汇总, 不需要逐条看供应商)
 		ON CONFLICT (role_id, perm_id) DO NOTHING`,
 
 		// 现有 dev 账号绑定到内置角色 (1:1)
