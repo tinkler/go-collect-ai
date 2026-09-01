@@ -43,8 +43,6 @@ func Migrate(ctx context.Context, pool *pgxpool.Pool) error {
 			mode            TEXT NOT NULL,
 			image_path      TEXT NOT NULL,
 			image_url       TEXT NOT NULL DEFAULT '',
-			image_paths     JSONB NOT NULL DEFAULT '[]'::jsonb,
-			image_urls      JSONB NOT NULL DEFAULT '[]'::jsonb,
 			source          TEXT NOT NULL,
 			raw_ocr_json    JSONB,
 			raw_llm_json    JSONB,
@@ -54,9 +52,6 @@ func Migrate(ctx context.Context, pool *pgxpool.Pool) error {
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_session_created ON parse_session(created_at DESC)`,
 		`CREATE INDEX IF NOT EXISTS idx_session_supplier ON parse_session(supplier_name)`,
-		// 多图字段兼容老库(2026-08-28 加入, 用于企微 H5 多图采购收货单)
-		`ALTER TABLE parse_session ADD COLUMN IF NOT EXISTS image_paths JSONB NOT NULL DEFAULT '[]'::jsonb`,
-		`ALTER TABLE parse_session ADD COLUMN IF NOT EXISTS image_urls  JSONB NOT NULL DEFAULT '[]'::jsonb`,
 		`CREATE TABLE IF NOT EXISTS parse_row (
 			id              BIGSERIAL PRIMARY KEY,
 			session_id      UUID NOT NULL REFERENCES parse_session(id) ON DELETE CASCADE,
@@ -106,352 +101,56 @@ func Migrate(ctx context.Context, pool *pgxpool.Pool) error {
 		`CREATE INDEX IF NOT EXISTS idx_template_supplier ON template(supplier_name)`,
 		`CREATE INDEX IF NOT EXISTS idx_template_default ON template(is_default)`,
 
-		// ============== restock 模块 5 张表(追加于 2026-08-26) ==============
+		// ============================================================
+		// 智能采购模块 (W1, 2026-09-01) — agent-purchase-plan.md §6
+		// 依赖 trpc-agent-go; 工具/Agent 入口: internal/agent/
+		// ============================================================
 
-		`CREATE TABLE IF NOT EXISTS restock_task (
-			task_id         TEXT PRIMARY KEY,
-			branch_no       TEXT NOT NULL,
-			item_no         TEXT NOT NULL,
-			item_name       TEXT NOT NULL DEFAULT '',
-			supplier_name   TEXT,
-			current_stock   INT NOT NULL DEFAULT 0,
-			safety_stock    INT NOT NULL DEFAULT 0,
-			yesterday_sales INT NOT NULL DEFAULT 0,
-			suggest_qty     INT NOT NULL DEFAULT 0,
-			reason          TEXT,
-			priority        TEXT NOT NULL DEFAULT 'P2',
-			status          TEXT NOT NULL DEFAULT 'open',
-			first_push_at   TIMESTAMPTZ,
-			last_push_at    TIMESTAMPTZ,
-			last_update_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-			closed_at       TIMESTAMPTZ,
-			closed_reason   TEXT,
-			push_count      INT NOT NULL DEFAULT 0
-		)`,
-		`CREATE UNIQUE INDEX IF NOT EXISTS uniq_open_task
-			ON restock_task (branch_no, item_no) WHERE status='open'`,
-		`CREATE INDEX IF NOT EXISTS idx_task_status
-			ON restock_task (status, last_push_at)`,
-
-		`CREATE TABLE IF NOT EXISTS restock_feedback (
-			id            BIGSERIAL PRIMARY KEY,
-			task_id       TEXT NOT NULL,
-			feedback_type TEXT NOT NULL,
-			feedback_user TEXT NOT NULL,
-			feedback_time TIMESTAMPTZ NOT NULL DEFAULT NOW()
-		)`,
-		`CREATE INDEX IF NOT EXISTS idx_feedback_task ON restock_feedback(task_id)`,
-		`CREATE INDEX IF NOT EXISTS idx_feedback_time ON restock_feedback(feedback_time DESC)`,
-
-		`CREATE TABLE IF NOT EXISTS restock_sales_watch (
-			branch_no    TEXT NOT NULL,
-			item_no      TEXT NOT NULL,
-			window_start TIMESTAMPTZ NOT NULL,
-			window_end   TIMESTAMPTZ NOT NULL,
-			sale_qnty    INT NOT NULL DEFAULT 0,
-			PRIMARY KEY (branch_no, item_no, window_start)
-		)`,
-
-		`CREATE TABLE IF NOT EXISTS restock_need_purchase (
+		// 供应商政策 (A 模块) — 一家供应商同一 key 唯一
+		`CREATE TABLE IF NOT EXISTS supplier_policy (
 			id              BIGSERIAL PRIMARY KEY,
-			branch_no       TEXT NOT NULL,
-			item_no         TEXT NOT NULL,
-			item_name       TEXT NOT NULL DEFAULT '',
-			barcode         TEXT,
-			supplier_name   TEXT,
-			suggest_qty     INT NOT NULL DEFAULT 0,
-			trigger_kind    TEXT NOT NULL,
-			trigger_task_id TEXT,
-			status          TEXT NOT NULL DEFAULT 'pending',
+			supplier_name   TEXT NOT NULL,
+			key             TEXT NOT NULL,
+			value           JSONB NOT NULL,
+			source          TEXT NOT NULL,
+			chat_id         TEXT NOT NULL DEFAULT '',
+			message_id      TEXT NOT NULL DEFAULT '',
 			created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 			updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-			exported_at     TIMESTAMPTZ
+			UNIQUE (supplier_name, key)
 		)`,
-		`CREATE UNIQUE INDEX IF NOT EXISTS uniq_pending_need
-			ON restock_need_purchase (branch_no, item_no) WHERE status='pending'`,
-		`CREATE INDEX IF NOT EXISTS idx_need_pending
-			ON restock_need_purchase (branch_no, status, created_at DESC) WHERE status='pending'`,
+		`CREATE INDEX IF NOT EXISTS idx_supplier_policy_supplier ON supplier_policy(supplier_name)`,
+		`CREATE INDEX IF NOT EXISTS idx_supplier_policy_key ON supplier_policy(key)`,
 
-		`CREATE TABLE IF NOT EXISTS supplier_reliability (
-			supplier_name TEXT NOT NULL,
-			item_no       TEXT NOT NULL,
-			requested_qty NUMERIC(12,2) NOT NULL DEFAULT 0,
-			supplied_qty  NUMERIC(12,2) NOT NULL DEFAULT 0,
-			fill_rate     NUMERIC(5,2)  NOT NULL DEFAULT 1.0,
-			avg_lead_days NUMERIC(5,1)  NOT NULL DEFAULT 1.0,
-			last_order_at TIMESTAMPTZ,
-			updated_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-			PRIMARY KEY (supplier_name, item_no)
-		)`,
-
-		// ============== restock 模块新版 (2026-08-30) ==============
-		// 替代旧 restock_task / restock_sales_watch / supplier_reliability 的功能
-		// 旧表保留(加 deprecated_at 列标记软删),代码层不再写,7 天后由清理脚本 DROP
-		// 沿用:restock_need_purchase(trigger_kind 新增 'display_short' 枚举值)
-		// 沿用:restock_feedback(只用于审计)
-
-		`ALTER TABLE restock_task          ADD COLUMN IF NOT EXISTS deprecated_at TIMESTAMPTZ`,
-		`ALTER TABLE restock_sales_watch   ADD COLUMN IF NOT EXISTS deprecated_at TIMESTAMPTZ`,
-		`ALTER TABLE supplier_reliability  ADD COLUMN IF NOT EXISTS deprecated_at TIMESTAMPTZ`,
-
-		// ① 每日陈列补充建议(每店每商品每天 1 行,三次 tick 累加)
-		`CREATE TABLE IF NOT EXISTS restock_display_suggest (
-			branch_no      TEXT NOT NULL,
-			item_no        TEXT NOT NULL,
-			period_date    DATE NOT NULL,
-			suggest_qty    INT  NOT NULL DEFAULT 0,   -- 累加值,员工点完成时置 0
-			inv_snapshot   INT  NOT NULL DEFAULT 0,   -- 最新 tick 时的库存快照(用于解除 short 判定)
-			last_period    TEXT,                      -- 'eve' | 'morn' | 'aft' 上次 tick 哪个时段
-			last_sale_at   TIMESTAMPTZ,               -- 最近一次有销售的 tick 时间
-			last_update_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-			item_name      TEXT,                      -- 2026-09-01: 从 cube 写入,ListH5Tasks/ListShortItems 不再 JOIN need_purchase 拿 name
-			PRIMARY KEY (branch_no, item_no, period_date)
-		)`,
-		`ALTER TABLE restock_display_suggest ADD COLUMN IF NOT EXISTS item_name TEXT`,
-		`CREATE INDEX IF NOT EXISTS idx_dsp_date ON restock_display_suggest(period_date)`,
-		`CREATE INDEX IF NOT EXISTS idx_dsp_sale ON restock_display_suggest(last_sale_at DESC) WHERE suggest_qty > 0`,
-
-		// ② 全局短补状态(每店每商品 1 行,跨天持续;短补中 ONCE 锁定)
-		`CREATE TABLE IF NOT EXISTS restock_short_state (
-			branch_no  TEXT NOT NULL,
-			item_no    TEXT NOT NULL,
-			is_short   BOOLEAN NOT NULL DEFAULT FALSE,
-			short_at   TIMESTAMPTZ,
-			short_user TEXT,                          -- 哪个员工标的(企微 user_id)
-			PRIMARY KEY (branch_no, item_no)
-		)`,
-		`CREATE INDEX IF NOT EXISTS idx_short_flag ON restock_short_state(is_short) WHERE is_short = TRUE`,
-
-		// ③ tick 执行日志(关键!用于错误恢复 + 审计;7 天清理)
-		`CREATE TABLE IF NOT EXISTS restock_tick_log (
-			id          BIGSERIAL PRIMARY KEY,
-			branch_no   TEXT NOT NULL,
-			period      TEXT NOT NULL,                -- 'eve' | 'morn' | 'aft'
-			tick_at     TIMESTAMPTZ NOT NULL,
-			window_from TIMESTAMPTZ NOT NULL,
-			window_to   TIMESTAMPTZ NOT NULL,
-			status      TEXT NOT NULL,                -- 'ok' | 'error'
-			error_msg   TEXT,
-			items_count INT NOT NULL DEFAULT 0,
-			created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
-		)`,
-		`CREATE INDEX IF NOT EXISTS idx_tick_branch_time ON restock_tick_log(branch_no, tick_at DESC)`,
-		`CREATE INDEX IF NOT EXISTS idx_tick_status ON restock_tick_log(status) WHERE status = 'error'`,
-
-		// ============== 鉴权 (2026-08-29) ==============
-		// users / role_permissions / auth_sessions / audit_log
-		`CREATE TABLE IF NOT EXISTS users (
-			id              TEXT PRIMARY KEY,
-			name            TEXT NOT NULL,
-			role            TEXT NOT NULL,
-			tenant_id       TEXT NOT NULL DEFAULT 't_dev',
-			external_id     TEXT,
-			source          TEXT NOT NULL DEFAULT 'wecom',
-			status          TEXT NOT NULL DEFAULT 'active',
-			"group"         TEXT NOT NULL DEFAULT '',   -- 2026-08-30: 'floor' / 'office' / ''
-			created_at      TIMESTAMPTZ DEFAULT now(),
-			updated_at      TIMESTAMPTZ DEFAULT now()
-		)`,
-		`ALTER TABLE users ADD COLUMN IF NOT EXISTS "group" TEXT NOT NULL DEFAULT ''`,
-		`CREATE INDEX IF NOT EXISTS idx_users_role ON users(role)`,
-		`CREATE INDEX IF NOT EXISTS idx_users_tenant ON users(tenant_id)`,
-		`CREATE INDEX IF NOT EXISTS idx_users_group ON users("group")`,
-
-		// ============== RBAC 增强 (2026-08-30) ==============
-		// 部门缓存 + 用户多角色 + 权限点字典 + 审计
-		`CREATE TABLE IF NOT EXISTS wecom_departments (
-			id              BIGINT PRIMARY KEY,
-			parent_id       BIGINT,
-			name            TEXT NOT NULL,
-			path            TEXT NOT NULL DEFAULT '',
-			order_idx       INT DEFAULT 0,
-			synced_at       TIMESTAMPTZ DEFAULT now()
-		)`,
-		`CREATE INDEX IF NOT EXISTS idx_dept_path ON wecom_departments(path)`,
-
-		`CREATE TABLE IF NOT EXISTS roles (
-			id              TEXT PRIMARY KEY,
-			name            TEXT NOT NULL,
-			scope           TEXT NOT NULL DEFAULT 'platform',  -- 'platform' / 'store' / 'dept'
-			description     TEXT DEFAULT '',
-			is_builtin      BOOLEAN NOT NULL DEFAULT false,
-			created_at      TIMESTAMPTZ DEFAULT now()
-		)`,
-
-		`CREATE TABLE IF NOT EXISTS permissions (
-			id              TEXT PRIMARY KEY,        -- 'session:create' / 'restock:feedback' / 'user:manage' ...
-			domain          TEXT NOT NULL,           -- 'session' / 'restock' / 'inventory' / 'user' / 'report'
-			action          TEXT NOT NULL,           -- 'create' / 'read' / 'update' / 'delete' / 'manage' / 'feedback'
-			description     TEXT DEFAULT ''
-		)`,
-
-		`CREATE TABLE IF NOT EXISTS role_permissions (
-			role_id         TEXT NOT NULL REFERENCES roles(id) ON DELETE CASCADE,
-			perm_id         TEXT NOT NULL REFERENCES permissions(id) ON DELETE CASCADE,
-			PRIMARY KEY (role_id, perm_id)
-		)`,
-		`CREATE INDEX IF NOT EXISTS idx_role_perm_perm ON role_permissions(perm_id)`,
-
-		`CREATE TABLE IF NOT EXISTS user_roles (
-			user_id         TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-			role_id         TEXT NOT NULL REFERENCES roles(id) ON DELETE CASCADE,
-			scope_type      TEXT NOT NULL DEFAULT 'all',   -- 'all' / 'store' / 'dept'
-			scope_id        TEXT NOT NULL DEFAULT '',     -- 门店号 '0001' / 部门 path '/5/12/'
-			is_primary      BOOLEAN NOT NULL DEFAULT false,
-			granted_by      TEXT DEFAULT '',
-			granted_at      TIMESTAMPTZ DEFAULT now(),
-			expires_at      TIMESTAMPTZ,                 -- 临时授权到期 (NULL=永久)
-			PRIMARY KEY (user_id, role_id, scope_type, scope_id)
-		)`,
-		`CREATE INDEX IF NOT EXISTS idx_user_roles_role ON user_roles(role_id)`,
-		`CREATE INDEX IF NOT EXISTS idx_user_roles_expires ON user_roles(expires_at) WHERE expires_at IS NOT NULL`,
-
-		`CREATE TABLE IF NOT EXISTS permission_audit (
+		// 特殊日历 (A 模块) — 节假日/促销/季节 决策辅助
+		`CREATE TABLE IF NOT EXISTS special_calendar (
 			id              BIGSERIAL PRIMARY KEY,
-			actor_id        TEXT DEFAULT '',             -- 操作人
-			target_user     TEXT DEFAULT '',             -- 被操作用户
-			action          TEXT NOT NULL,               -- 'grant' / 'revoke' / 'create_role' / 'update_role' / 'delete_role' / 'left' / 'sync'
-			detail          JSONB DEFAULT '{}'::jsonb,
-			reason          TEXT DEFAULT '',
-			ts              TIMESTAMPTZ DEFAULT now()
+			date            DATE NOT NULL,
+			type            TEXT NOT NULL,    -- 'holiday' | 'promo' | 'blackout' | 'season_start' | 'season_end'
+			name            TEXT NOT NULL,
+			lead_days       INT NOT NULL DEFAULT 0,
+			note            TEXT NOT NULL DEFAULT '',
+			source          TEXT NOT NULL,
+			created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+			UNIQUE (date, type, name)
 		)`,
-		`CREATE INDEX IF NOT EXISTS idx_audit_target_ts ON permission_audit(target_user, ts DESC)`,
-		`CREATE INDEX IF NOT EXISTS idx_audit_actor_ts ON permission_audit(actor_id, ts DESC)`,
+		`CREATE INDEX IF NOT EXISTS idx_special_calendar_date ON special_calendar(date)`,
+		`CREATE INDEX IF NOT EXISTS idx_special_calendar_type ON special_calendar(type, date)`,
 
-		// users 表加新字段 (部门/手机/职位/在职)
-		`ALTER TABLE users ADD COLUMN IF NOT EXISTS mobile TEXT NOT NULL DEFAULT ''`,
-		`ALTER TABLE users ADD COLUMN IF NOT EXISTS department_id BIGINT`,
-		`ALTER TABLE users ADD COLUMN IF NOT EXISTS department_path TEXT NOT NULL DEFAULT ''`,
-		`ALTER TABLE users ADD COLUMN IF NOT EXISTS position TEXT NOT NULL DEFAULT ''`,
-		`ALTER TABLE users ADD COLUMN IF NOT EXISTS hired_at TIMESTAMPTZ`,
-		`ALTER TABLE users ADD COLUMN IF NOT EXISTS left_at TIMESTAMPTZ`,
-		`ALTER TABLE users ADD COLUMN IF NOT EXISTS sync_at TIMESTAMPTZ`,
-		`CREATE INDEX IF NOT EXISTS idx_users_dept ON users(department_id)`,
-		`CREATE INDEX IF NOT EXISTS idx_users_left ON users(left_at)`,
-
-		// 注意: role_permissions 表已在上面 (line ~234) 由 rbac 包创建, 列 (role_id, perm_id) + FK
-		//       这里不再重复创建 — 之前 auth 包的 (role, perm) 简版被 IF NOT EXISTS 跳过, 留作历史
-		//       真实 RBAC 数据全部走 rbac 那张表
-
-		`CREATE TABLE IF NOT EXISTS auth_sessions (
-			id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-			user_id         TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-			refresh_hash    TEXT NOT NULL,
-			expires_at      TIMESTAMPTZ NOT NULL,
-			created_at      TIMESTAMPTZ DEFAULT now(),
-			revoked_at      TIMESTAMPTZ
-		)`,
-		`CREATE INDEX IF NOT EXISTS idx_auth_sessions_user ON auth_sessions(user_id) WHERE revoked_at IS NULL`,
-
-		`CREATE TABLE IF NOT EXISTS audit_log (
+		// 促销费用 (A 模块) — 堆头/端架/陈列/DM
+		`CREATE TABLE IF NOT EXISTS promotion_fee (
 			id              BIGSERIAL PRIMARY KEY,
-			user_id         TEXT,
-			method          TEXT,
-			path            TEXT,
-			status          INT,
-			ts              TIMESTAMPTZ DEFAULT now()
+			supplier_name   TEXT NOT NULL,
+			kind            TEXT NOT NULL,    -- '堆头' | '端架' | '陈列' | 'DM' | '条码费'
+			amount          NUMERIC(12,2) NOT NULL,
+			period_start    DATE NOT NULL,
+			period_end      DATE NOT NULL,
+			note            TEXT NOT NULL DEFAULT '',
+			source          TEXT NOT NULL,
+			created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
 		)`,
-		`CREATE INDEX IF NOT EXISTS idx_audit_log_user_ts ON audit_log(user_id, ts DESC)`,
-
-		// ============== 用户最后访问页 (2026-08-31) ==============
-		//   登录后自动跳回上次访问的页; 权限不够时降级到 index.html
-		//   单行覆盖, 无历史, 防止数据膨胀
-		`CREATE TABLE IF NOT EXISTS user_last_page (
-			user_id     TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
-			last_page   TEXT NOT NULL,
-			updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
-		)`,
-		`CREATE INDEX IF NOT EXISTS idx_ulp_updated ON user_last_page(updated_at DESC)`,
-
-		// seed 4 个 dev 账号 (2026-08-30: 加 group 分组: office=管理者,floor=卖场员工)
-		`INSERT INTO users (id, name, role, tenant_id, source, "group") VALUES
-			('u_owner',   '梁老板(店主)', 'owner',   't_dev', 'dev', 'office'),
-			('u_manager', '李店长',       'manager', 't_dev', 'dev', 'office'),
-			('u_buyer',   '王采购',       'buyer',   't_dev', 'dev', 'office'),
-			('u_cashier', '陈收银',       'cashier', 't_dev', 'dev', 'floor')
-		ON CONFLICT (id) DO NOTHING`,
-		// 已有账号补 group 字段 (UPDATE 而不是 INSERT 触发 ON CONFLICT)
-		`UPDATE users SET "group" = 'office' WHERE id IN ('u_owner','u_manager','u_buyer') AND ("group" IS NULL OR "group" = '')`,
-		`UPDATE users SET "group" = 'floor'  WHERE id = 'u_cashier'               AND ("group" IS NULL OR "group" = '')`,
-
-		// ============== RBAC 增强 seed (2026-08-30) ==============
-		// 内置 6 个角色 (旧的 'role' 字段 + 新的 roles 表双轨)
-		`INSERT INTO roles (id, name, scope, description, is_builtin) VALUES
-			('owner',   '店主',     'platform', '平台总管理员, 所有权限',   true),
-			('manager', '店长',     'store',   '门店管理 (单店范围)',      true),
-			('buyer',   '采购',     'platform', '采购员 (跨店)',           true),
-			('cashier', '收银',     'store',   '收银员 (单店, 只读)',     true),
-			('floor',   '卖场员工', 'store',   '卖场员工 (反馈补货)',      true),
-			('office',  '办公室',   'platform', '办公室人员 (看板)',       true)
-		ON CONFLICT (id) DO NOTHING`,
-
-		// 权限点字典 (跟现有 role_permissions 表保持一致)
-		`INSERT INTO permissions (id, domain, action, description) VALUES
-			('*',               '_wildcard', 'all',     '通配 (所有权限)'),
-			('session:create',   'session',   'create',  '创建收货单'),
-			('session:read',     'session',   'read',    '查看收货单'),
-			('session:update',   'session',   'update',  '编辑收货单'),
-			('session:delete',   'session',   'delete',  '删除收货单'),
-			('row:update',       'row',       'update',  '修改明细行'),
-			('row:delete',       'row',       'delete',  '删除明细行'),
-			('plan:read',        'plan',      'read',    '查看补货计划'),
-			('plan:create',      'plan',      'create',  '生成补货计划'),
-			('plan:approve',     'plan',      'approve', '审批补货计划'),
-			('restock:feedback', 'restock',   'feedback','反馈补货 (已补/缺货) [旧]'),
-			('display:short',    'display',   'short',   '陈列补货 - 点击缺货按钮 (新)'),
-			('display:done',     'display',   'done',    '陈列补货 - 点击完成按钮 (新)'),
-			('inventory:view',   'inventory', 'view',    '查看库存'),
-			('inventory:adjust', 'inventory', 'adjust',  '调整库存'),
-			('supplier:view',    'supplier',  'view',    '查看供应商 (采购敏感)'),
-			('report:view',      'report',    'view',    '查看报表'),
-			('user:manage',      'user',      'manage',  '管理员工/授权'),
-			('role:manage',      'role',      'manage',  '管理角色'),
-			('admin',            'admin',     'manage',  '系统管理 (同步/审计)')
-		ON CONFLICT (id) DO NOTHING`,
-
-		// 内置角色-权限映射 (新表)
-		//   2026-08-30: 加 display:short / display:done (陈列补货新版)
-		//     - floor:  营业员 → 全 2 个新 perm
-		//     - office: 办公室 → 全 2 个新 perm (后续可拆 read-only)
-		//     - cashier:收银 → 只 display:done (不能误标缺货, 收银台只需确认已补)
-		`INSERT INTO role_permissions (role_id, perm_id) VALUES
-			('owner',   '*'),
-			('owner',   'admin'),
-			('manager', 'session:create'), ('manager', 'session:read'),
-			('manager', 'session:update'), ('manager', 'session:delete'),
-			('manager', 'row:update'),     ('manager', 'row:delete'),
-			('manager', 'plan:read'),      ('manager', 'plan:create'),
-			('manager', 'restock:feedback'),
-			('manager', 'display:short'),  ('manager', 'display:done'),
-			('manager', 'inventory:view'), ('manager', 'inventory:adjust'),
-			('manager', 'supplier:view'),
-			('manager', 'report:view'),    ('manager', 'user:manage'),
-			('buyer',   'session:create'), ('buyer',   'session:read'),
-			('buyer',   'session:update'), ('buyer',   'session:delete'),
-			('buyer',   'row:update'),     ('buyer',   'row:delete'),
-			('buyer',   'plan:read'),      ('buyer',   'plan:create'),
-			('buyer',   'plan:approve'),   ('buyer',   'inventory:view'),
-			('buyer',   'supplier:view'),
-			('cashier', 'session:read'),   ('cashier', 'plan:read'),
-			('cashier', 'restock:feedback'),
-			('cashier', 'display:done'),
-			('floor',   'plan:read'),      ('floor',   'restock:feedback'),
-			('floor',   'display:short'),  ('floor',   'display:done'),
-			('office',  'plan:read'),      ('office',  'plan:create'),
-			('office',  'inventory:view'), ('office',  'report:view'),
-			('office',  'restock:feedback'),
-			('office',  'display:short'),  ('office',  'display:done')
-			-- 2026-09-01: office 不给 supplier:view (办公室只看汇总, 不需要逐条看供应商)
-		ON CONFLICT (role_id, perm_id) DO NOTHING`,
-
-		// 现有 dev 账号绑定到内置角色 (1:1)
-		`INSERT INTO user_roles (user_id, role_id, scope_type, scope_id, is_primary) VALUES
-			('u_owner',   'owner',   'platform', '', true),
-			('u_manager', 'manager', 'store',   '0001', true),
-			('u_buyer',   'buyer',   'platform', '', true),
-			('u_cashier', 'cashier', 'store',   '0001', true),
-			('u_cashier', 'floor',   'store',   '0001', false)
-		ON CONFLICT DO NOTHING`,
+		`CREATE INDEX IF NOT EXISTS idx_promotion_fee_supplier ON promotion_fee(supplier_name, period_end DESC)`,
+		`CREATE INDEX IF NOT EXISTS idx_promotion_fee_period ON promotion_fee(period_start, period_end)`,
 	}
 	for _, s := range stmts {
 		if _, err := pool.Exec(ctx, s); err != nil {
