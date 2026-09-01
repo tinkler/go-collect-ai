@@ -15,11 +15,12 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
+	"github.com/tinkler/collect-ai/internal/agent"
 	"github.com/tinkler/collect-ai/internal/auth"
 	"github.com/tinkler/collect-ai/internal/business"
 	"github.com/tinkler/collect-ai/internal/model"
 	"github.com/tinkler/collect-ai/internal/parser"
-	"github.com/tinkler/collect-ai/internal/parser/agent"
+	parseragent "github.com/tinkler/collect-ai/internal/parser/agent"
 	"github.com/tinkler/collect-ai/internal/parser/matcher"
 	"github.com/tinkler/collect-ai/internal/purchasealert"
 	"github.com/tinkler/collect-ai/internal/restock"
@@ -32,7 +33,7 @@ type Handler struct {
 	PublicBase    string
 	MaxUpload     int64 // bytes
 	Parser        *parser.Parser
-	Agent         *agent.Client
+	Agent         *parseragent.Client
 	BusinessReg   *business.Registry // 业务字段映射(products / suppliers 跨数据源)
 	Sessions      *store.SessionRepo
 	Templates     *store.TemplateRepo
@@ -40,6 +41,7 @@ type Handler struct {
 	PayRepo       *store.SupplierPaymentRepo     // W4: 供应商结算建议
 	RestockSvc    *restock.Service               // 2026-08-28: 采购收货单附加 plan_qty
 	AlertSvc      *purchasealert.Service         // 2026-09-01 W3.2: 采购订单智能提醒
+	AgentRunner   *agent.Runner                  // W2.5: H5 触发 Agent
 	FuzzyDistance int // rematch 用 (旧接口保留)
 	// 兜底值 (per-template 没配时, 用这几个)
 	DefaultOcrModel  string
@@ -787,6 +789,102 @@ func (h *Handler) GetCashBalance(c *gin.Context) {
 		return
 	}
 	c.JSON(200, cb)
+}
+
+// W2.5: H5 端触发 Agent 跑一轮 (复用 Runner.Run)
+//   Body: { "user_id": "u1", "session_id": "s1", "message": "汇一是自采" }
+//   Response: { "reply": "...", "tool_calls": [...] }
+//   LLM 不可用时返降级提示 (200 OK, 不报错)
+func (h *Handler) AgentChat(c *gin.Context) {
+	if h.AgentRunner == nil {
+		c.JSON(503, gin.H{"error": "agent runner 未配置"})
+		return
+	}
+	var body struct {
+		UserID    string `json:"user_id"`
+		SessionID string `json:"session_id"`
+		Message   string `json:"message" binding:"required"`
+	}
+	if err := c.ShouldBindJSON(&body); err != nil {
+		c.JSON(400, gin.H{"error": "bad json: " + err.Error()})
+		return
+	}
+	if strings.TrimSpace(body.Message) == "" {
+		c.JSON(400, gin.H{"error": "message 必填"})
+		return
+	}
+	if strings.TrimSpace(body.UserID) == "" {
+		body.UserID = "u_" + c.ClientIP()
+	}
+	if strings.TrimSpace(body.SessionID) == "" {
+		body.SessionID = "sess_" + body.UserID + "_" + time.Now().Format("20060102150405")
+	}
+
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 90*time.Second)
+	defer cancel()
+
+	if !h.AgentRunner.Enabled() {
+		c.JSON(200, gin.H{
+			"reply":      "智能助理暂未配置 (需 COLLECTAI_LLM_API_KEY),无法回复。",
+			"tool_calls": []string{},
+			"enabled":    false,
+		})
+		return
+	}
+
+	events, err := h.AgentRunner.Run(ctx, body.UserID, body.SessionID, body.Message)
+	if err != nil {
+		log.Printf("[handler.AgentChat] runner.Run err: %v", err)
+		c.JSON(200, gin.H{
+			"reply":   "我没听懂,换个说法试试",
+			"enabled": true,
+			"error":   err.Error(),
+		})
+		return
+	}
+
+	var reply strings.Builder
+	toolCalls := []string{}
+	chunks := 0
+	for ev := range events {
+		if ev == nil || ev.Raw == nil {
+			continue
+		}
+		// 抽文本 chunk
+		if ev.Raw.Response != nil {
+			for _, ch := range ev.Raw.Response.Choices {
+				if ch.Delta.Content != "" {
+					reply.WriteString(ch.Delta.Content)
+					chunks++
+				} else if ch.Message.Content != "" {
+					reply.WriteString(ch.Message.Content)
+					chunks++
+				}
+			}
+		}
+		// 抽 tool calls
+		if ev.Raw.Response != nil {
+			for _, ch := range ev.Raw.Response.Choices {
+				if len(ch.Message.ToolCalls) > 0 {
+					for _, tc := range ch.Message.ToolCalls {
+						if tc.Function.Name != "" {
+							toolCalls = append(toolCalls, tc.Function.Name)
+						}
+					}
+				}
+			}
+		}
+	}
+	msg := strings.TrimSpace(reply.String())
+	if msg == "" {
+		msg = "我没听懂,换个说法试试"
+	}
+	c.JSON(200, gin.H{
+		"reply":      msg,
+		"tool_calls": toolCalls,
+		"chunks":     chunks,
+		"enabled":    true,
+	})
 }
 
 func (h *Handler) ListPendingPayments(c *gin.Context) {

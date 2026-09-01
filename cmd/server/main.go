@@ -127,6 +127,13 @@ func main() {
 	cashRepo := store.NewCashBalanceRepo(pool)        // W4
 	payRepo := store.NewSupplierPaymentRepo(pool)     // W4
 
+	// W2.5 + W4.3: Agent Runner (W2 wecom 桥 + W2.5 HTTP 触发共用)
+	//   agentEnabled 跟 W2 wecom 桥保持一致 (用同一个 env)
+	//   agentRunner 可能为 nil (LLM 不可用时 tools-only 模式), handler.AgentChat 走降级
+	var agentRunner *agent.Runner
+	agentEnabled := !strings.EqualFold(strings.TrimSpace(os.Getenv("COLLECTAI_AGENT_ENABLED")), "false")
+	agentChatIDs := splitIDs(os.Getenv("COLLECTAI_AGENT_CHAT_IDS"))
+
 	// ============== 鉴权 (2026-08-29) ==============
 	authStore := auth.NewStore(pool)
 	// 启动时加载 role_permissions 到内存 (RBAC 热路径用)
@@ -156,6 +163,7 @@ func main() {
 		PayRepo:             payRepo,     // W4
 		RestockSvc:          restockSvc, // 2026-08-28: 采购收货单附加 plan_qty
 		AlertSvc:            alertSvc,   // 2026-09-01 W3.2: 采购订单智能提醒
+		AgentRunner:         agentRunner, // W2.5: H5 端 Agent chat
 		FuzzyDistance:       cfg.FuzzyDistance,
 		DefaultOcrModel:     cfg.OCRModel,
 		DefaultLlmModel:     cfg.LLMModel,
@@ -173,11 +181,11 @@ func main() {
 	//   显式白名单 chat_ids 才接管(避免误接管 restock 群)
 	//   env: COLLECTAI_AGENT_CHAT_IDS=chat_id1,chat_id2 (逗号或空格分隔)
 	//        COLLECTAI_AGENT_ENABLED=true|false (默认 true, 需时显式关)
-	agentEnabled := !strings.EqualFold(strings.TrimSpace(os.Getenv("COLLECTAI_AGENT_ENABLED")), "false")
-	agentChatIDs := splitIDs(os.Getenv("COLLECTAI_AGENT_CHAT_IDS"))
+	// (agentEnabled / agentChatIDs / agentRunner 已在 W2.5 块定义, 这里直接用)
 	if agentEnabled && len(agentChatIDs) > 0 {
 		agentCfg := agent.LoadConfigFromEnv(os.Getenv)
-		agentRunner, err := agent.NewRunner(context.Background(), agentCfg, pool)
+		var err error
+		agentRunner, err = agent.NewRunner(context.Background(), agentCfg, pool)
 		if err != nil {
 			log.Printf("[main] agent.NewRunner 失败: %v (Bridge 不启动)", err)
 		} else {

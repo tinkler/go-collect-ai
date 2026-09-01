@@ -107,6 +107,9 @@ func NewRouter(h *handler.Handler, cfg *config.Config, restockSvc *restock.Servi
 			authed.GET("/cash/balance", auth.RequirePerm("cash:read"), h.GetCashBalance)
 			authed.GET("/payments/pending", auth.RequirePerm("payment:read"), h.ListPendingPayments)
 
+			// W2.5: H5 端触发 Agent 跑一轮
+			authed.POST("/agent/chat", auth.RequirePerm("agent:write"), h.AgentChat)
+
 			// parse (受限流保护)
 			authed.POST("/parse", limiter.Middleware(wait), auth.RequirePerm("session:create"), h.Parse)
 			authed.POST("/rematch", limiter.Middleware(wait), auth.RequirePerm("session:update"), h.Rematch)
