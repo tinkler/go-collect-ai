@@ -43,10 +43,10 @@ type H5TaskView struct {
 	BranchNo       string     `json:"branch_no"`
 	ItemNo         string     `json:"item_no"`
 	ItemName       string     `json:"item_name"`
-	Barcode        string     `json:"barcode,omitempty"`        // 暂未挂载 (siss cube 无此 dim)
 	ItemClsname    string     `json:"item_clsname,omitempty"`   // 来自 cube (分类)
 	ItemClsno      string     `json:"item_clsno,omitempty"`     // 来自 cube
 	ItemBrand      string     `json:"item_brand,omitempty"`     // 来自 cube
+	Unit           string     `json:"unit,omitempty"`           // 2026-09-01: items cube unit_no 注入
 	SupplierName   string     `json:"supplier_name,omitempty"`  // office
 	CurrentStock   int        `json:"current_stock"`
 	SafetyStock    int        `json:"safety_stock,omitempty"`    // office
@@ -143,6 +143,8 @@ func RestockH5TasksList(svc *Service) gin.HandlerFunc {
 				v.ItemClsname = cls.ClsName
 				v.ItemBrand = cls.Brand
 			}
+			// 2026-09-01: 注入 unit (内存字典, 启动时从 items cube 加载)
+			v.Unit = svc.UnitOf(t.ItemNo)
 			if full {
 				v.SupplierName = t.SupplierName
 				v.SafetyStock = t.SafetyStock
@@ -225,6 +227,16 @@ func RestockTasksList(svc *Service) gin.HandlerFunc {
 			log.Printf("[restock.tasks] ListH5Tasks: %v", err)
 			c.JSON(500, gin.H{"error": err.Error()})
 			return
+		}
+
+		// 2026-09-01: 注入 clsno/clsname/unit (从内存字典查)
+		//   之前 floor 视图不显示分类,因为 ListH5Tasks 只查 display_suggest + need_purchase
+		//   没 clsno 列;现在每次响应从启动时加载的字典查
+		for _, t := range tasks {
+			clsno := svc.ItemClsNoOf(t.ItemNo)
+			t.ItemClsno = clsno
+			t.ItemClsname = svc.ClsNameOf(clsno)
+			t.Unit = svc.UnitOf(t.ItemNo)
 		}
 
 		// 2026-09-01 权限隔离: 无 inventory:view 时隐藏 inv_snapshot (库存数)

@@ -39,6 +39,10 @@ type Service struct {
 	itemClsMap   map[string]string
 	itemClsMapMu sync.RWMutex
 
+	// 2026-09-01: item_no -> unit_no 字典 (启动时从 items cube 加载, 给 H5 task API 注入 unit)
+	itemUnitMap   map[string]string
+	itemUnitMapMu sync.RWMutex
+
 	stopCh   chan struct{}
 	stopOnce sync.Once
 	wg       sync.WaitGroup
@@ -52,13 +56,14 @@ func NewService(
 	wecom *WeCom,
 ) *Service {
 	return &Service{
-		Cfg:         cfg,
-		Store:       NewStore(pool),
-		Cube:        cube,
-		LLM:         llm,
-		WeCom:       wecom,
-		clsDict:     map[string]string{},
-		itemClsMap:  map[string]string{},
+		Cfg:             cfg,
+		Store:           NewStore(pool),
+		Cube:            cube,
+		LLM:             llm,
+		WeCom:           wecom,
+		clsDict:         map[string]string{},
+		itemClsMap:      map[string]string{},
+		itemUnitMap:     map[string]string{},
 	}
 }
 
@@ -144,6 +149,48 @@ func (s *Service) ItemClsNoOf(itemNo string) string {
 	return s.itemClsMap[itemNo]
 }
 
+// LoadItemUnitMap 启动时一次性加载 item_no → unit_no 映射
+//   来源: items cube (~26485 行, 同 LoadItemClsMap 一次拉完)
+//   启动时调一次, 之后 H5 task 查 0 cube 调用
+func (s *Service) LoadItemUnitMap(ctx context.Context) error {
+	if s.Cube == nil || s.Cube.agent == nil {
+		return nil
+	}
+	rows, err := s.Cube.agent.Execute("items",
+		[]string{"items.count"},
+		[]string{"items.item_no", "items.unit_no"},
+		nil, nil, 30000)
+	if err != nil {
+		return err
+	}
+	m := make(map[string]string, len(rows))
+	for _, r := range rows {
+		ino := asString(r, "items.item_no")
+		uno := asString(r, "items.unit_no")
+		if ino == "" || uno == "" {
+			continue
+		}
+		if _, exists := m[ino]; !exists {
+			m[ino] = uno
+		}
+	}
+	s.itemUnitMapMu.Lock()
+	s.itemUnitMap = m
+	s.itemUnitMapMu.Unlock()
+	log.Printf("[restock] ItemUnitMap loaded: %d entries", len(m))
+	return nil
+}
+
+// UnitOf 给一个 item_no 查 unit_no (带锁)
+func (s *Service) UnitOf(itemNo string) string {
+	if itemNo == "" {
+		return ""
+	}
+	s.itemUnitMapMu.RLock()
+	defer s.itemUnitMapMu.RUnlock()
+	return s.itemUnitMap[itemNo]
+}
+
 // Start 启动 3 个陈列补货调度 goroutine(自实现,避免依赖 robfig/cron)
 //   - eve  (07:00): DisplayRestockTick(period=eve),窗口 昨日 20:30 ~ 今 07:00
 //   - morn (12:00): DisplayRestockTick(period=morn),窗口 今 07:00 ~ 12:00
@@ -159,6 +206,9 @@ func (s *Service) Start() error {
 	}
 	if err := s.LoadItemClsMap(initCtx); err != nil {
 		log.Printf("[restock] LoadItemClsMap init failed: %v (item_clsno 会空, 不阻断)", err)
+	}
+	if err := s.LoadItemUnitMap(initCtx); err != nil {
+		log.Printf("[restock] LoadItemUnitMap init failed: %v (unit 会空, 不阻断)", err)
 	}
 	initCancel()
 	s.wg.Add(1)
@@ -211,6 +261,9 @@ func (s *Service) loopClsDictRefresh() {
 			}
 			if err := s.LoadItemClsMap(ctx); err != nil {
 				log.Printf("[restock] LoadItemClsMap refresh: %v", err)
+			}
+			if err := s.LoadItemUnitMap(ctx); err != nil {
+				log.Printf("[restock] LoadItemUnitMap refresh: %v", err)
 			}
 			cancel()
 		}

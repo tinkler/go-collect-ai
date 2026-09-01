@@ -255,6 +255,7 @@ type TickLog struct {
 // H5TaskItem H5 任务列表返回结构(2026-08-30 新版)
 //   合并 display_suggest + short_state + need_purchase 三个数据源
 //   前端根据 IsShort 决定按钮显示(只显 DONE / 或 SHORT+DONE)
+//   2026-09-01: 加 clsno/clsname/unit (http_h5.go RestockTasksList 注入, 用 ItemClsNoOf/UnitOf 内存字典)
 type H5TaskItem struct {
 	ItemNo       string `json:"item_no"`
 	ItemName     string `json:"item_name"`
@@ -269,4 +270,8 @@ type H5TaskItem struct {
 	LastPeriod   string  `json:"last_period"`
 	PeriodDate   string  `json:"period_date"`
 	LastUpdateAt string  `json:"last_update_at"`
+	// 2026-09-01 新增 (RestockTasksList 注入, 让 floor 视图也能分类)
+	ItemClsno    string `json:"item_clsno,omitempty"`
+	ItemClsname  string `json:"item_clsname,omitempty"`
+	Unit         string `json:"unit,omitempty"`
 }
