@@ -118,7 +118,9 @@ func main() {
 	restockLLM := restock.NewLlmPlanner(llmClient, cfg.RestockLLMModel, cfg.RestockLLMPlanEnabled, cfg.RestockLLMPlanCacheHrs)
 	restockWeCom := restock.NewWeCom(restockCfg)
 	restockSvc := restock.NewService(restockCfg, pool, restockCube, restockLLM, restockWeCom)
-	alertSvc := purchasealert.NewService(pool)            // W3.2: 采购订单智能提醒
+	// W3.5: 季节判定分类器 (关键词快速 + LLM 慢路径 + 6h 缓存)
+	seasonClassifier := buildSeasonClassifier(llmClient)
+	alertSvc := purchasealert.NewServiceWithClassifier(pool, seasonClassifier) // W3.2+W3.5
 	promoAlertSvc := promotionalert.NewService(pool, strings.TrimSpace(os.Getenv("PROMOTION_ALERT_CHAT_ID"))) // W3.3: 堆头费到期预警 (空=禁用)
 
 	// ============== 鉴权 (2026-08-29) ==============
@@ -305,4 +307,20 @@ func splitIDs(s string) []string {
 		out = append(out, v)
 	}
 	return out
+}
+
+// buildSeasonClassifier W3.5 季节判定分类器链
+//   关键词 (W3.2 OffseasonRule 已有表) → LLM (GLM-4-flash) → 6h 缓存
+//   LLM 不可用 / 没 key → 返回 nil, Service 跳过 LLMSeasonRule,等同 W3.2
+func buildSeasonClassifier(llmClient *bigmodel.LlmClient) purchasealert.SeasonClassifier {
+	keyword := purchasealert.NewKeywordSeasonClassifier(nil)
+	if llmClient == nil {
+		log.Printf("[main] Season classifier: keyword-only (LLM client nil)")
+		return keyword
+	}
+	llm := purchasealert.NewBigModelSeasonClassifier(llmClient, "glm-4-flash", nil)
+	cached := purchasealert.NewCachingSeasonClassifier(llm, 6*60*60*1e9, 1000, nil) // 6h
+	chained := purchasealert.NewChainedSeasonClassifier(keyword, cached)
+	log.Printf("[main] Season classifier: keyword + LLM (cached 6h/1000)")
+	return chained
 }

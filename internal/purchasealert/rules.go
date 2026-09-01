@@ -292,3 +292,43 @@ var DefaultRules = []Rule{
 	OffseasonRule{},
 	HolidayLeadRule{},
 }
+
+// ============================================================
+// 规则 5: LLMSeasonRule (W3.5 新增)
+//   用 SeasonClassifier 语义判定 SKU 是否反季
+//   优先于 OffseasonRule (关键词), 用于 W3.5+ LLM 介入场景
+//   classifier == nil → 跳过本规则(兼容 W3.2 部署)
+// ============================================================
+
+type LLMSeasonRule struct {
+	Classifier SeasonClassifier
+}
+
+func (LLMSeasonRule) Name() string { return "llm_offseason" }
+
+func (r LLMSeasonRule) Apply(_ context.Context, sess *model.Session, row *model.SkuRow, _ RuleContext) []Alert {
+	if r.Classifier == nil {
+		return nil
+	}
+	if row == nil {
+		return nil
+	}
+	name := row.MatchedName
+	if name == "" {
+		name = row.RawName
+	}
+	if name == "" {
+		return nil
+	}
+	season := r.Classifier.Classify(context.Background(), name) // 简单 ctx (W3.5 暂不传 ctx 上下文)
+	if season == SeasonOffSeason {
+		return []Alert{{
+			SessID:   sess.ID,
+			RowID:    row.RowID,
+			Rule:     "llm_offseason",
+			Severity: SeverityInfo,
+			Message:  fmt.Sprintf("LLM 判定 [%s] 当前反季(类目性反季,非简单关键词),请确认是否真要补货", name),
+		}}
+	}
+	return nil
+}

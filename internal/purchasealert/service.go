@@ -19,11 +19,28 @@ type Service struct {
 	now   func() time.Time // 注入便于单测
 }
 
-// NewService 默认 4 规则
+// NewService 默认 4 规则 (W3.2)
+//   W3.5: 传 nil classifier 跟老版完全兼容
 func NewService(pool *pgxpool.Pool) *Service {
 	return &Service{
 		pool:  pool,
 		rules: DefaultRules,
+		now:   time.Now,
+	}
+}
+
+// NewServiceWithClassifier W3.5+ 启用 LLMSeasonRule
+//   classifier=nil → 等同 NewService (不启用 LLM 规则)
+//   顺序: 默认 4 规则 + LLMSeasonRule (LLM 补充关键词, 不互斥)
+func NewServiceWithClassifier(pool *pgxpool.Pool, classifier SeasonClassifier) *Service {
+	rules := make([]Rule, 0, len(DefaultRules)+1)
+	rules = append(rules, DefaultRules...)
+	if classifier != nil {
+		rules = append(rules, LLMSeasonRule{Classifier: classifier})
+	}
+	return &Service{
+		pool:  pool,
+		rules: rules,
 		now:   time.Now,
 	}
 }
