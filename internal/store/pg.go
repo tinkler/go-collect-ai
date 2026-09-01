@@ -204,8 +204,10 @@ func Migrate(ctx context.Context, pool *pgxpool.Pool) error {
 			last_period    TEXT,                      -- 'eve' | 'morn' | 'aft' 上次 tick 哪个时段
 			last_sale_at   TIMESTAMPTZ,               -- 最近一次有销售的 tick 时间
 			last_update_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+			item_name      TEXT,                      -- 2026-09-01: 从 cube 写入,ListH5Tasks/ListShortItems 不再 JOIN need_purchase 拿 name
 			PRIMARY KEY (branch_no, item_no, period_date)
 		)`,
+		`ALTER TABLE restock_display_suggest ADD COLUMN IF NOT EXISTS item_name TEXT`,
 		`CREATE INDEX IF NOT EXISTS idx_dsp_date ON restock_display_suggest(period_date)`,
 		`CREATE INDEX IF NOT EXISTS idx_dsp_sale ON restock_display_suggest(last_sale_at DESC) WHERE suggest_qty > 0`,
 

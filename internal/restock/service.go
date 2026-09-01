@@ -365,6 +365,7 @@ func (s *Service) DisplayRestockTick(ctx context.Context, period string) error {
 		if err := s.Store.UpsertDisplaySuggest(ctx, &DisplaySuggest{
 			BranchNo:    branch,
 			ItemNo:      itemNo,
+			ItemName:    ws.ItemName, // 2026-09-01: 缓存到 restock_display_suggest,ListH5Tasks 直接读
 			PeriodDate:  now,
 			InvSnapshot: ws.InvSnapshot,
 			LastPeriod:  period,

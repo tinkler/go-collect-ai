@@ -308,20 +308,22 @@ func (s *Store) GetSupplierReliability(ctx context.Context, supplier, itemNo str
 //   invSnapshot: 当前 hbpos 库存(覆盖式,总是最新)
 //   period: 'eve' / 'morn' / 'aft'
 //   ON CONFLICT (branch,item,period_date) DO UPDATE SET suggest_qty = suggest_qty + EXCLUDED.suggest_qty
+//   2026-09-01: 同时写 item_name(从 cube WindowSaleRow 拿, ListH5Tasks/ListShortItems 不再 JOIN need_purchase 拿 name)
 func (s *Store) UpsertDisplaySuggest(ctx context.Context, d *DisplaySuggest, saleQty int) error {
 	now := time.Now()
 	dateStr := d.PeriodDate.Format("2006-01-02")
 	_, err := s.pool.Exec(ctx, `
 		INSERT INTO restock_display_suggest
-			(branch_no, item_no, period_date, suggest_qty, inv_snapshot, last_period, last_sale_at, last_update_at)
-		VALUES ($1, $2, $3::date, $4, $5, $6, $7, $7)
+			(branch_no, item_no, period_date, suggest_qty, inv_snapshot, last_period, last_sale_at, last_update_at, item_name)
+		VALUES ($1, $2, $3::date, $4, $5, $6, $7, $7, $8)
 		ON CONFLICT (branch_no, item_no, period_date) DO UPDATE SET
 			suggest_qty  = restock_display_suggest.suggest_qty + EXCLUDED.suggest_qty,
 			inv_snapshot = EXCLUDED.inv_snapshot,
 			last_period  = EXCLUDED.last_period,
 			last_sale_at = EXCLUDED.last_sale_at,
-			last_update_at = EXCLUDED.last_update_at
-	`, d.BranchNo, d.ItemNo, dateStr, saleQty, d.InvSnapshot, d.LastPeriod, now)
+			last_update_at = EXCLUDED.last_update_at,
+			item_name    = COALESCE(EXCLUDED.item_name, restock_display_suggest.item_name)
+	`, d.BranchNo, d.ItemNo, dateStr, saleQty, d.InvSnapshot, d.LastPeriod, now, d.ItemName)
 	return err
 }
 
@@ -329,13 +331,13 @@ func (s *Store) UpsertDisplaySuggest(ctx context.Context, d *DisplaySuggest, sal
 func (s *Store) GetDisplaySuggest(ctx context.Context, branchNo, itemNo string, date time.Time) (*DisplaySuggest, error) {
 	row := s.pool.QueryRow(ctx, `
 		SELECT branch_no, item_no, period_date, suggest_qty, inv_snapshot,
-			COALESCE(last_period,''), last_sale_at, last_update_at
+			COALESCE(last_period,''), last_sale_at, last_update_at, COALESCE(item_name,'')
 		FROM restock_display_suggest
 		WHERE branch_no=$1 AND item_no=$2 AND period_date=$3::date
 	`, branchNo, itemNo, date.Format("2006-01-02"))
 	d := &DisplaySuggest{}
 	err := row.Scan(&d.BranchNo, &d.ItemNo, &d.PeriodDate, &d.SuggestQty, &d.InvSnapshot,
-		&d.LastPeriod, &d.LastSaleAt, &d.LastUpdateAt)
+		&d.LastPeriod, &d.LastSaleAt, &d.LastUpdateAt, &d.ItemName)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, nil
 	}
@@ -346,7 +348,7 @@ func (s *Store) GetDisplaySuggest(ctx context.Context, branchNo, itemNo string, 
 func (s *Store) ListDisplaySuggestToday(ctx context.Context, branchNo string, date time.Time) ([]*DisplaySuggest, error) {
 	rows, err := s.pool.Query(ctx, `
 		SELECT branch_no, item_no, period_date, suggest_qty, inv_snapshot,
-			COALESCE(last_period,''), last_sale_at, last_update_at
+			COALESCE(last_period,''), last_sale_at, last_update_at, COALESCE(item_name,'')
 		FROM restock_display_suggest
 		WHERE branch_no=$1 AND period_date=$2::date
 		ORDER BY suggest_qty DESC, item_no
@@ -394,6 +396,9 @@ func (s *Store) GetShortState(ctx context.Context, branchNo, itemNo string) (*Sh
 
 // ListShortItems 拉某门店所有短补中的 item
 //   JOIN display_suggest 拿 item_name / suggest_qty
+//   2026-09-01: item_name 改从 display_suggest 拿(之前 d.item_name 列不存在 → 全空,
+//   因为短补中的 item 不一定在当天有销售(可能没 display_suggest 行), 这个 SQL 本来就会丢 item_name,
+//   见 ListH5Tasks 注释理解整体修复方向)
 func (s *Store) ListShortItems(ctx context.Context, branchNo string, date time.Time) ([]*H5TaskItem, error) {
 	rows, err := s.pool.Query(ctx, `
 		SELECT s.item_no,
@@ -530,13 +535,14 @@ func (s *Store) ListRecentTickErrors(ctx context.Context, branchNo string, since
 
 // ListH5Tasks H5 任务列表:合并 display_suggest + short_state + need_purchase
 //   返回 suggest_qty>0 或 is_short=true 的 item(给员工看的"待办"清单)
+//   2026-09-01: item_name 直接从 restock_display_suggest 拿(写入时从 cube WindowSaleRow 缓存)
+//   之前从 LEFT JOIN need_purchase 拿 name 是错的 — need_purchase 只有用户点了缺货后才有数据,
+//   大部分 task 行 item_name 都是空字符串
 func (s *Store) ListH5Tasks(ctx context.Context, branchNo string, date time.Time) ([]*H5TaskItem, error) {
-	// 2026-08-30 修: restock_display_suggest 没有 item_name 列, 从 LEFT JOIN 的 need_purchase 拿
-	//   后续: 接入 items 主表 / siss_sales_demo cube 提供 fallback
 	rows, err := s.pool.Query(ctx, `
 		SELECT
 			d.item_no,
-			COALESCE(MAX(np.item_name), ''),
+			COALESCE(MAX(d.item_name), ''),
 			COALESCE(MAX(d.suggest_qty), 0),
 			COALESCE(MAX(d.inv_snapshot), 0),
 			COALESCE(MAX(d.last_period), ''),
