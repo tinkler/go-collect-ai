@@ -124,6 +124,11 @@ func main() {
 	alertSvc := purchasealert.NewServiceWithClassifier(pool, seasonClassifier) // W3.2+W3.5
 	promoAlertSvc := promotionalert.NewService(pool, strings.TrimSpace(os.Getenv("PROMOTION_ALERT_CHAT_ID"))) // W3.3: 堆头费到期预警 (空=禁用)
 	supplierPaySvc := supplierpayment.NewService(pool, strings.TrimSpace(os.Getenv("OWNER_CHAT_ID")))          // W4.3: 供应商结算 cron
+	// W5: cube 数据源注入 (默认 Noop, 设 COLLECTAI_CUBE_QUERIER=real 接真实 cube)
+	if cq := buildCubeQuerier(agentClient); cq != nil {
+		supplierPaySvc.SetCubeQuerier(cq)
+		log.Printf("[main] W5 cube 接入: 模式=%s", cubeMode())
+	}
 	cashRepo := store.NewCashBalanceRepo(pool)        // W4
 	payRepo := store.NewSupplierPaymentRepo(pool)     // W4
 
@@ -333,6 +338,34 @@ func splitIDs(s string) []string {
 		out = append(out, v)
 	}
 	return out
+}
+
+// buildCubeQuerier W5 cube 数据源
+//   env COLLECTAI_CUBE_QUERIER:
+//     "" / "noop" (默认) → NoopCubeQuerier (返回固定占位值, devMode 友好)
+//     "real"            → RealCubeQuerier 包装 agentClient
+//   真实接入需在 cube-agent-server 端有 siss_saleflow / v_prom_saleflow cube 定义
+//   字段名见 internal/supplierpayment/cube.go RealCubeQuerier 默认值
+func buildCubeQuerier(agentClient *parseragent.Client) supplierpayment.CubeQuerier {
+	mode := strings.ToLower(strings.TrimSpace(os.Getenv("COLLECTAI_CUBE_QUERIER")))
+	switch mode {
+	case "real":
+		if agentClient == nil {
+			log.Printf("[main] W5 cube: 模式 real 但 agentClient nil, 降级 Noop")
+			return supplierpayment.NewNoopCubeQuerier()
+		}
+		return supplierpayment.NewRealCubeQuerier(agentClient)
+	default:
+		return supplierpayment.NewNoopCubeQuerier()
+	}
+}
+
+func cubeMode() string {
+	m := strings.ToLower(strings.TrimSpace(os.Getenv("COLLECTAI_CUBE_QUERIER")))
+	if m == "" {
+		return "noop"
+	}
+	return m
 }
 
 // buildSeasonClassifier W3.5 季节判定分类器链

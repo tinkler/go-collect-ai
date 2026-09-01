@@ -33,6 +33,7 @@ type Service struct {
 	pay   *store.SupplierPaymentRepo
 	fore  *store.SupplierForecastRepo
 	share *store.PromotionFeeShareRepo
+	cube  CubeQuerier // W5 cube 数据源 (默认 Noop)
 
 	// OwnerChatID 现金不足时推的群
 	OwnerChatID string
@@ -40,7 +41,7 @@ type Service struct {
 	now func() time.Time
 }
 
-// NewService 构造
+// NewService 构造 (默认 cube=Noop, devMode 友好)
 func NewService(pool *pgxpool.Pool, ownerChatID string) *Service {
 	return &Service{
 		pool:        pool,
@@ -48,6 +49,7 @@ func NewService(pool *pgxpool.Pool, ownerChatID string) *Service {
 		pay:         store.NewSupplierPaymentRepo(pool),
 		fore:        store.NewSupplierForecastRepo(pool),
 		share:       store.NewPromotionFeeShareRepo(pool),
+		cube:        NewNoopCubeQuerier(),
 		OwnerChatID: ownerChatID,
 		now:         time.Now,
 	}
@@ -227,8 +229,7 @@ func (s *Service) computePaymentSuggestion(ctx context.Context, supplier string,
 			invWeight = 1.5
 		}
 	}
-	promoWeight := 1.0
-	sellthroughWeight := 1.0
+	promoWeight, sellthroughWeight := s.cubeWeightsFromCube(ctx, supplier)
 	amount := baseForecast * invWeight * promoWeight * sellthroughWeight
 
 	basis := map[string]any{
