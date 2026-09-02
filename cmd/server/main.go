@@ -25,6 +25,7 @@ import (
 	"github.com/tinkler/collect-ai/internal/rbac"
 	"github.com/tinkler/collect-ai/internal/supplierpayment"
 	"github.com/tinkler/collect-ai/internal/restock"
+	"github.com/tinkler/collect-ai/internal/wecom"
 	"github.com/tinkler/collect-ai/internal/wxsign"
 	"github.com/tinkler/collect-ai/internal/store"
 	"github.com/gin-gonic/gin"
@@ -91,7 +92,13 @@ func main() {
 		WeComBindFile: cfg.WeComBindFile,
 	}
 	restockCube := restock.NewCubeQuerier(agentClient, restockCfg)
-	restockWeCom := restock.NewWeCom(restockCfg)
+	// 2026-09-02: 企微长连接从 restock 抽到 internal/wecom/ 通用包
+	wecomClient := wecom.New(wecom.Config{
+		BotID:     cfg.WeComBotID,
+		BotSecret: cfg.WeComBotSecret,
+		WSURL:     cfg.WeComWSURL,
+		BindFile:  cfg.WeComBindFile,
+	})
 	restockSvc := restock.NewService(restockCfg, pool, restockCube)
 	// W3.5: 季节判定分类器 (关键词快速 + LLM 慢路径 + 6h 缓存)
 	seasonClassifier := buildSeasonClassifier(llmClient)
@@ -151,9 +158,9 @@ func main() {
 	}
 
 	// 注册企微消息回调 (新版 restock 不推群, 只做消息接收)
-	restockWeCom.OnMessage = func(chatID, userID, text string) {
+	wecomClient.OnMessage(func(chatID, userID, text string) {
 		log.Printf("[wecom] msg from chat=%s user=%s: %s", chatID, userID, text)
-	}
+	})
 
 	// ============== 智能采购 Agent 桥接 (W2, 2026-09-01) ==============
 	//   显式白名单 chat_ids 才接管(避免误接管 restock 群)
@@ -167,15 +174,15 @@ func main() {
 		if err != nil {
 			log.Printf("[main] agent.NewRunner 失败: %v (Bridge 不启动)", err)
 		} else {
-			bridge := agent.NewBridge(agent.DefaultBridgeConfig(), agentRunner, agent.NewWecomSender(restockWeCom))
+			bridge := agent.NewBridge(agent.DefaultBridgeConfig(), agentRunner, agent.NewWecomSender(wecomClient))
 			// 白名单 set 覆盖默认
 			bridge = agent.NewBridge(agent.BridgeConfig{
 				ChatIDs:       agentChatIDs,
 				MaxReplyChars: 200,
 				PerMinuteRate: 25,
 				RunTimeout:    60 * time.Second,
-			}, agentRunner, agent.NewWecomSender(restockWeCom))
-			restockWeCom.OnAgentMessage = bridge.Handle
+			}, agentRunner, agent.NewWecomSender(wecomClient))
+			wecomClient.OnAgentMessage(bridge.Handle)
 			log.Printf("[main] Agent Bridge ready: chats=%d llm=%v model=%s", len(agentChatIDs), agentRunner.Enabled(), agentCfg.ModelName)
 		}
 	} else {
@@ -188,7 +195,7 @@ func main() {
 	if strings.TrimSpace(os.Getenv("PROMOTION_ALERT_CHAT_ID")) != "" {
 		// 启动时立即跑一次 (捕获已到期的)
 		go func() {
-			_ = promoAlertSvc.RunAndPush(promoAlertCtx, agent.NewWecomSender(restockWeCom))
+			_ = promoAlertSvc.RunAndPush(promoAlertCtx, agent.NewWecomSender(wecomClient))
 		}()
 		// 每日 21:00 跑
 		go func() {
@@ -207,14 +214,14 @@ func main() {
 			case <-promoAlertCtx.Done():
 				return
 			case <-first.C:
-				_ = promoAlertSvc.RunAndPush(promoAlertCtx, agent.NewWecomSender(restockWeCom))
+				_ = promoAlertSvc.RunAndPush(promoAlertCtx, agent.NewWecomSender(wecomClient))
 			}
 			for {
 				select {
 				case <-promoAlertCtx.Done():
 					return
 				case <-ticker.C:
-					_ = promoAlertSvc.RunAndPush(promoAlertCtx, agent.NewWecomSender(restockWeCom))
+					_ = promoAlertSvc.RunAndPush(promoAlertCtx, agent.NewWecomSender(wecomClient))
 				}
 			}
 		}()
@@ -227,7 +234,7 @@ func main() {
 	supplierPayCtx, supplierPayCancel := context.WithCancel(context.Background())
 	defer supplierPayCancel()
 	if strings.TrimSpace(os.Getenv("OWNER_CHAT_ID")) != "" {
-		go runSupplierPayCron(supplierPayCtx, supplierPaySvc, restockWeCom, agent.NewWecomSender(restockWeCom))
+		go runSupplierPayCron(supplierPayCtx, supplierPaySvc, wecomClient, agent.NewWecomSender(wecomClient))
 		log.Printf("[main] W4.3 供应商结算 cron 启动 (owner=%s)", os.Getenv("OWNER_CHAT_ID"))
 	} else {
 		log.Printf("[main] OWNER_CHAT_ID 未配置, 供应商结算 cron 禁用 (但 weekly/monthly 仍会写库, 只不发群)")
@@ -254,7 +261,7 @@ func main() {
 
 	// 企微长连接(独立开关: 任何时候都能起,用于测试/绑定 chat)
 	if cfg.WeComBotID != "" {
-		if err := restockWeCom.Start(context.Background()); err != nil {
+		if err := wecomClient.Start(context.Background()); err != nil {
 			log.Printf("[main] wecom ws start failed: %v", err)
 		} else {
 			log.Printf("[main] wecom ws connecting... (bot_id=%s)", cfg.WeComBotID)
@@ -262,7 +269,7 @@ func main() {
 	} else {
 		log.Printf("[main] WECOM_BOT_ID 未配置,企微长连接不启动")
 	}
-	defer restockWeCom.Stop()
+	defer wecomClient.Stop()
 
 	rbacStore := rbac.NewStore(pool)
 
@@ -297,7 +304,7 @@ func main() {
 	if err := srv.Shutdown(shutdownCtx); err != nil {
 		log.Printf("shutdown: %v", err)
 	}
-	// restockSvc.Stop() / restockWeCom.Stop() 通过 line 134/146 的 defer 自动调用
+	// restockSvc.Stop() / wecomClient.Stop() 通过 line 134/146 的 defer 自动调用
 }
 
 // splitIDs 按逗号/空格/分号/换行分隔 ID 列表,trim + 去重
@@ -370,7 +377,7 @@ func buildSeasonClassifier(llmClient *bigmodel.LlmClient) purchasealert.SeasonCl
 //   每周一 09:00 跑 weekly
 //   每月 1 号 02:00 跑 monthly share
 //   每日 22:00 跑 cash check
-func runSupplierPayCron(ctx context.Context, svc *supplierpayment.Service, _ *restock.WeCom, sender agent.Sender) {
+func runSupplierPayCron(ctx context.Context, svc *supplierpayment.Service, _ *wecom.Client, sender agent.Sender) {
 	// 启动立即跑
 	if _, err := svc.RunDailyForecast(ctx); err != nil {
 		log.Printf("[supplierpay.DailyForecast] err: %v", err)
