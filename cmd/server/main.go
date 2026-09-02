@@ -71,7 +71,26 @@ func main() {
 	initialDS := cfg.DataSource
 	log.Printf("[main] datasource: %s (from env/cfg, 启动后即固定)", initialDS)
 	agentClient := parseragent.NewClient(cfg.AgentURL, cfg.AgentToken, 30, initialDS)
-	businessReg := business.NewDefaultRegistry()
+	// 2026-09-02: 业务字段映射优先从 yaml 加载,失败 fallback 到 NewDefaultRegistry 硬编码
+	//   MAPPING_FILE 留空 = 用 hardcode (向后兼容)
+	//   推荐: MAPPING_FILE=configs/mappings.yaml
+	var businessReg *business.Registry
+	if cfg.MappingFile != "" {
+		reg, err := business.NewRegistryFromYAML(cfg.MappingFile)
+		if err != nil {
+			log.Printf("[main] WARN: load mappings yaml %s failed: %v (fallback to NewDefaultRegistry)", cfg.MappingFile, err)
+			businessReg = business.NewDefaultRegistry()
+		} else {
+			businessReg = reg
+			log.Printf("[main] mappings loaded from yaml: %s (entities=%v)", cfg.MappingFile, businessReg.List())
+		}
+	} else {
+		businessReg = business.NewDefaultRegistry()
+		log.Printf("[main] mappings: NewDefaultRegistry (hardcode). Set MAPPING_FILE=configs/mappings.yaml to use yaml config.")
+	}
+	// 2026-09-02: 所有 cube 调用统一走 Gateway,业务代码不直接 import parser/agent
+	//   Gateway 持 CubeClient interface,*agent.Client 自动满足
+	gateway := business.NewGateway(agentClient, businessReg)
 
 	psr := parser.New(ocrClient, llmClient, agentClient)
 
@@ -91,7 +110,7 @@ func main() {
 		WeComWSURL:  cfg.WeComWSURL,
 		WeComBindFile: cfg.WeComBindFile,
 	}
-	restockCube := restock.NewCubeQuerier(agentClient, restockCfg)
+	restockCube := restock.NewCubeQuerier(gateway, restockCfg)
 	// 2026-09-02: 企微长连接从 restock 抽到 internal/wecom/ 通用包
 	wecomClient := wecom.New(wecom.Config{
 		BotID:     cfg.WeComBotID,
@@ -106,7 +125,8 @@ func main() {
 	promoAlertSvc := promotionalert.NewService(pool, strings.TrimSpace(os.Getenv("PROMOTION_ALERT_CHAT_ID"))) // W3.3: 堆头费到期预警 (空=禁用)
 	supplierPaySvc := supplierpayment.NewService(pool, strings.TrimSpace(os.Getenv("OWNER_CHAT_ID")))          // W4.3: 供应商结算 cron
 	// W5: cube 数据源注入 (默认 Noop, 设 COLLECTAI_CUBE_QUERIER=real 接真实 cube)
-	if cq := buildCubeQuerier(agentClient); cq != nil {
+	//   2026-09-02: 传 gateway.Client() (CubeClient interface),统一 client
+	if cq := buildCubeQuerier(gateway.Client()); cq != nil {
 		supplierPaySvc.SetCubeQuerier(cq)
 		log.Printf("[main] W5 cube 接入: 模式=%s", cubeMode())
 	}
@@ -170,7 +190,7 @@ func main() {
 	if agentEnabled && len(agentChatIDs) > 0 {
 		agentCfg := agent.LoadConfigFromEnv(os.Getenv)
 		var err error
-		agentRunner, err = agent.NewRunner(context.Background(), agentCfg, pool)
+		agentRunner, err = agent.NewRunner(context.Background(), agentCfg, pool, gateway)
 		if err != nil {
 			log.Printf("[main] agent.NewRunner 失败: %v (Bridge 不启动)", err)
 		} else {
@@ -330,18 +350,20 @@ func splitIDs(s string) []string {
 // buildCubeQuerier W5 cube 数据源
 //   env COLLECTAI_CUBE_QUERIER:
 //     "" / "noop" (默认) → NoopCubeQuerier (返回固定占位值, devMode 友好)
-//     "real"            → RealCubeQuerier 包装 agentClient
+//     "real"            → RealCubeQuerier 包装 business.CubeClient (Gateway 内部用同一个 client)
 //   真实接入需在 cube-agent-server 端有 siss_saleflow / v_prom_saleflow cube 定义
 //   字段名见 internal/supplierpayment/cube.go RealCubeQuerier 默认值
-func buildCubeQuerier(agentClient *parseragent.Client) supplierpayment.CubeQuerier {
+//
+// 2026-09-02 重构: agentClient → gateway.Client() (统一 CubeClient interface)
+func buildCubeQuerier(client business.CubeClient) supplierpayment.CubeQuerier {
 	mode := strings.ToLower(strings.TrimSpace(os.Getenv("COLLECTAI_CUBE_QUERIER")))
 	switch mode {
 	case "real":
-		if agentClient == nil {
-			log.Printf("[main] W5 cube: 模式 real 但 agentClient nil, 降级 Noop")
+		if client == nil {
+			log.Printf("[main] W5 cube: 模式 real 但 client nil, 降级 Noop")
 			return supplierpayment.NewNoopCubeQuerier()
 		}
-		return supplierpayment.NewRealCubeQuerier(agentClient)
+		return supplierpayment.NewRealCubeQuerier(client)
 	default:
 		return supplierpayment.NewNoopCubeQuerier()
 	}

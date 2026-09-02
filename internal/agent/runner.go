@@ -26,6 +26,7 @@ import (
 	"trpc.group/trpc-go/trpc-agent-go/tool"
 
 	"github.com/tinkler/collect-ai/internal/agent/tools"
+	"github.com/tinkler/collect-ai/internal/business"
 )
 
 // Config Agent 配置 (env 兜底 + main.go 注入)
@@ -87,18 +88,21 @@ const defaultInstruction = `你是商超采购助理 AI,服务于店老板。
 
 // Runner Agent Runner 封装
 type Runner struct {
-	cfg    Config
-	pool   *pgxpool.Pool
-	tools  []tool.Tool
+	cfg         Config
+	pool        *pgxpool.Pool
+	gateway     *business.Gateway // 2026-09-02: 预留 Gateway 注入,W2+ cube 工具用
+	tools       []tool.Tool
 	toolsByName map[string]tool.Tool
-	llmAgent agent.Agent
-	runner  runner.Runner
+	llmAgent    agent.Agent
+	runner      runner.Runner
 }
 
 // NewRunner 构造 Runner
 //   当 cfg.Enabled=true 且 cfg.APIKey 非空 → 注册 LLM Agent
 //   否则降级: tools 仍可用,但 LLM 调用会返回 ErrLLMNotConfigured
-func NewRunner(ctx context.Context, cfg Config, pool *pgxpool.Pool) (*Runner, error) {
+//   gateway: 2026-09-02 预留,当前 6 个 tool 都是写 PG 表,不用 cube
+//            W2+ 加 cube 工具 (e.g. QueryProductsTool) 时直接用 r.gateway.Query()
+func NewRunner(ctx context.Context, cfg Config, pool *pgxpool.Pool, gateway *business.Gateway) (*Runner, error) {
 	if pool == nil {
 		return nil, fmt.Errorf("agent: pg pool 必填")
 	}
@@ -117,9 +121,10 @@ func NewRunner(ctx context.Context, cfg Config, pool *pgxpool.Pool) (*Runner, er
 	}
 
 	r := &Runner{
-		cfg:    cfg,
-		pool:   pool,
-		tools:  allTools,
+		cfg:         cfg,
+		pool:        pool,
+		gateway:     gateway,
+		tools:       allTools,
 		toolsByName: toolsByName,
 	}
 

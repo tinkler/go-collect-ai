@@ -13,6 +13,19 @@ import (
 	"github.com/tinkler/collect-ai/internal/model"
 )
 
+// asAnyString 业务字段值 → string (适配 map[string]any 业务响应)
+//   2026-09-02 加,LoadItemDict 走 Gateway 业务字段名后,row 是 map[key]any
+//   不是 cube 物理响应 (map[physicalRef]any)
+func asAnyString(v any) string {
+	if v == nil {
+		return ""
+	}
+	if s, ok := v.(string); ok {
+		return s
+	}
+	return fmt.Sprintf("%v", v)
+}
+
 // Service restock 模块主服务 (2026-09-02 重构)
 //
 // 精简后只保留:
@@ -466,30 +479,32 @@ func (s *Service) AttachPlanQtyToRows(ctx context.Context, supplier string, rows
 
 // ============== ClsDict (item 分类字典, 启动时加载) ==============
 
-// LoadItemDict 启动时从 items cube 加载 3 个字典
-//   item_no → clsno        (H5 任务列表注入 clsno)
-//   clsno  → clsname       (H5 任务列表注入 clsname)
-//   item_no → unit_no      (H5 任务列表注入 unit)
-//   items cube 字段: item_no / item_clsno / item_clsname / unit_no
+// LoadItemDict 启动时从 products entity 加载 3 个字典
+//   2026-09-02 重构: 改走 business.Gateway.Query (业务字段名 → products 实体 → cube)
+//   原 hardcode "items" cube + 物理字段名,现改:
+//     item_no  → products.barcode (hbpos)  或  products.barcode (erp,共字段)
+//     clsno    → products.clsno
+//     clsname  → products.clsname
+//     unit     → products.unit
+//   业务字段名由 Registry 翻译,跨数据源一致
 func (s *Service) LoadItemDict(ctx context.Context) error {
-	if s.Cube == nil {
+	if s.Cube == nil || s.Cube.Gateway == nil {
 		return nil
 	}
-	rows, err := s.Cube.Agent.Execute("items",
-		[]string{"items.item_no", "items.item_clsno", "items.item_clsname", "items.unit_no"},
-		[]string{"items.item_no", "items.item_clsno", "items.item_clsname", "items.unit_no"},
-		nil, nil, 30000)
+	ds := s.Cube.Gateway.Client().GetDataSource()
+	bizFields := []string{"barcode", "clsno", "clsname", "unit"}
+	rows, err := s.Cube.Gateway.Query("products", ds, bizFields, nil, 30000)
 	if err != nil {
-		log.Printf("[restock] LoadItemDict: cube query err: %v (前端 clsno/clsname/unit 走空)", err)
+		log.Printf("[restock] LoadItemDict: gateway query err: %v (前端 clsno/clsname/unit 走空)", err)
 		return err
 	}
 	s.itemLock.Lock()
 	defer s.itemLock.Unlock()
 	for _, r := range rows {
-		itemNo := asString(r, "items.item_no")
-		clsno := asString(r, "items.item_clsno")
-		clsname := asString(r, "items.item_clsname")
-		unit := asString(r, "items.unit_no")
+		itemNo := asAnyString(r["barcode"])
+		clsno := asAnyString(r["clsno"])
+		clsname := asAnyString(r["clsname"])
+		unit := asAnyString(r["unit"])
 		if itemNo != "" {
 			s.clsNoDict[itemNo] = clsno
 			if unit != "" {

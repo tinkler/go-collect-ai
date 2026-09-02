@@ -33,8 +33,9 @@ type Handler struct {
 	PublicBase    string
 	MaxUpload     int64 // bytes
 	Parser        *parser.Parser
-	Agent         *parseragent.Client
-	BusinessReg   *business.Registry // 业务字段映射(products / suppliers 跨数据源)
+	Agent         *parseragent.Client  // 仅用于 Ping / GetDataSource (2026-09-02: cube 调用已收编到 BizExecutor)
+	BizExecutor   *business.Executor   // 2026-09-02: cube 业务字段调用入口
+	BusinessReg   *business.Registry   // 业务字段映射(products / suppliers 跨数据源)
 	Sessions      *store.SessionRepo
 	Templates     *store.TemplateRepo
 	CashRepo      *store.CashBalanceRepo         // W4: 现金日报
@@ -102,72 +103,25 @@ func (h *Handler) ListSuppliers(c *gin.Context) {
 		c.JSON(503, gin.H{"error": "agent 不可达: " + err.Error()})
 		return
 	}
+	if h.BizExecutor == nil {
+		c.JSON(500, gin.H{"error": "business executor not configured"})
+		return
+	}
 	limit, _ := strconv.Atoi(c.Query("limit"))
 	if limit == 0 {
 		limit = 20000
 	}
-	// 数据源启动后即固定(2026-08-31),不再接受 ?datasource= 覆盖
-	ds := h.Agent.GetDataSource()
-	if h.BusinessReg == nil {
-		c.JSON(500, gin.H{"error": "business registry not configured"})
-		return
-	}
-	ent, ok := h.BusinessReg.Get("suppliers")
-	if !ok {
-		c.JSON(500, gin.H{"error": "suppliers entity not found"})
-		return
-	}
-	src, ok := ent.Sources[ds]
-	if !ok {
-		c.JSON(400, gin.H{"error": "suppliers entity has no mapping for datasource " + ds})
-		return
-	}
-	if src.Cube == "" {
-		c.JSON(400, gin.H{"error": "suppliers " + ds + " has no cube"})
-		return
-	}
-	supplierNameRef := src.FieldRefs["supplier_name"]
-	if supplierNameRef == "" {
-		c.JSON(400, gin.H{"error": "supplier_name field not mapped for " + ds})
-		return
-	}
-	measures := []string{}
-	if ds == "erp" {
-		if r, ok := src.FieldRefs["stock_qty"]; ok && r != "" {
-			measures = []string{r}
-		}
-	} else {
-		measures = []string{"suppliers.count"}
-	}
-
-	rows, err := h.Agent.Execute(src.Cube, measures, []string{supplierNameRef}, nil, []string{"sup_only"}, limit)
+	// 2026-09-02: 重复 Executor.DistinctSuppliers 收编
+	out, err := h.BizExecutor.DistinctSuppliers(limit)
 	if err != nil {
-		c.JSON(500, gin.H{"error": "agent query: " + err.Error()})
+		c.JSON(500, gin.H{"error": "list suppliers: " + err.Error()})
 		return
-	}
-	bizRows, err := h.BusinessReg.ToBusinessResponse("suppliers", ds, rows, []string{"supplier_name"})
-	if err != nil {
-		c.JSON(500, gin.H{"error": "translate response: " + err.Error()})
-		return
-	}
-	set := make(map[string]struct{})
-	for _, br := range bizRows {
-		if s, ok := br["supplier_name"].(string); ok {
-			s = strings.TrimSpace(s)
-			if s != "" {
-				set[s] = struct{}{}
-			}
-		}
-	}
-	out := make([]string, 0, len(set))
-	for k := range set {
-		out = append(out, k)
 	}
 	sortStrings(out)
 	c.JSON(200, gin.H{
 		"suppliers":  out,
 		"count":      len(out),
-		"datasource": ds,
+		"datasource": h.Agent.GetDataSource(),
 	})
 }
 
@@ -200,8 +154,8 @@ func (h *Handler) ListSuppliersByBrand(c *gin.Context) {
 		c.JSON(503, gin.H{"error": "agent 不可达: " + err.Error()})
 		return
 	}
-	if h.BusinessReg == nil {
-		c.JSON(500, gin.H{"error": "business registry not configured"})
+	if h.BizExecutor == nil {
+		c.JSON(500, gin.H{"error": "business executor not configured"})
 		return
 	}
 	// 数据源启动后即固定(2026-08-31),不再接受 ?datasource= 覆盖
@@ -211,78 +165,25 @@ func (h *Handler) ListSuppliersByBrand(c *gin.Context) {
 		limit = 50000
 	}
 
-	ent, ok := h.BusinessReg.Get("products")
-	if !ok {
-		c.JSON(500, gin.H{"error": "products entity not found"})
-		return
-	}
-	src, ok := ent.Sources[ds]
-	if !ok {
-		c.JSON(400, gin.H{"error": "products has no mapping for datasource " + ds})
-		return
-	}
-	if src.Cube == "" {
-		c.JSON(400, gin.H{"error": "products " + ds + " has no cube"})
-		return
-	}
-
-	productNameRef := src.FieldRefs["product_name"]
-	supplierNameRef := src.FieldRefs["supplier_name"]
-	if supplierNameRef == "" {
-		c.JSON(400, gin.H{"error": "supplier_name not mapped for " + ds})
-		return
-	}
-	if productNameRef == "" {
-		c.JSON(400, gin.H{"error": "product_name not mapped for " + ds})
-		return
-	}
-
-	// 业务字段 → 物理 measures/dimensions
-	//   dimensions 用 product_name + supplier_name (按 product 粒度取, 再 distinct supplier)
-	measures := []string{}
-	dimensions := []string{}
-	for _, bf := range []string{"product_name", "supplier_name"} {
-		ref, ok := src.FieldRefs[bf]
-		if !ok || ref == "" {
-			continue
-		}
-		if ent.Fields[bf].Type == business.FieldTypeMeasure {
-			measures = append(measures, ref)
-		} else {
-			dimensions = append(dimensions, ref)
-		}
-	}
-	if len(dimensions) == 0 {
-		c.JSON(400, gin.H{"error": "no dimensions resolved for brand query (datasource " + ds + ")"})
-		return
-	}
-
-	// 按 product_name contains XXX 过滤
-	//   注意: agent 数据里 brand 字段经常是空的,所以"按品牌反查"实际语义是
-	//         "商品名包含这个关键词的产品归属于哪些供应商"
-	//   t_bd_item_info cube SQL 已加 supcust_flag='1' 过滤,排除客户
-	filters := []map[string]any{
-		{"member": productNameRef, "operator": "contains", "values": []string{brand}},
-	}
-
-	rows, err := h.Agent.Execute(src.Cube, measures, dimensions, filters, []string{"sup_only"}, limit)
+	// 2026-09-02: 翻译部分收编到 Executor.SearchProductsByBrand
+	rows, err := h.BizExecutor.SearchProductsByBrand(brand, limit)
 	if err != nil {
 		c.JSON(500, gin.H{"error": "agent query: " + err.Error()})
 		return
 	}
 
-	// 内存聚合: supplier -> distinct products -> count
+	// 内存聚合: supplier -> distinct products -> count (handler 业务层,不动)
 	type supplierAgg struct {
 		Products map[string]struct{}
 		Count    int
 	}
 	agg := make(map[string]*supplierAgg)
 	for _, r := range rows {
-		supplier := asAnyString(r[supplierNameRef])
+		supplier := asAnyString(r["supplier_name"])
 		if supplier == "" {
 			continue
 		}
-		product := asAnyString(r[productNameRef])
+		product := asAnyString(r["product_name"])
 		a, ok := agg[supplier]
 		if !ok {
 			a = &supplierAgg{Products: make(map[string]struct{})}
@@ -1073,41 +974,14 @@ func (s *stringBuilder) String() string { return string(s.buf) }
 //   前端/parser 给业务字段名(supplier_name, barcode, ...)
 //   内部翻译为物理字段,调 agent,响应再翻回业务字段名
 //   返回 []model.SkuRecord 业务字段模型(供 SkuMatcher 用)
+//
+// 2026-09-02 重构: 翻译/调用/翻回全部收编到 Executor.SearchProducts
+//   handler 只剩"业务字段 map → model.SkuRecord"和"按 keyword 去重"2 步
 func (h *Handler) loadSupplierSkusBiz(supplierKeyword string, limit int) ([]model.SkuRecord, error) {
-	if h.BusinessReg == nil {
-		return nil, fmt.Errorf("business registry not configured")
+	if h.BizExecutor == nil {
+		return nil, fmt.Errorf("business executor not configured")
 	}
-	ds := h.Agent.GetDataSource()
-	ent, ok := h.BusinessReg.Get("products")
-	if !ok {
-		return nil, fmt.Errorf("products entity not found")
-	}
-	src, ok := ent.Sources[ds]
-	if !ok {
-		return nil, fmt.Errorf("products entity has no mapping for datasource %s", ds)
-	}
-	// 业务字段清单(只取该 ds 支持的)
-	bizFields := []string{"barcode", "product_name", "supplier_id", "supplier_name", "category", "brand", "stock_qty"}
-	// 物理字段清单
-	measures := []string{}
-	dimensions := []string{}
-	for _, bf := range bizFields {
-		ref, ok := src.FieldRefs[bf]
-		if !ok || ref == "" {
-			continue
-		}
-		if ent.Fields[bf].Type == business.FieldTypeMeasure {
-			measures = append(measures, ref)
-		} else {
-			dimensions = append(dimensions, ref)
-		}
-	}
-	// supplier_name filter
-	supplierNameRef := src.FieldRefs["supplier_name"]
-	if supplierNameRef == "" {
-		return nil, fmt.Errorf("supplier_name not mapped for datasource %s", ds)
-	}
-	// 多关键词
+	// 多关键词去重 → 拆多次调
 	keywords := splitAndTrim(supplierKeyword, ";,\n\r\t ")
 	if len(keywords) == 0 {
 		return nil, fmt.Errorf("supplier keyword empty")
@@ -1115,15 +989,10 @@ func (h *Handler) loadSupplierSkusBiz(supplierKeyword string, limit int) ([]mode
 	seen := make(map[string]struct{})
 	var merged []model.SkuRecord
 	for _, kw := range keywords {
-		filters := []map[string]any{
-			{"member": supplierNameRef, "operator": "contains", "values": []string{kw}},
-		}
-		rows, err := h.Agent.Execute(src.Cube, measures, dimensions, filters, []string{"sup_only"}, limit)
-		if err != nil {
-			return nil, err
-		}
-		// 翻回业务字段名
-		bizRows, err := h.BusinessReg.ToBusinessResponse("products", ds, rows, bizFields)
+		// 2026-09-02: 用 Executor.SearchProducts 走 Registry 翻译
+		//   注意: 原代码每个 keyword 单独 limit,合并去重
+		//   简化: 用每个 keyword 调一次,跟原行为一致
+		bizRows, err := h.BizExecutor.SearchProducts(kw, limit)
 		if err != nil {
 			return nil, err
 		}
@@ -1284,27 +1153,14 @@ func (h *Handler) SearchProducts(c *gin.Context) {
 		}
 		bizFields = filtered
 	}
-	measures := []string{}
-	dimensions := []string{}
-	for _, bf := range bizFields {
-		ref, ok := src.FieldRefs[bf]
-		if !ok || ref == "" {
-			continue
-		}
-		if ent.Fields[bf].Type == business.FieldTypeMeasure {
-			measures = append(measures, ref)
-		} else {
-			dimensions = append(dimensions, ref)
-		}
-	}
-	filters := []map[string]any{}
+
+	// 2026-09-02: 翻译/Execute/翻回收编到 Executor.Query
+	//   handler 只负责"业务字段 filter 拼装 + permission 切字段"
+	bizFilters := []business.BusinessFilter{}
 	if supplier != "" {
-		supplierNameRef := src.FieldRefs["supplier_name"]
-		if supplierNameRef != "" {
-			filters = append(filters, map[string]any{
-				"member": supplierNameRef, "operator": "contains", "values": []string{supplier},
-			})
-		}
+		bizFilters = append(bizFilters, business.BusinessFilter{
+			Field: "supplier_name", Op: "contains", Values: []any{supplier},
+		})
 	}
 	// 2026-08-31: barcode / item_no 过滤 (扫码查商品, 返回 1 条精准结果)
 	barcodeQuery := barcode
@@ -1312,33 +1168,25 @@ func (h *Handler) SearchProducts(c *gin.Context) {
 		barcodeQuery = itemNo
 	}
 	if barcodeQuery != "" {
-		barcodeRef := src.FieldRefs["barcode"]
-		if barcodeRef != "" {
-			filters = append(filters, map[string]any{
-				"member": barcodeRef, "operator": "equals", "values": []string{barcodeQuery},
-			})
-			// 精准查询: 限定 1 条
-			if limit > 1 {
-				limit = 1
-			}
+		bizFilters = append(bizFilters, business.BusinessFilter{
+			Field: "barcode", Op: "equals", Values: []any{barcodeQuery},
+		})
+		// 精准查询: 限定 1 条
+		if limit > 1 {
+			limit = 1
 		}
 	}
 
-	rows, err := h.Agent.Execute(src.Cube, measures, dimensions, filters, []string{"sup_only"}, limit)
+	bizRows, err := h.BizExecutor.Query("products", bizFields, bizFilters, limit)
 	if err != nil {
-		c.JSON(500, gin.H{"error": "agent query: " + err.Error()})
-		return
-	}
-	bizRows, err := h.BusinessReg.ToBusinessResponse("products", ds, rows, bizFields)
-	if err != nil {
-		c.JSON(500, gin.H{"error": "translate response: " + err.Error()})
+		c.JSON(500, gin.H{"error": "query: " + err.Error()})
 		return
 	}
 	c.JSON(200, gin.H{
 		"products":   bizRows,
 		"count":      len(bizRows),
 		"datasource": ds,
-		"cube":       src.Cube,
+		"cube":       h.BizExecutor.CubeOf("products"),
 		"meta": gin.H{
 			"inv_viewable": invViewable,
 		},

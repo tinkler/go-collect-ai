@@ -326,6 +326,10 @@ func (r *Registry) registerProducts() {
 			"brand":         {Name: "brand", Type: FieldTypeDimension, Description: "品牌"},
 			"stock_qty":     {Name: "stock_qty", Type: FieldTypeMeasure, Description: "库存数(已聚合)"},
 			"price":         {Name: "price", Type: FieldTypeMeasure, Description: "当前售价(已聚合)"},
+			// 2026-09-02: restock 收编,LoadItemDict 从 products 拿 (HBPoS cube 已有这些字段)
+			"clsno":         {Name: "clsno", Type: FieldTypeDimension, Description: "商品分类编码 (HBPoS item_clsno)"},
+			"clsname":       {Name: "clsname", Type: FieldTypeDimension, Description: "商品分类名 (HBPoS item_clsname)"},
+			"unit":          {Name: "unit", Type: FieldTypeDimension, Description: "计量单位 (HBPoS unit_no)"},
 		},
 		Sources: map[string]SourceMapping{
 			"erp": {
@@ -339,6 +343,9 @@ func (r *Registry) registerProducts() {
 					"brand":         "", // ERP 没品牌字段
 					"stock_qty":     "products.qty",
 					"price":         "", // ERP 当前没暴露售价字段, 留空 (返回空)
+					"clsno":         "",
+					"clsname":       "",
+					"unit":          "",
 				},
 			},
 			"hbpos": {
@@ -356,6 +363,9 @@ func (r *Registry) registerProducts() {
 					//   扫商品场景不再显示"- (无库存字段)"
 					"stock_qty":     "t_bd_item_info.stock_qty",
 					"price":         "t_bd_item_info.sale_price", // 2026-08-31: 售价用 sale_price (原 price 是进价, sale_price 才是零售)
+					"clsno":         "t_bd_item_info.item_clsno",
+					"clsname":       "t_bd_item_info.item_clsname",
+					"unit":          "t_bd_item_info.unit_no",
 				},
 			},
 		},

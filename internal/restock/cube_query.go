@@ -8,7 +8,7 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/tinkler/collect-ai/internal/parser/agent"
+	"github.com/tinkler/collect-ai/internal/business"
 )
 
 // CubeQuerier 包装 collect-ai 现有 agent.Client
@@ -24,12 +24,12 @@ import (
 //
 // 第一版如果 cube 还没建,函数会返回错误(不阻塞业务,降级 mock 数据)
 type CubeQuerier struct {
-	Agent *agent.Client
-	cfg   *RestockConfig
+	Gateway *business.Gateway
+	cfg     *RestockConfig
 }
 
-func NewCubeQuerier(a *agent.Client, cfg *RestockConfig) *CubeQuerier {
-	return &CubeQuerier{Agent: a, cfg: cfg}
+func NewCubeQuerier(g *business.Gateway, cfg *RestockConfig) *CubeQuerier {
+	return &CubeQuerier{Gateway: g, cfg: cfg}
 }
 
 // SalesInWindow 拉指定时间窗口的销量 + 当前库存快照
@@ -90,7 +90,7 @@ func (q *CubeQuerier) SalesInWindow(ctx context.Context, branchNo string, from, 
 			},
 		},
 	}
-	rows, err := q.Agent.ExecuteWithTime(cube,
+	rows, err := q.Gateway.RawQueryWithTime(cube,
 		[]string{
 			cube + ".sale_qty",
 			cube + ".inv_snapshot",

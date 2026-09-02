@@ -95,6 +95,11 @@ type Config struct {
 	// Refresh cookie
 	CookieDomain string `mapstructure:"COOKIE_DOMAIN"`
 	CookieSecure bool   `mapstructure:"COOKIE_SECURE"`
+
+	// ============== 业务字段映射 (2026-09-02 配置化) ==============
+	//   YAML 路径,空 = 用 NewDefaultRegistry() 硬编码 fallback
+	//   推荐: configs/mappings.yaml (项目根目录相对路径)
+	MappingFile string `mapstructure:"MAPPING_FILE"`
 }
 
 // leaves 列出所有需要 BindEnv 的叶子 key
@@ -119,6 +124,9 @@ var leaves = []string{
 	"DEV_MODE",
 	"WECOM_CORP_ID", "WECOM_AGENT_ID", "WECOM_CORP_SECRET",
 	"COOKIE_DOMAIN", "COOKIE_SECURE",
+
+	// 业务字段映射配置 (2026-09-02)
+	"MAPPING_FILE",
 }
 
 // Load 加载配置

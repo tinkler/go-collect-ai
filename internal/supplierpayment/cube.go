@@ -8,6 +8,10 @@
 //   - NoopCubeQuerier 返回固定值 (0.5 / 0.8), 让 cron 跑通
 //   - 真实接入需在 main.go 注入 RealCubeQuerier (使用 internal/parser/agent.Client.Execute)
 //
+// 2026-09-02 重构:
+//   - 删本地 CubeClient interface,统一复用 business.CubeClient (Gateway.RawQuery 包装)
+//   - RealCubeQuerier 持 business.CubeClient,不直接 import parser/agent
+//
 // 接口设计原则:
 //   - 抽象成 CubeQuerier interface, 业务代码不强依赖 collect-ai agent.Client
 //   - NoopQuerier 保证 devMode 友好 (无 LLM/无 cube 也能跑)
@@ -18,6 +22,8 @@ import (
 	"fmt"
 	"log"
 	"time"
+
+	"github.com/tinkler/collect-ai/internal/business"
 )
 
 // CubeQuerier cube 数据源抽象
@@ -69,14 +75,11 @@ func (n *NoopCubeQuerier) SellthroughSupplier(_ context.Context, _ string, _ int
 // ============================================================
 
 // RealCubeQuerier 真实 cube 客户端包装
-//   依赖 internal/parser/agent.Client (HTTP 调 cube-agent-server)
-//   interface 注入避免循环依赖
-type CubeClient interface {
-	Execute(cube string, measures, dimensions []string, filters []map[string]any, segments []string, limit int) ([]map[string]any, error)
-}
-
+//   2026-09-02 重构: 改持 business.CubeClient interface(原 CubeClient interface 已删,统一复用 business.CubeClient)
+//   实参可以是 *agent.Client 或 Gateway.RawQuery 包装
+//   不再 import internal/parser/agent
 type RealCubeQuerier struct {
-	client CubeClient
+	client business.CubeClient
 	// 实际 cube 名 + measure/dim 在这里集中管理
 	salesCube        string
 	promoCube        string
@@ -87,7 +90,7 @@ type RealCubeQuerier struct {
 	now              func() time.Time
 }
 
-func NewRealCubeQuerier(client CubeClient) *RealCubeQuerier {
+func NewRealCubeQuerier(client business.CubeClient) *RealCubeQuerier {
 	return &RealCubeQuerier{
 		client:           client,
 		salesCube:        "siss_saleflow",
