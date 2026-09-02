@@ -76,49 +76,23 @@ func main() {
 
 	gin.SetMode(gin.ReleaseMode)
 
-	// ============== restock 模块启动(2026-08-28: 提前到这里,让 Handler 注入 RestockSvc) ==============
+	// ============== restock 模块启动 (2026-09-02 重构精简) ==============
 	restockCfg := &restock.RestockConfig{
-		BranchNo:               cfg.RestockBranchNo,
-		HourlyCron:             cfg.RestockHourlyCron,
-		AggregateCron:          cfg.RestockAggregateCron,
-		LlmPlanCron:            cfg.RestockLlmPlanCron,
-		MaxPushPerTick:         cfg.RestockMaxPushPerTick,
-		ROPFactor:              cfg.RestockROPFactor,
-		OUTDays:                cfg.RestockOUTDays,
-		OUTPromoBoost:          cfg.RestockOUTPromoBoost,
-		SafetyMin:              cfg.RestockSafetyMin,
-		WYesterday:             cfg.RestockWYesterday,
-		WSevenDay:              cfg.RestockWSevenDay,
-		WThirtyDay:             cfg.RestockWThirtyDay,
-		FloorMinIntervalMin:    cfg.RestockFloorMinIntervalMin,
-		OfficeP0MinMin:         cfg.RestockOfficeP0MinMin,
-		OfficeP1MinMin:         cfg.RestockOfficeP1MinMin,
-		OfficeP2MinMin:         cfg.RestockOfficeP2MinMin,
-		EscalateP2ToP1Hours:    cfg.RestockEscalateP2ToP1Hours,
-		EscalateP1ToP0Hours:    cfg.RestockEscalateP1ToP0Hours,
-		CubeSales:              cfg.RestockCubeSales,
-		CubeInventory:          cfg.RestockCubeInventory,
-		CubePromotion:          cfg.RestockCubePromotion,
-		LLMEnabled:             cfg.RestockLLMEnabled,
-		LLMPlanEnabled:         cfg.RestockLLMPlanEnabled,
-		LLMModel:               cfg.RestockLLMModel,
-		LLMPlanCacheHrs:        cfg.RestockLLMPlanCacheHrs,
-		WeComBotID:             cfg.WeComBotID,
-		WeComBotSecret:         cfg.WeComBotSecret,
-		WeComWSURL:             cfg.WeComWSURL,
-		WeComBindFile:          cfg.WeComBindFile,
-		// 陈列补货新版 (2026-08-30)
-		DisplayRestockCronEve:  cfg.DisplayRestockCronEve,
-		DisplayRestockCronMorn: cfg.DisplayRestockCronMorn,
-		DisplayRestockCronAft:  cfg.DisplayRestockCronAft,
-		DisplayRestockCubeName: cfg.DisplayRestockCubeName,
-		DisplayRestockRetryMax: cfg.DisplayRestockRetryMax,
-		DisplayRestockMaxPush:  cfg.DisplayRestockMaxPush,
+		BranchNo:    cfg.RestockBranchNo,
+		CronEve:     cfg.DisplayRestockCronEve,
+		CronMorn:    cfg.DisplayRestockCronMorn,
+		CronAft:     cfg.DisplayRestockCronAft,
+		CubeName:    cfg.DisplayRestockCubeName,
+		RetryMax:    cfg.DisplayRestockRetryMax,
+		MaxPerTick:  cfg.DisplayRestockMaxPush,
+		WeComBotID:  cfg.WeComBotID,
+		WeComBotSecret: cfg.WeComBotSecret,
+		WeComWSURL:  cfg.WeComWSURL,
+		WeComBindFile: cfg.WeComBindFile,
 	}
 	restockCube := restock.NewCubeQuerier(agentClient, restockCfg)
-	restockLLM := restock.NewLlmPlanner(llmClient, cfg.RestockLLMModel, cfg.RestockLLMPlanEnabled, cfg.RestockLLMPlanCacheHrs)
 	restockWeCom := restock.NewWeCom(restockCfg)
-	restockSvc := restock.NewService(restockCfg, pool, restockCube, restockLLM, restockWeCom)
+	restockSvc := restock.NewService(restockCfg, pool, restockCube)
 	// W3.5: 季节判定分类器 (关键词快速 + LLM 慢路径 + 6h 缓存)
 	seasonClassifier := buildSeasonClassifier(llmClient)
 	alertSvc := purchasealert.NewServiceWithClassifier(pool, seasonClassifier) // W3.2+W3.5
@@ -176,8 +150,7 @@ func main() {
 		DefaultFuzzyDist:    cfg.FuzzyDistance,
 	}
 
-	// 注册企微按钮点击回调 → 复用 Service.OnButtonClick(写 Feedback + 改状态 + in-place 更新卡片)
-	restockWeCom.OnButtonClick = restockSvc.OnButtonClick
+	// 注册企微消息回调 (新版 restock 不推群, 只做消息接收)
 	restockWeCom.OnMessage = func(chatID, userID, text string) {
 		log.Printf("[wecom] msg from chat=%s user=%s: %s", chatID, userID, text)
 	}
@@ -264,6 +237,13 @@ func main() {
 
 	// restock cron(独立开关: 没门店不跑)
 	if cfg.RestockBranchNo != "" {
+		// 启动时一次性加载 items cube 字典 (item_no → clsno / clsname / unit)
+		// 失败不阻断,前端 cls/clsname/unit 字段会空
+		dictCtx, dictCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		if err := restockSvc.LoadItemDict(dictCtx); err != nil {
+			log.Printf("[main] restock LoadItemDict: %v (前端 cls/unit 字段会空, 不阻断)", err)
+		}
+		dictCancel()
 		if err := restockSvc.Start(); err != nil {
 			log.Printf("[main] restock cron start failed: %v (继续运行,restock 不可用)", err)
 		}

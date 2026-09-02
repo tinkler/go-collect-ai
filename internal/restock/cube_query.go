@@ -24,109 +24,26 @@ import (
 //
 // 第一版如果 cube 还没建,函数会返回错误(不阻塞业务,降级 mock 数据)
 type CubeQuerier struct {
-	agent *agent.Client
+	Agent *agent.Client
 	cfg   *RestockConfig
 }
 
 func NewCubeQuerier(a *agent.Client, cfg *RestockConfig) *CubeQuerier {
-	return &CubeQuerier{agent: a, cfg: cfg}
+	return &CubeQuerier{Agent: a, cfg: cfg}
 }
 
-// SalesYesterday 拉昨日 + 7日均 + 30日均销量
-//   适配 cube-agent-server 上 sales_yesterday cube
-//   返回: map[item_no] -> { YesterdaySales, SevenDayAvg, ThirtyDayAvg }
-func (q *CubeQuerier) SalesYesterday(ctx context.Context, branchNo string) (map[string]*SkuSnapshot, error) {
-	cube := q.cfg.CubeSales
-	if cube == "" {
-		cube = "sales_yesterday"
-	}
-	rows, err := q.agent.Execute(cube,
-		[]string{"sales_yesterday.sale_qty_yesterday", "sales_yesterday.sale_qty_7d_avg", "sales_yesterday.sale_qty_30d_avg"},
-		[]string{"sales_yesterday.item_no", "sales_yesterday.item_name", "sales_yesterday.barcode", "sales_yesterday.supplier_name"},
-		[]map[string]any{
-			{"member": "sales_yesterday.branch_no", "operator": "equals", "values": []string{branchNo}},
-		},
-		nil, 5000)
-	if err != nil {
-		return nil, fmt.Errorf("cube %s query: %w", cube, err)
-	}
-	out := make(map[string]*SkuSnapshot, len(rows))
-	for _, r := range rows {
-		sku := &SkuSnapshot{
-			BranchNo:       branchNo,
-			ItemNo:         asString(r, "sales_yesterday.item_no"),
-			ItemName:       asString(r, "sales_yesterday.item_name"),
-			Barcode:        asString(r, "sales_yesterday.barcode"),
-			SupplierName:   asString(r, "sales_yesterday.supplier_name"),
-			YesterdaySales: asInt(r, "sales_yesterday.sale_qty_yesterday"),
-			SevenDayAvg:    asInt(r, "sales_yesterday.sale_qty_7d_avg"),
-			ThirtyDayAvg:   asInt(r, "sales_yesterday.sale_qty_30d_avg"),
-		}
-		out[sku.ItemNo] = sku
-	}
-	log.Printf("[restock] sales(%s): %d items, branch=%s", cube, len(out), branchNo)
-	return out, nil
-}
-
-// InventoryCurrent 拉当前库存
-//   适配 inventory_current cube
-//   返回: map[item_no] -> { Stock }
-func (q *CubeQuerier) InventoryCurrent(ctx context.Context, branchNo string) (map[string]int, error) {
-	cube := q.cfg.CubeInventory
-	if cube == "" {
-		cube = "inventory_current"
-	}
-	rows, err := q.agent.Execute(cube,
-		[]string{"inventory_current.stock_qty"},
-		[]string{"inventory_current.item_no"},
-		[]map[string]any{
-			{"member": "inventory_current.branch_no", "operator": "equals", "values": []string{branchNo}},
-		},
-		nil, 10000)
-	if err != nil {
-		return nil, fmt.Errorf("cube %s query: %w", cube, err)
-	}
-	out := make(map[string]int, len(rows))
-	for _, r := range rows {
-		itemNo := asString(r, "inventory_current.item_no")
-		if itemNo == "" {
-			continue
-		}
-		out[itemNo] = asInt(r, "inventory_current.stock_qty")
-	}
-	log.Printf("[restock] inventory(%s): %d items", cube, len(out))
-	return out, nil
-}
-
-// Promotion7d 拉未来 7 天促销计划(只关心哪些 item 有促销)
-//   适配 promotion_plan_7d cube
-func (q *CubeQuerier) Promotion7d(ctx context.Context, branchNo string) (map[string]bool, error) {
-	cube := q.cfg.CubePromotion
-	if cube == "" {
-		cube = "promotion_plan_7d"
-	}
-	rows, err := q.agent.Execute(cube,
-		[]string{"promotion_plan_7d.count"},
-		[]string{"promotion_plan_7d.item_no"},
-		[]map[string]any{
-			{"member": "promotion_plan_7d.branch_no", "operator": "equals", "values": []string{branchNo}},
-		},
-		nil, 10000)
-	if err != nil {
-		return nil, fmt.Errorf("cube %s query: %w", cube, err)
-	}
-	out := make(map[string]bool, len(rows))
-	for _, r := range rows {
-		itemNo := asString(r, "promotion_plan_7d.item_no")
-		if itemNo == "" {
-			continue
-		}
-		out[itemNo] = true
-	}
-	return out, nil
-}
-
-// ============== Display Restock Window (2026-08-30 新增) ==============
+// SalesInWindow 拉指定时间窗口的销量 + 当前库存快照
+//   适配 cube-agent-server 上 display_restock_window cube
+//   from/to 用 mssql 通用 datetime 格式 (yyyy-MM-dd HH:mm:ss)
+//   ⚠️ 不要用 RFC3339 / ISO 8601:SQL Server 2008 R2 无法解析 '2026-08-31T12:34:56Z'
+//   返回: map[item_no] -> WindowSaleRow(SaleQty 是窗口内合计,InvSnapshot 是当前值)
+//   性能:< 10s / 次(子 session 实测 100-208ms,3.18M 行)
+//
+// ⚠️ 2026-08-31 累加修复:
+//   cube 引擎按 5 个 dimension + oper_date(time) GROUP BY,
+//   同一个 item 在窗口内不同 oper_date 时间点会返回多行(每行 cube 内部已 SUM 过 sale_qnty)
+//   collect-ai 端必须把同 item 多行的 sale_qty 累加(不是覆盖),
+//   否则后写覆盖前写,sale_qty 偶发只留最后一行(1.0 变 0.6361 被过滤 / 0.6361 变 1.0 假象)
 
 // WindowSaleRow 时间窗口销量 + 库存快照的一行
 //   2026-08-31: SaleQty 改 float64,适配 SQL Server decimal(18,4) 称重件
@@ -153,7 +70,7 @@ type WindowSaleRow struct {
 //   collect-ai 端必须把同 item 多行的 sale_qty 累加(不是覆盖),
 //   否则后写覆盖前写,sale_qty 偶发只留最后一行(1.0 变 0.6361 被过滤 / 0.6361 变 1.0 假象)
 func (q *CubeQuerier) SalesInWindow(ctx context.Context, branchNo string, from, to time.Time) (map[string]*WindowSaleRow, error) {
-	cube := q.cfg.DisplayRestockCubeName
+	cube := q.cfg.CubeName
 	if cube == "" {
 		cube = "display_restock_window"
 	}
@@ -173,7 +90,7 @@ func (q *CubeQuerier) SalesInWindow(ctx context.Context, branchNo string, from, 
 			},
 		},
 	}
-	rows, err := q.agent.ExecuteWithTime(cube,
+	rows, err := q.Agent.ExecuteWithTime(cube,
 		[]string{
 			cube + ".sale_qty",
 			cube + ".inv_snapshot",

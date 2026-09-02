@@ -124,27 +124,21 @@ func NewRouter(h *handler.Handler, cfg *config.Config, restockSvc *restock.Servi
 			authed.DELETE("/sessions/:id/rows/:rowId", auth.RequirePerm("row:delete"), h.DeleteRow)
 
 			// 采购计划
-			authed.GET("/purchase-plans", auth.RequirePerm("plan:read"), restock.PurchasePlansList(restockSvc))
+			authed.GET("/purchase-plans", auth.RequirePerm("plan:read"), restock.RestockPurchasePlansList(restockSvc))
 
 			// 业务层 API(2026-08-31: /datasources 端点删除,数据源启动后即固定)
 			authed.GET("/products/search", auth.RequirePerm("session:read"), h.SearchProducts)
 
-			// restock
-			//   新版陈列补货 (2026-08-30): 走 display_suggest + short_state + need_purchase 三表 join
-			//     GET  /restock/tasks?date=YYYY-MM-DD
-			//     POST /restock/feedback  (event_key 统一入参, H5 + 企微 callback 同路)
+			// restock (2026-09-02 重构精简)
+			//   4 个端点, 不分 date / office / floor, 不推群
+			//     GET  /restock/tasks            任务列表 (H5 主页)
+			//     POST /restock/feedback         员工反馈 (DONE/SHORT, 按 kind perm 分)
+			//     GET  /restock/purchase-plans   采购计划单 (采购看)
+			//     POST /restock/cron/tick        手动触发 (admin)
 			authed.GET("/restock/tasks", auth.RequirePerm("plan:read"), restock.RestockTasksList(restockSvc))
-			authed.POST("/restock/feedback", auth.RequirePerm("restock:feedback"), restock.RestockFeedback(restockSvc))
-			authed.GET("/restock/need-purchase", auth.RequirePerm("plan:read"), restock.RestockNeedPurchaseList(restockSvc))
+			authed.POST("/restock/feedback", restock.RestockFeedback(restockSvc))
+			authed.GET("/restock/purchase-plans", auth.RequirePerm("plan:read"), restock.RestockPurchasePlansList(restockSvc))
 			authed.POST("/restock/cron/tick", auth.RequirePerm("admin"), restock.RestockManualTick(restockSvc))
-			authed.GET("/restock/llm/plan", auth.RequirePerm("plan:read"), restock.RestockLlmPlanNow(restockSvc))
-
-			// H5 视图 (2026-08-30): 替代企微群 button 交互, 按 user.group 决定返回粒度
-			authed.GET("/restock/h5/tasks", auth.RequirePerm("plan:read"), restock.RestockH5TasksList(restockSvc))
-			authed.POST("/restock/h5/tasks/:task_id/feedback", auth.RequirePerm("plan:read"), restock.RestockH5Feedback(restockSvc))
-			authed.GET("/restock/h5/categories", auth.RequirePerm("plan:read"), restock.RestockH5Categories(restockSvc))
-			authed.GET("/restock/h5/cls-map", auth.RequirePerm("plan:read"), restock.RestockH5ClsMap(restockSvc))
-			authed.GET("/restock/h5/purchase-plans", auth.RequirePerm("plan:read"), restock.RestockH5PurchasePlans(restockSvc))
 
 			// ============== Admin 权限管理 (2026-08-30) ==============
 			rbacH := rbac.NewHandler(rbacStore)
@@ -170,12 +164,6 @@ func NewRouter(h *handler.Handler, cfg *config.Config, restockSvc *restock.Servi
 				admin.GET("/departments", rbacH.ListDepartments)
 				admin.GET("/audit", rbacH.ListAudit)
 			}
-
-			// wecom chat 管理 (admin)
-			authed.GET("/restock/wecom/chats", auth.RequirePerm("admin"), restock.RestockListChats(restockSvc))
-			authed.POST("/restock/wecom/chats/bind", auth.RequirePerm("admin"), restock.RestockBindChat(restockSvc))
-			authed.POST("/restock/wecom/chats/bulk-bind", auth.RequirePerm("admin"), restock.RestockBulkBindChat(restockSvc))
-			authed.POST("/restock/wecom/chats/test", auth.RequirePerm("admin"), restock.RestockTestChat(restockSvc))
 		}
 	}
 

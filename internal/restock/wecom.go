@@ -1,9 +1,16 @@
+// Package restock 精简后的企微长连接客户端 (2026-09-02)
+//
+// 保留: 长连接 + 收消息 + 按 chat_id 发送 + bindings 持久化
+// 删掉: floor/office 角色绑定, SendUpdateCard (不推群), 旧 OnButtonClick
+//
+// 角色绑定被删是因为新版 restock 不推群, 未来通用化后由调用方自己维护 chat_id 列表
 package restock
 
 import (
 	"context"
 	"crypto/rand"
 	"crypto/sha1"
+	"crypto/tls"
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
@@ -18,8 +25,6 @@ import (
 	"sync"
 	"time"
 
-	"crypto/tls"
-
 	"gopkg.in/yaml.v3"
 )
 
@@ -30,11 +35,11 @@ import (
 // 协议: 客户端主动建立 WS → 发 aibot_subscribe 认证 → 收 aibot_event_callback
 //       → 30s 一次 ping → 发消息走 aibot_send_msg 帧
 //
-// 凭证: BotID + Secret (就这 2 个,不需要 CorpID/AgentID/Token/AESKey)
+// 凭证: BotID + Secret
 //
 // 关键约束:
-//   - 一个机器人同时只能有 1 个有效长连接(新连接会踢旧连接)
-//   - 群 chat_id 不能预先创建,用户在群里发消息后企微推过来
+//   - 一个机器人同时只能有 1 个有效长连接
+//   - 群 chat_id 用户在群里发消息后企微推过来
 //   - 主动发消息: 用户必须先在会话里发过消息(24 小时内)
 //   - 频率限制: 30 条/分钟/会话, 1000 条/小时/会话
 // =====================================================================
@@ -43,9 +48,8 @@ import (
 type WeCom struct {
 	cfg *RestockConfig
 
-	// bindings: chat_id -> "floor" / "office" / ""
-	bindings   map[string]string
-	discovered map[string]time.Time // 首次发现时间
+	// chat_id 列表 (自动发现)
+	discovered map[string]time.Time
 	mu         sync.RWMutex
 
 	// 长连接状态
@@ -53,34 +57,28 @@ type WeCom struct {
 	writeMu   sync.Mutex
 	connected bool
 
-	// 事件回调(由 service.go 注册)
-	OnButtonClick func(reqID, chatID, userID, taskID, eventKey string) // 按钮点击(req_id 用于回发 update 帧)
-	OnMessage     func(chatID, userID, text string)                    // 文本消息(用于自动发现)
-	OnAgentMessage func(chatID, userID, text string)                   // 文本消息(智能采购 Agent, W2 接入)
-	OnConnect     func()                                               // 连接成功
+	// 事件回调 (由 service / main 注册)
+	OnMessage      func(chatID, userID, text string)
+	OnAgentMessage func(chatID, userID, text string)
+	OnConnect      func()
 
 	// 内部
 	stopCh   chan struct{}
 	stopOnce sync.Once
 	reqID    uint64
-
-	// for TLS ws://
-	tlsConfig *tls.Config
 }
 
-// ChatBinding 持久化结构(YAML)
+// ChatBinding 持久化结构 (YAML)
 type ChatBinding struct {
 	ChatID     string    `yaml:"chat_id" json:"chat_id"`
-	Role       string    `yaml:"role" json:"role"` // "floor" / "office" / ""
+	Note       string    `yaml:"note,omitempty" json:"note,omitempty"`
 	FirstSeen  time.Time `yaml:"first_seen" json:"first_seen"`
 	LastActive time.Time `yaml:"last_active,omitempty" json:"last_active,omitempty"`
-	Note       string    `yaml:"note,omitempty" json:"note,omitempty"`
 }
 
 func NewWeCom(cfg *RestockConfig) *WeCom {
 	w := &WeCom{
 		cfg:        cfg,
-		bindings:   make(map[string]string),
 		discovered: make(map[string]time.Time),
 		stopCh:     make(chan struct{}),
 	}
@@ -88,7 +86,7 @@ func NewWeCom(cfg *RestockConfig) *WeCom {
 	return w
 }
 
-// Start 启长连接(后台 goroutine)
+// Start 启长连接 (后台 goroutine)
 func (w *WeCom) Start(ctx context.Context) error {
 	if w.cfg.WeComBotID == "" || w.cfg.WeComBotSecret == "" {
 		return fmt.Errorf("WECOM_BOT_ID / WECOM_BOT_SECRET 未配置")
@@ -104,7 +102,7 @@ func (w *WeCom) Stop() {
 	})
 }
 
-// connectLoop 重连循环(指数退避)
+// connectLoop 重连循环 (指数退避)
 func (w *WeCom) connectLoop(ctx context.Context) {
 	backoff := 2 * time.Second
 	maxBackoff := 60 * time.Second
@@ -133,9 +131,8 @@ func (w *WeCom) connectLoop(ctx context.Context) {
 	}
 }
 
-// connect 单次连接生命周期: 拨号 → WS 握手 → 订阅 → 收发循环 → 断开返回
+// connect 单次连接生命周期
 func (w *WeCom) connect(ctx context.Context) error {
-	// 解析 wss://host:port/path → 拿 host, port, path
 	u, err := url.Parse(w.cfg.WeComWSURL)
 	if err != nil {
 		return fmt.Errorf("parse ws url: %w", err)
@@ -152,7 +149,6 @@ func (w *WeCom) connect(ctx context.Context) error {
 	if path == "" {
 		path = "/"
 	}
-	// Host 头不含端口(如果是 443/80)
 	hostHeader := u.Host
 
 	log.Printf("[wecom] dialing %s ...", host)
@@ -162,10 +158,8 @@ func (w *WeCom) connect(ctx context.Context) error {
 		return fmt.Errorf("tcp dial: %w", err)
 	}
 
-	// wss:// 需要 TLS 握手
 	var wsConn io.ReadWriteCloser = rawConn
 	if u.Scheme == "wss" {
-		log.Printf("[wecom] tls handshake to %s ...", hostHeader)
 		tlsConn := tls.Client(rawConn, &tls.Config{
 			ServerName: hostHeader,
 			MinVersion: tls.VersionTLS12,
@@ -175,23 +169,20 @@ func (w *WeCom) connect(ctx context.Context) error {
 			return fmt.Errorf("tls handshake: %w", err)
 		}
 		wsConn = tlsConn
-		log.Printf("[wecom] tls handshake ok")
 	}
 
-	// WS 客户端握手
 	wsKey, err := w.wsHandshake(wsConn, hostHeader, path)
 	if err != nil {
 		wsConn.Close()
 		return fmt.Errorf("ws handshake: %w", err)
 	}
-	log.Printf("[wecom] ws handshake ok, key=%s", wsKey)
+	_ = wsKey
 
 	w.mu.Lock()
 	w.conn = wsConn
 	w.connected = true
 	w.mu.Unlock()
 
-	// 订阅
 	if err := w.subscribe(); err != nil {
 		w.closeConn()
 		return fmt.Errorf("subscribe: %w", err)
@@ -202,8 +193,7 @@ func (w *WeCom) connect(ctx context.Context) error {
 		w.OnConnect()
 	}
 
-	// 启心跳 + 收消息
-	pingTicker := time.NewTicker(25 * time.Second) // 略小于 30s
+	pingTicker := time.NewTicker(25 * time.Second)
 	defer pingTicker.Stop()
 
 	go func() {
@@ -221,14 +211,11 @@ func (w *WeCom) connect(ctx context.Context) error {
 		}
 	}()
 
-	// 收消息主循环
 	return w.readLoop()
 }
 
-// wsHandshake WebSocket 客户端握手(简化版,只支持 wss://host:port/)
-//   返回 Sec-WebSocket-Accept 校验后的 key
+// wsHandshake WebSocket 客户端握手
 func (w *WeCom) wsHandshake(conn io.ReadWriteCloser, host, path string) (string, error) {
-	// 生成 Sec-WebSocket-Key
 	keyBytes := make([]byte, 16)
 	if _, err := rand.Read(keyBytes); err != nil {
 		return "", err
@@ -244,8 +231,6 @@ func (w *WeCom) wsHandshake(conn io.ReadWriteCloser, host, path string) (string,
 		"User-Agent: collect-ai-wecom/1.0\r\n"+
 		"\r\n", path, host, key)
 
-	// tls.Conn 支持 SetDeadline, 普通 net.Conn 也支持
-	// io.ReadWriteCloser 没有 SetDeadline,我们尽量用 timeout 控制
 	if tc, ok := conn.(interface{ SetDeadline(time.Time) error }); ok {
 		_ = tc.SetDeadline(time.Now().Add(10 * time.Second))
 	}
@@ -253,7 +238,6 @@ func (w *WeCom) wsHandshake(conn io.ReadWriteCloser, host, path string) (string,
 		return "", err
 	}
 
-	// 读响应(直到 \r\n\r\n)
 	buf := make([]byte, 4096)
 	n, err := readUntil(conn, buf, "\r\n\r\n")
 	if err != nil {
@@ -264,7 +248,6 @@ func (w *WeCom) wsHandshake(conn io.ReadWriteCloser, host, path string) (string,
 		return "", fmt.Errorf("ws upgrade failed: %s", strings.SplitN(resp, "\r\n", 2)[0])
 	}
 
-	// 校验 Sec-WebSocket-Accept
 	expected := computeAcceptKey(key)
 	if !strings.Contains(resp, expected) {
 		return "", fmt.Errorf("ws accept key mismatch: want %s in %s", expected, Truncate(resp, 200))
@@ -306,11 +289,9 @@ func readUntil(r io.Reader, buf []byte, delim string) (int, error) {
 func (w *WeCom) readLoop() error {
 	header := make([]byte, 14)
 	for {
-		// 读 frame header (最少 2 字节,最长 14 字节含 8 字节 masking key)
 		if _, err := io.ReadFull(w.conn, header[:2]); err != nil {
 			return fmt.Errorf("read frame hdr: %w", err)
 		}
-		fin := (header[0] & 0x80) != 0
 		opcode := header[0] & 0x0F
 		masked := (header[1] & 0x80) != 0
 		payloadLen := int(header[1] & 0x7F)
@@ -348,24 +329,20 @@ func (w *WeCom) readLoop() error {
 			}
 		}
 
-		_ = fin
 		switch opcode {
 		case 0x1: // text
 			w.handleMessage(payload)
 		case 0x8: // close
-			log.Printf("[wecom] received close frame")
 			return fmt.Errorf("server closed")
 		case 0x9: // ping
 			_ = w.pong(payload)
 		case 0xA: // pong
 			// noop
-		default:
-			// binary / 其它忽略
 		}
 	}
 }
 
-// writeFrame 写一帧(客户端必须 mask)
+// writeFrame 写一帧
 func (w *WeCom) writeFrame(opcode byte, payload []byte) error {
 	w.writeMu.Lock()
 	defer w.writeMu.Unlock()
@@ -376,32 +353,28 @@ func (w *WeCom) writeFrame(opcode byte, payload []byte) error {
 	}
 
 	var header [14]byte
-	header[0] = 0x80 | opcode // FIN=1
+	header[0] = 0x80 | opcode
 
 	plen := len(payload)
 	if plen < 126 {
 		header[1] = 0x80 | byte(plen)
-		_, err := conn.Write(header[:2])
-		if err != nil {
+		if _, err := conn.Write(header[:2]); err != nil {
 			return err
 		}
 	} else if plen < 65536 {
 		header[1] = 0x80 | 126
 		binary.BigEndian.PutUint16(header[2:], uint16(plen))
-		_, err := conn.Write(header[:4])
-		if err != nil {
+		if _, err := conn.Write(header[:4]); err != nil {
 			return err
 		}
 	} else {
 		header[1] = 0x80 | 127
 		binary.BigEndian.PutUint64(header[2:], uint64(plen))
-		_, err := conn.Write(header[:10])
-		if err != nil {
+		if _, err := conn.Write(header[:10]); err != nil {
 			return err
 		}
 	}
 
-	// 客户端必须 mask
 	maskKey := [4]byte{}
 	if _, err := rand.Read(maskKey[:]); err != nil {
 		return err
@@ -423,7 +396,6 @@ func (w *WeCom) nextReqID() string {
 	return "restock-" + strconv.FormatUint(w.reqID, 10) + "-" + strconv.FormatInt(time.Now().UnixNano()%1_000_000_000, 10)
 }
 
-// sendJSON 通用发 JSON 帧
 func (w *WeCom) sendJSON(v any) error {
 	bs, err := json.Marshal(v)
 	if err != nil {
@@ -465,35 +437,29 @@ func (w *WeCom) closeConn() {
 }
 
 // =====================================================================
-// 业务消息收发
+// 收消息
 // =====================================================================
 
-// ChatFrame 收消息 envelope
 type ChatFrame struct {
 	Cmd     string         `json:"cmd"`
 	Headers map[string]any `json:"headers"`
 	Body    struct {
-		MsgID     string `json:"msgid"`
-		CreateAt  int64  `json:"create_time"`
-		AIBotID   string `json:"aibotid"`
-		ChatID    string `json:"chatid"`
-		ChatType  string `json:"chattype"` // single / group
-		From      struct {
+		MsgID    string `json:"msgid"`
+		CreateAt int64  `json:"create_time"`
+		AIBotID  string `json:"aibotid"`
+		ChatID   string `json:"chatid"`
+		ChatType string `json:"chattype"`
+		From     struct {
 			CorpID string `json:"corpid"`
 			UserID string `json:"userid"`
 		} `json:"from"`
 		ResponseURL string `json:"response_url"`
-		MsgType     string `json:"msgtype"` // text / event
+		MsgType     string `json:"msgtype"`
 		Text        *struct {
 			Content string `json:"content"`
 		} `json:"text,omitempty"`
 		Event *struct {
-			EventType          string `json:"eventtype"`
-			TemplateCardEvent  *struct {
-				CardType string `json:"card_type"`
-				EventKey string `json:"event_key"`
-				TaskID   string `json:"task_id"`
-			} `json:"template_card_event,omitempty"`
+			EventType string `json:"eventtype"`
 		} `json:"event,omitempty"`
 	} `json:"body"`
 }
@@ -501,7 +467,7 @@ type ChatFrame struct {
 func (w *WeCom) handleMessage(payload []byte) {
 	var f ChatFrame
 	if err := json.Unmarshal(payload, &f); err != nil {
-		log.Printf("[wecom] parse frame: %v payload=%s", err, Truncate(string(payload), 300))
+		log.Printf("[wecom] parse frame: %v", err)
 		return
 	}
 
@@ -511,9 +477,7 @@ func (w *WeCom) handleMessage(payload []byte) {
 	case "aibot_msg_callback":
 		w.handleTextMsg(&f)
 	default:
-		// 订阅响应、ping 响应等: 打印
 		if f.Cmd == "" {
-			// 可能是订阅响应包,忽略
 			return
 		}
 		log.Printf("[wecom] frame cmd=%s: %s", f.Cmd, Truncate(string(payload), 200))
@@ -521,7 +485,6 @@ func (w *WeCom) handleMessage(payload []byte) {
 }
 
 func (w *WeCom) handleEvent(f *ChatFrame) {
-	// 首次发现 chat_id(只要有 chatid 就记)
 	if f.Body.ChatID != "" {
 		w.recordChat(f.Body.ChatID)
 	}
@@ -529,25 +492,6 @@ func (w *WeCom) handleEvent(f *ChatFrame) {
 		return
 	}
 	switch f.Body.Event.EventType {
-	case "template_card_event":
-		if f.Body.Event.TemplateCardEvent == nil {
-			return
-		}
-		ev := f.Body.Event.TemplateCardEvent
-		// 解析 event_key (格式: "DONE|task_id" / "SHORT|task_id")
-		kind, taskID := parseButtonKey2(ev.EventKey)
-		log.Printf("[wecom] button click: chat=%s user=%s key=%s -> kind=%s task=%s",
-			f.Body.ChatID, f.Body.From.UserID, ev.EventKey, kind, taskID)
-		if w.OnButtonClick != nil && taskID != "" {
-			// 透传 req_id(从 frame header 拿),让 service.go 能回发 aibot_respond_update_msg
-			reqID := ""
-			if f.Headers != nil {
-				if v, ok := f.Headers["req_id"].(string); ok {
-					reqID = v
-				}
-			}
-			w.OnButtonClick(reqID, f.Body.ChatID, f.Body.From.UserID, taskID, ev.EventKey)
-		}
 	case "enter_chat":
 		log.Printf("[wecom] user entered chat: user=%s", f.Body.From.UserID)
 	case "disconnected_event":
@@ -563,29 +507,20 @@ func (w *WeCom) handleTextMsg(f *ChatFrame) {
 		if w.OnMessage != nil {
 			w.OnMessage(f.Body.ChatID, f.Body.From.UserID, f.Body.Text.Content)
 		}
-		// 2026-09-01 W2: 智能采购 Agent 桥接(同事件,OnAgentMessage 跟 OnMessage 并存,
-		// 桥内部按 chat_id 白名单过滤,只接管显式指定的群)
 		if w.OnAgentMessage != nil {
 			w.OnAgentMessage(f.Body.ChatID, f.Body.From.UserID, f.Body.Text.Content)
 		}
 	}
 }
 
-func parseButtonKey2(key string) (kind, taskID string) {
-	if i := strings.Index(key, "|"); i >= 0 {
-		return key[:i], key[i+1:]
-	}
-	return "", key
-}
-
-// recordChat 记录 chat_id(首次发现)
+// recordChat 记录 chat_id
 func (w *WeCom) recordChat(chatID string) {
 	w.mu.Lock()
 	if _, exists := w.discovered[chatID]; !exists {
 		w.discovered[chatID] = time.Now()
 		w.mu.Unlock()
 		_ = w.saveBindings()
-		log.Printf("[wecom] NEW chat discovered: %s (use POST /api/v1/restock/wecom/chats/bind to bind role)", chatID)
+		log.Printf("[wecom] NEW chat discovered: %s", chatID)
 		return
 	}
 	w.mu.Unlock()
@@ -595,44 +530,14 @@ func (w *WeCom) recordChat(chatID string) {
 // 发消息
 // =====================================================================
 
-// SendUpdateCard 员工点完按钮后,长连接回发 aibot_respond_update_msg 帧
-//   reqID: 原 callback event 的 req_id(必须透传,5 秒内回复)
-//   cardBody: 完整 template_card JSON(与 RenderFloorCard 兼容,msgtype=template_card + template_card={...})
-//   注意: body 不需要 chatid, 也不需要 msgtype 字段, 只放 response_type + template_card
-func (w *WeCom) SendUpdateCard(ctx context.Context, reqID string, cardBody []byte) error {
-	var card map[string]any
-	if err := json.Unmarshal(cardBody, &card); err != nil {
-		return fmt.Errorf("update card body not JSON: %w", err)
-	}
-	// 抽掉 msgtype 顶层(它属于 aibot_send_msg,update 不需要)
-	delete(card, "msgtype")
-	tplCard, ok := card["template_card"].(map[string]any)
-	if !ok {
-		return fmt.Errorf("template_card missing in update body")
-	}
-
-	frame := map[string]any{
-		"cmd": "aibot_respond_update_msg",
-		"headers": map[string]any{
-			"req_id": reqID,
-		},
-		"body": map[string]any{
-			"response_type":  "update_template_card",
-			"template_card":  tplCard,
-		},
-	}
-	return w.sendJSON(frame)
-}
-
-// SendAppChat 发消息到指定 chat_id(role 找 chat_id)
-//   role: "floor" / "office" / 任何已绑定的 chat_id
-func (w *WeCom) SendAppChat(ctx context.Context, chatID string, body []byte) error {
-	chatID = w.resolveChatID(chatID)
+// SendCard 发卡片消息到指定 chat_id
+//   chatID: 企微会话 ID
+//   body: 完整消息 JSON (msgtype + 对应字段, e.g. {"msgtype":"text","text":{"content":"hi"}})
+func (w *WeCom) SendCard(ctx context.Context, chatID string, body []byte) error {
 	if chatID == "" {
-		return fmt.Errorf("no chat_id for role, bind first via /api/v1/restock/wecom/chats/bind")
+		return fmt.Errorf("chat_id required")
 	}
 
-	// 解析 body 拿 msgtype 和对应字段
 	var msg map[string]any
 	if err := json.Unmarshal(body, &msg); err != nil {
 		return fmt.Errorf("body not JSON: %w", err)
@@ -659,20 +564,20 @@ func (w *WeCom) SendAppChat(ctx context.Context, chatID string, body []byte) err
 	return w.sendJSON(frame)
 }
 
-// resolveChatID role → chat_id
-func (w *WeCom) resolveChatID(roleOrChatID string) string {
-	w.mu.RLock()
-	defer w.mu.RUnlock()
-	if strings.HasPrefix(roleOrChatID, "wr") || strings.HasPrefix(roleOrChatID, "wc") {
-		// 直接是 chat_id
-		return roleOrChatID
+// SendAppChat 兼容 agent.WecomSender interface
+//   2026-09-02: 跟 SendCard 签名一致, 等价方法
+func (w *WeCom) SendAppChat(ctx context.Context, chatID string, body []byte) error {
+	return w.SendCard(ctx, chatID, body)
+}
+
+// SendText 简化的发文本
+func (w *WeCom) SendText(ctx context.Context, chatID, text string) error {
+	body := map[string]any{
+		"msgtype": "text",
+		"text":    map[string]any{"content": text},
 	}
-	for cid, role := range w.bindings {
-		if role == roleOrChatID {
-			return cid
-		}
-	}
-	return ""
+	bs, _ := json.Marshal(body)
+	return w.SendCard(ctx, chatID, bs)
 }
 
 // =====================================================================
@@ -680,51 +585,26 @@ func (w *WeCom) resolveChatID(roleOrChatID string) string {
 // =====================================================================
 
 func (w *WeCom) bindingsFile() string {
-	// 智能 fallback: 如果 env 配的是 .json(老配置),自动改用 .yaml
-	// 避免新部署忘改 env 又踩坑
 	p := w.cfg.WeComBindFile
 	if p == "" {
 		return "./wecom_bindings.yaml"
-	}
-	if strings.HasSuffix(p, ".json") {
-		log.Printf("[wecom] WECOM_BIND_FILE=%s 是老格式,自动改用 .yaml", p)
-		return strings.TrimSuffix(p, ".json") + ".yaml"
 	}
 	return p
 }
 
 func (w *WeCom) loadBindings() {
-	// 优先读 .yaml(新格式), 如果不存在再读 .json(老格式, 一次性迁移)
-	yamlPath := w.bindingsFile()
-	jsonPath := yamlPath
-	if strings.HasSuffix(yamlPath, ".yaml") {
-		jsonPath = strings.TrimSuffix(yamlPath, ".yaml") + ".json"
-	} else if strings.HasSuffix(yamlPath, ".yml") {
-		jsonPath = strings.TrimSuffix(yamlPath, ".yml") + ".json"
+	p := w.bindingsFile()
+	bs, err := os.ReadFile(p)
+	if err != nil {
+		return
 	}
-
-	var bs []byte
-	var err error
-	if bs, err = os.ReadFile(yamlPath); err != nil {
-		// yaml 不存在, 试老 json
-		if bs, err = os.ReadFile(jsonPath); err != nil {
-			return
-		}
-		log.Printf("[wecom] migrating bindings: %s -> %s", jsonPath, yamlPath)
-	}
-
 	var list []ChatBinding
-	// 试 yaml
 	if err := yaml.Unmarshal(bs, &list); err != nil {
-		// 试 json(老文件)
-		if jerr := json.Unmarshal(bs, &list); jerr != nil {
-			log.Printf("[wecom] load bindings: yaml=%v json=%v", err, jerr)
-			return
-		}
+		log.Printf("[wecom] load bindings: %v", err)
+		return
 	}
 	w.mu.Lock()
 	for _, b := range list {
-		w.bindings[b.ChatID] = b.Role
 		if b.FirstSeen.IsZero() {
 			w.discovered[b.ChatID] = time.Now()
 		} else {
@@ -732,16 +612,6 @@ func (w *WeCom) loadBindings() {
 		}
 	}
 	w.mu.Unlock()
-
-	// 迁移成功后, 删老 json
-	if yamlPath != jsonPath {
-		if _, err := os.Stat(jsonPath); err == nil {
-			_ = os.Remove(jsonPath)
-			log.Printf("[wecom] removed old %s", jsonPath)
-		}
-		// 立即用新格式重写一次(标准化)
-		_ = w.saveBindings()
-	}
 }
 
 func (w *WeCom) saveBindings() error {
@@ -750,14 +620,12 @@ func (w *WeCom) saveBindings() error {
 	for cid, seen := range w.discovered {
 		list = append(list, ChatBinding{
 			ChatID:    cid,
-			Role:      w.bindings[cid],
 			FirstSeen: seen,
 		})
 	}
 	w.mu.RUnlock()
 
-	// 头部加注释(让用户知道这是自动生成的)
-	header := []byte("# wecom_bindings.yaml - 自动生成,手编后会被覆盖\n# role: floor | office | (空)\n# 手动改后请通过 POST /api/v1/restock/wecom/chats/bind 写回\n")
+	header := []byte("# wecom_bindings.yaml - 自动生成,手编后会被覆盖\n")
 	bs, err := yaml.Marshal(list)
 	if err != nil {
 		return err
@@ -765,50 +633,29 @@ func (w *WeCom) saveBindings() error {
 	return os.WriteFile(w.bindingsFile(), append(header, bs...), 0o644)
 }
 
-// BindChat 绑定 chat_id 到 role
-func (w *WeCom) BindChat(chatID, role string) error {
-	if role != "floor" && role != "office" && role != "" {
-		return fmt.Errorf("role must be floor/office/empty")
-	}
-	w.mu.Lock()
-	w.bindings[chatID] = role
-	if _, ok := w.discovered[chatID]; !ok {
-		w.discovered[chatID] = time.Now()
-	}
-	w.mu.Unlock()
-	return w.saveBindings()
-}
+// =====================================================================
+// 公共访问
+// =====================================================================
 
-// ListChats 列出所有已知 chat
-func (w *WeCom) ListChats() []ChatBinding {
-	w.mu.RLock()
-	defer w.mu.RUnlock()
-	out := make([]ChatBinding, 0, len(w.discovered))
-	for cid, seen := range w.discovered {
-		out = append(out, ChatBinding{
-			ChatID:    cid,
-			Role:      w.bindings[cid],
-			FirstSeen: seen,
-		})
-	}
-	return out
-}
-
-// IsConnected 长连接状态
-func (w *WeCom) IsConnected() bool {
+// Connected 是否已连接
+func (w *WeCom) Connected() bool {
 	w.mu.RLock()
 	defer w.mu.RUnlock()
 	return w.connected
 }
 
-// =====================================================================
-// HTTP helpers (保留供旧代码使用,实际不再调用)
-// =====================================================================
+// DiscoveredChats 列出已发现的 chat_id (用于 admin API)
+func (w *WeCom) DiscoveredChats() []ChatBinding {
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+	out := make([]ChatBinding, 0, len(w.discovered))
+	for cid, seen := range w.discovered {
+		out = append(out, ChatBinding{ChatID: cid, FirstSeen: seen})
+	}
+	return out
+}
 
-// SendAppChatLegacy 兼容旧签名
-func (w *WeCom) SendAppChatLegacy(chatID string) bool { return false }
-
-// Truncate 字符串截断(供同包使用)
+// Truncate 截断字符串 (供日志用)
 func Truncate(s string, n int) string {
 	if len(s) <= n {
 		return s

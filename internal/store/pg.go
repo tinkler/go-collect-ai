@@ -229,6 +229,81 @@ func Migrate(ctx context.Context, pool *pgxpool.Pool) error {
 			created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_pfs_supplier ON promotion_fee_share(supplier_name, share_month DESC)`,
+
+		// ============== restock 模块 (2026-09-02 重构后精简) ==============
+		// 保留 4 张表:
+		//   restock_display_suggest  陈列补货建议
+		//   restock_short_state      短补锁定
+		//   restock_need_purchase    采购计划单
+		//   restock_tick_log         tick 执行日志
+		`CREATE TABLE IF NOT EXISTS restock_display_suggest (
+			branch_no      TEXT NOT NULL,
+			item_no        TEXT NOT NULL,
+			period_date    DATE NOT NULL,
+			suggest_qty    INT NOT NULL DEFAULT 0,
+			inv_snapshot   INT NOT NULL DEFAULT 0,
+			last_period    TEXT NOT NULL DEFAULT '',
+			last_sale_at   TIMESTAMPTZ,
+			last_update_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+			item_name      TEXT NOT NULL DEFAULT '',
+			PRIMARY KEY (branch_no, item_no, period_date)
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_rds_suggest ON restock_display_suggest(branch_no, period_date DESC)`,
+		`CREATE INDEX IF NOT EXISTS idx_rds_item ON restock_display_suggest(item_no)`,
+
+		`CREATE TABLE IF NOT EXISTS restock_short_state (
+			branch_no  TEXT NOT NULL,
+			item_no    TEXT NOT NULL,
+			is_short   BOOLEAN NOT NULL DEFAULT FALSE,
+			short_at   TIMESTAMPTZ,
+			short_user TEXT NOT NULL DEFAULT '',
+			PRIMARY KEY (branch_no, item_no)
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_rss_short ON restock_short_state(branch_no) WHERE is_short = TRUE`,
+
+		`CREATE TABLE IF NOT EXISTS restock_need_purchase (
+			id              BIGSERIAL PRIMARY KEY,
+			branch_no       TEXT NOT NULL,
+			item_no         TEXT NOT NULL,
+			item_name       TEXT NOT NULL DEFAULT '',
+			barcode         TEXT NOT NULL DEFAULT '',
+			supplier_name   TEXT NOT NULL DEFAULT '',
+			suggest_qty     INT NOT NULL DEFAULT 0,
+			trigger_kind    TEXT NOT NULL,
+			trigger_task_id TEXT NOT NULL DEFAULT '',
+			status          TEXT NOT NULL DEFAULT 'pending',
+			created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+			updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+			exported_at     TIMESTAMPTZ
+		)`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS uq_rnp_branch_item_pending
+			ON restock_need_purchase(branch_no, item_no) WHERE status = 'pending'`,
+		`CREATE INDEX IF NOT EXISTS idx_rnp_status ON restock_need_purchase(branch_no, status)`,
+		`CREATE INDEX IF NOT EXISTS idx_rnp_supplier ON restock_need_purchase(supplier_name, created_at DESC)`,
+
+		`CREATE TABLE IF NOT EXISTS restock_tick_log (
+			id           BIGSERIAL PRIMARY KEY,
+			branch_no    TEXT NOT NULL,
+			period       TEXT NOT NULL,
+			tick_at      TIMESTAMPTZ NOT NULL,
+			window_from  TIMESTAMPTZ NOT NULL,
+			window_to    TIMESTAMPTZ NOT NULL,
+			status       TEXT NOT NULL,
+			error_msg    TEXT,
+			items_count  INT NOT NULL DEFAULT 0,
+			created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_rtl_branch_status ON restock_tick_log(branch_no, status, created_at DESC)`,
+
+		// 2026-09-02 重构: 删 4 张旧表
+		//   - restock_task           旧 ROP 触发 task 体系
+		//   - restock_feedback       旧反馈审计 (新版不再需要, 写 display_suggest.last_update_at 已能体现)
+		//   - restock_sales_watch    旧 R2/R2b 24h 销售观测
+		//   - supplier_reliability   旧 LLM 调量用 fill_rate
+		`DROP TABLE IF EXISTS restock_task CASCADE`,
+		`DROP TABLE IF EXISTS restock_feedback CASCADE`,
+		`DROP TABLE IF EXISTS restock_sales_watch CASCADE`,
+		`DROP TABLE IF EXISTS supplier_reliability CASCADE`,
 	}
 	for _, s := range stmts {
 		if _, err := pool.Exec(ctx, s); err != nil {
