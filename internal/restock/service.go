@@ -500,11 +500,16 @@ func (s *Service) LoadItemDict(ctx context.Context) error {
 	}
 	s.itemLock.Lock()
 	defer s.itemLock.Unlock()
+	// 2026-09-03: cube 端 t_bd_item_info.item_no 是 CHAR 类型,SQL 没 RTRIM
+	//   返回 "00001               " (20 位带空格),但 display_suggest.item_no 是
+	//   display_restock_window 写入的 (RTRIM 后 "00001",5 位)
+	//   → 字典 key 必须 RTRIM 才能跟 PG 查到的 item_no 对上
+	trimmed := func(s string) string { return strings.TrimSpace(s) }
 	for _, r := range rows {
-		itemNo := asAnyString(r["barcode"])
-		clsno := asAnyString(r["clsno"])
+		itemNo := trimmed(asAnyString(r["barcode"]))
+		clsno := trimmed(asAnyString(r["clsno"]))
 		clsname := asAnyString(r["clsname"])
-		unit := asAnyString(r["unit"])
+		unit := trimmed(asAnyString(r["unit"]))
 		if itemNo != "" {
 			s.clsNoDict[itemNo] = clsno
 			if unit != "" {
