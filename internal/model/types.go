@@ -118,10 +118,14 @@ type SkuRow struct {
 	PlanItemName string `json:"plan_item_name,omitempty"`
 	PlanBarcode  string `json:"plan_barcode,omitempty"`
 	PlanQty      *int   `json:"plan_qty,omitempty"`
-	// 2026-09-03: hbpos t_bd_item_info 反查的商品内码 (cube barcode → item_no 映射)
+	// 2026-09-03: hbpos t_bd_item_info 反查的商品内码 (cube item_no 维度)
 	//   handler 层 enrichRowsWithItemNo 填充,不入库
 	//   为空时前端 fallback 用 matched_barcode (条形码) — 不阻塞业务
 	ItemNo string `json:"item_no,omitempty"`
+	// 2026-09-03: 商品计量单位 (hbpos t_bd_item_info.unit_no)
+	//   handler 层 enrichRowsWithItemNo 顺便带回,不入库
+	//   为空时前端用通用单位兜底(件/瓶/包) 或 仅显示 qty
+	Unit string `json:"unit,omitempty"`
 }
 
 // ============== 模板 (Phase A 已删除,2026-09-02) ==============
