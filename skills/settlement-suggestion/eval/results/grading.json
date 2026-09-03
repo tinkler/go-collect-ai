@@ -1,0 +1,169 @@
+{
+  "skill": "settlement-suggestion",
+  "version": "1.0.0",
+  "run_at": "2026-09-02T10:18:55Z",
+  "summary": {
+    "total": 4,
+    "passed": 4,
+    "failed": 0,
+    "pass_rate": 1.0
+  },
+  "cases": [
+    {
+      "id": "case-001",
+      "prompt": "汇一这个月要结多少?",
+      "status": "pass",
+      "passed": 9,
+      "total": 9,
+      "results": [
+        {
+          "check": "body 引用 scripts/calc_share.py",
+          "passed": true,
+          "info": "contains('scripts/calc_share.py')"
+        },
+        {
+          "check": "body 引用 scripts/assess_investment.py",
+          "passed": true,
+          "info": "contains('scripts/assess_investment.py')"
+        },
+        {
+          "check": "body 引用 references/coefficient_defaults.md",
+          "passed": true,
+          "info": "contains('references/coefficient_defaults.md')"
+        },
+        {
+          "check": "body 引用 references/payment_cycle_guide.md",
+          "passed": true,
+          "info": "contains('references/payment_cycle_guide.md')"
+        },
+        {
+          "check": "run_script scripts/calc_share.py rc",
+          "passed": true,
+          "info": "rc=0"
+        },
+        {
+          "check": "json_field(overlap_days)",
+          "passed": true,
+          "info": "json_field(overlap_days) == 30, got 30"
+        },
+        {
+          "check": "json_field(month_share)",
+          "passed": true,
+          "info": "json_field(month_share) == 5000.0, got 5000.0"
+        },
+        {
+          "check": "read_file references/coefficient_defaults.md 非空",
+          "passed": true,
+          "info": "len=1547"
+        },
+        {
+          "check": "read_file references/payment_cycle_guide.md 非空",
+          "passed": true,
+          "info": "len=677"
+        }
+      ]
+    },
+    {
+      "id": "case-002",
+      "prompt": "618 堆头费怎么分摊?",
+      "status": "pass",
+      "passed": 7,
+      "total": 7,
+      "results": [
+        {
+          "check": "description 含触发词 '618'",
+          "passed": true,
+          "info": "contains('618')"
+        },
+        {
+          "check": "body 引用 scripts/calc_share.py",
+          "passed": true,
+          "info": "contains('scripts/calc_share.py')"
+        },
+        {
+          "check": "body 引用 references/fee_kind_taxonomy.md",
+          "passed": true,
+          "info": "contains('references/fee_kind_taxonomy.md')"
+        },
+        {
+          "check": "run_script scripts/calc_share.py rc",
+          "passed": true,
+          "info": "rc=0"
+        },
+        {
+          "check": "json_field(overlap_days)",
+          "passed": true,
+          "info": "json_field(overlap_days) == 30, got 30"
+        },
+        {
+          "check": "json_field(month_share)",
+          "passed": true,
+          "info": "json_field(month_share) == 3000.0, got 3000.0"
+        },
+        {
+          "check": "read_file references/fee_kind_taxonomy.md 非空",
+          "passed": true,
+          "info": "len=1023"
+        }
+      ]
+    },
+    {
+      "id": "case-003",
+      "prompt": "这月促销费下月到期,提醒我",
+      "status": "pass",
+      "passed": 2,
+      "total": 2,
+      "results": [
+        {
+          "check": "body 引用 references/payment_cycle_guide.md",
+          "passed": true,
+          "info": "contains('references/payment_cycle_guide.md')"
+        },
+        {
+          "check": "read_file references/payment_cycle_guide.md 非空",
+          "passed": true,
+          "info": "len=677"
+        }
+      ]
+    },
+    {
+      "id": "case-004",
+      "prompt": "汇一是战略供应商,投资比例能调高吗?",
+      "status": "pass",
+      "passed": 6,
+      "total": 6,
+      "results": [
+        {
+          "check": "body 引用 scripts/assess_investment.py",
+          "passed": true,
+          "info": "contains('scripts/assess_investment.py')"
+        },
+        {
+          "check": "body 引用 references/scenario_adjustments.md",
+          "passed": true,
+          "info": "contains('references/scenario_adjustments.md')"
+        },
+        {
+          "check": "run_script scripts/assess_investment.py rc",
+          "passed": true,
+          "info": "rc=0"
+        },
+        {
+          "check": "json_field(investment_weight)",
+          "passed": true,
+          "info": "json_field(investment_weight) == 1.7, got 1.7"
+        },
+        {
+          "check": "contains(rationale)",
+          "passed": true,
+          "info": "contains('strategic')"
+        },
+        {
+          "check": "read_file references/scenario_adjustments.md 非空",
+          "passed": true,
+          "info": "len=1428"
+        }
+      ]
+    }
+  ]
+}

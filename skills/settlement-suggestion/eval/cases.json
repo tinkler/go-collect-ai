@@ -1,0 +1,49 @@
+{
+  "skill": "settlement-suggestion",
+  "version": "1.0.0",
+  "cases": [
+    {
+      "id": "case-001",
+      "prompt": "汇一这个月要结多少?",
+      "context": {"today": "2026-09-02"},
+      "expected_skill": "settlement-suggestion",
+      "expected_output_keywords": ["汇一", "结算", "建议", "金额"],
+      "expected_script_path": ["scripts/calc_share.py", "scripts/assess_investment.py"],
+      "expected_reference_path": ["references/coefficient_defaults.md", "references/payment_cycle_guide.md"],
+      "script_path": "scripts/calc_share.py",
+      "script_args": {"amount": 5000, "period_start": "2026-09-01", "period_end": "2026-09-30", "month": "2026-09"}
+    },
+    {
+      "id": "case-002",
+      "prompt": "618 堆头费怎么分摊?",
+      "context": {"today": "2026-06-15"},
+      "expected_skill": "settlement-suggestion",
+      "expected_output_keywords": ["堆头", "分摊", "618"],
+      "expected_script_path": ["scripts/calc_share.py"],
+      "expected_reference_path": ["references/fee_kind_taxonomy.md"],
+      "script_path": "scripts/calc_share.py",
+      "script_args": {"amount": 3000, "period_start": "2026-06-01", "period_end": "2026-06-30", "month": "2026-06"}
+    },
+    {
+      "id": "case-003",
+      "prompt": "这月促销费下月到期,提醒我",
+      "context": {"today": "2026-09-02"},
+      "expected_skill": "settlement-suggestion",
+      "expected_output_keywords": ["促销", "到期", "续约"],
+      "expected_script_path": [],
+      "expected_reference_path": ["references/payment_cycle_guide.md"],
+      "script_args": null
+    },
+    {
+      "id": "case-004",
+      "prompt": "汇一是战略供应商,投资比例能调高吗?",
+      "context": {"today": "2026-09-02", "supplier_tier": "strategic"},
+      "expected_skill": "settlement-suggestion",
+      "expected_output_keywords": ["投资", "系数", "战略"],
+      "expected_script_path": ["scripts/assess_investment.py"],
+      "expected_reference_path": ["references/scenario_adjustments.md"],
+      "script_path": "scripts/assess_investment.py",
+      "script_args": {"month_share": 1500, "month_forecast": 10000, "supplier_tier": "strategic"}
+    }
+  ]
+}

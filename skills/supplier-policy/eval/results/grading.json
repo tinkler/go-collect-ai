@@ -1,0 +1,209 @@
+{
+  "skill": "supplier-policy",
+  "version": "1.0.0",
+  "run_at": "2026-09-02T10:18:55Z",
+  "summary": {
+    "total": 4,
+    "passed": 4,
+    "failed": 0,
+    "pass_rate": 1.0
+  },
+  "cases": [
+    {
+      "id": "case-001",
+      "prompt": "汇一是自采供应商,堆头他们出,榄菊不让退",
+      "status": "pass",
+      "passed": 12,
+      "total": 12,
+      "results": [
+        {
+          "check": "body 引用 scripts/parse_policy_utterance.py",
+          "passed": true,
+          "info": "contains('scripts/parse_policy_utterance.py')"
+        },
+        {
+          "check": "body 引用 scripts/check_concentration.py",
+          "passed": true,
+          "info": "contains('scripts/check_concentration.py')"
+        },
+        {
+          "check": "body 引用 references/key_semantics.md",
+          "passed": true,
+          "info": "contains('references/key_semantics.md')"
+        },
+        {
+          "check": "body 引用 references/utterance_patterns.md",
+          "passed": true,
+          "info": "contains('references/utterance_patterns.md')"
+        },
+        {
+          "check": "run_script scripts/parse_policy_utterance.py rc",
+          "passed": true,
+          "info": "rc=0"
+        },
+        {
+          "check": "json_field(items[0].supplier)",
+          "passed": true,
+          "info": "json_field(items[0].supplier) == '汇一', got '汇一'"
+        },
+        {
+          "check": "json_field(items[0].key)",
+          "passed": true,
+          "info": "json_field(items[0].key) == 'is_self_procure', got 'is_self_procure'"
+        },
+        {
+          "check": "json_field(items[1].key)",
+          "passed": true,
+          "info": "json_field(items[1].key) == 'has_duitou', got 'has_duitou'"
+        },
+        {
+          "check": "json_field(items[2].key)",
+          "passed": true,
+          "info": "json_field(items[2].key) == 'allow_return', got 'allow_return'"
+        },
+        {
+          "check": "json_field(items[2].supplier)",
+          "passed": true,
+          "info": "json_field(items[2].supplier) == '榄菊', got '榄菊'"
+        },
+        {
+          "check": "read_file references/key_semantics.md 非空",
+          "passed": true,
+          "info": "len=2553"
+        },
+        {
+          "check": "read_file references/utterance_patterns.md 非空",
+          "passed": true,
+          "info": "len=2388"
+        }
+      ]
+    },
+    {
+      "id": "case-002",
+      "prompt": "以后不进 XX 供应商,拉黑",
+      "status": "pass",
+      "passed": 10,
+      "total": 10,
+      "results": [
+        {
+          "check": "description 含触发词 '供应商'",
+          "passed": true,
+          "info": "contains('供应商')"
+        },
+        {
+          "check": "description 含触发词 '拉黑'",
+          "passed": true,
+          "info": "contains('拉黑')"
+        },
+        {
+          "check": "body 引用 scripts/parse_policy_utterance.py",
+          "passed": true,
+          "info": "contains('scripts/parse_policy_utterance.py')"
+        },
+        {
+          "check": "body 引用 references/key_semantics.md",
+          "passed": true,
+          "info": "contains('references/key_semantics.md')"
+        },
+        {
+          "check": "body 引用 references/anti_kickback_signals.md",
+          "passed": true,
+          "info": "contains('references/anti_kickback_signals.md')"
+        },
+        {
+          "check": "run_script scripts/parse_policy_utterance.py rc",
+          "passed": true,
+          "info": "rc=0"
+        },
+        {
+          "check": "json_field(items[0].key)",
+          "passed": true,
+          "info": "json_field(items[0].key) == 'block_entry', got 'block_entry'"
+        },
+        {
+          "check": "json_field(items[0].value)",
+          "passed": true,
+          "info": "json_field(items[0].value) == True, got True"
+        },
+        {
+          "check": "read_file references/key_semantics.md 非空",
+          "passed": true,
+          "info": "len=2553"
+        },
+        {
+          "check": "read_file references/anti_kickback_signals.md 非空",
+          "passed": true,
+          "info": "len=1224"
+        }
+      ]
+    },
+    {
+      "id": "case-003",
+      "prompt": "我家供应商太集中了,要不要找备选?",
+      "status": "pass",
+      "passed": 8,
+      "total": 8,
+      "results": [
+        {
+          "check": "body 引用 scripts/check_concentration.py",
+          "passed": true,
+          "info": "contains('scripts/check_concentration.py')"
+        },
+        {
+          "check": "body 引用 references/anti_kickback_signals.md",
+          "passed": true,
+          "info": "contains('references/anti_kickback_signals.md')"
+        },
+        {
+          "check": "body 引用 references/supplier_tiering.md",
+          "passed": true,
+          "info": "contains('references/supplier_tiering.md')"
+        },
+        {
+          "check": "run_script scripts/check_concentration.py rc",
+          "passed": true,
+          "info": "rc=0"
+        },
+        {
+          "check": "json_field(tier)",
+          "passed": true,
+          "info": "json_field(tier) == 'high', got 'high'"
+        },
+        {
+          "check": "contains(warning)",
+          "passed": true,
+          "info": "contains('0.25')"
+        },
+        {
+          "check": "read_file references/anti_kickback_signals.md 非空",
+          "passed": true,
+          "info": "len=1224"
+        },
+        {
+          "check": "read_file references/supplier_tiering.md 非空",
+          "passed": true,
+          "info": "len=1287"
+        }
+      ]
+    },
+    {
+      "id": "case-004",
+      "prompt": "这家供应商怎么样,值不值得长期合作?",
+      "status": "pass",
+      "passed": 2,
+      "total": 2,
+      "results": [
+        {
+          "check": "body 引用 references/supplier_tiering.md",
+          "passed": true,
+          "info": "contains('references/supplier_tiering.md')"
+        },
+        {
+          "check": "read_file references/supplier_tiering.md 非空",
+          "passed": true,
+          "info": "len=1287"
+        }
+      ]
+    }
+  ]
+}

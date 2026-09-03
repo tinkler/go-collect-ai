@@ -1,0 +1,50 @@
+{
+  "skill": "seasonal-buying",
+  "version": "1.0.0",
+  "cases": [
+    {
+      "id": "case-001",
+      "prompt": "下个月要过节了,要不要备货?",
+      "context": {"today": "2026-09-02", "user_role": "owner"},
+      "expected_skill": "seasonal-buying",
+      "expected_output_keywords": ["中秋", "23", "建议", "备货"],
+      "expected_script_path": ["scripts/compute_window.py"],
+      "expected_reference_path": ["references/chinese_holidays_2026.md", "references/season_taxonomy.md"],
+      "script_path": "scripts/compute_window.py",
+      "script_args": {"today": "2026-09-02"}
+    },
+    {
+      "id": "case-002",
+      "prompt": "雪糕到了,要不要备点?",
+      "context": {"today": "2026-05-15", "user_role": "owner"},
+      "expected_skill": "seasonal-buying",
+      "expected_output_keywords": ["雪糕季", "换季", "备货", "季节"],
+      "expected_script_path": ["scripts/compute_window.py"],
+      "expected_reference_path": ["references/season_taxonomy.md"],
+      "script_path": "scripts/compute_window.py",
+      "script_args": {"today": "2026-05-15"}
+    },
+    {
+      "id": "case-003",
+      "prompt": "春节前 3 天要备 5 倍量,帮我看看",
+      "context": {"today": "2026-02-01", "user_role": "owner"},
+      "expected_skill": "seasonal-buying",
+      "expected_output_keywords": ["春节", "8", "备货", "倍"],
+      "expected_script_path": ["scripts/compute_window.py"],
+      "expected_reference_path": ["references/chinese_holidays_2026.md"],
+      "script_path": "scripts/compute_window.py",
+      "script_args": {"today": "2026-02-01"}
+    },
+    {
+      "id": "case-004",
+      "prompt": "618 来了,需要备什么?",
+      "context": {"today": "2026-05-30", "user_role": "buyer"},
+      "expected_skill": "seasonal-buying",
+      "expected_output_keywords": ["618", "促销", "备货"],
+      "expected_script_path": ["scripts/compute_window.py"],
+      "expected_reference_path": ["references/chinese_holidays_2026.md"],
+      "script_path": "scripts/compute_window.py",
+      "script_args": {"today": "2026-05-30"}
+    }
+  ]
+}

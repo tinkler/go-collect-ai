@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
@@ -11,11 +12,13 @@ import (
 	"time"
 
 	"github.com/tinkler/collect-ai/internal/agent"
+	"github.com/tinkler/collect-ai/internal/agent/skill"
 	"github.com/tinkler/collect-ai/internal/api"
 	"github.com/tinkler/collect-ai/internal/api/handler"
 	"github.com/tinkler/collect-ai/internal/auth"
 	"github.com/tinkler/collect-ai/internal/business"
 	"github.com/tinkler/collect-ai/internal/config"
+	"github.com/tinkler/collect-ai/internal/model"
 
 	"github.com/tinkler/collect-ai/internal/parser"
 	parseragent "github.com/tinkler/collect-ai/internal/parser/agent"
@@ -63,10 +66,14 @@ func main() {
 	log.Printf("[main] PG migrate OK")
 
 	sessionRepo := store.NewSessionRepo(pool)
-	templateRepo := store.NewTemplateRepo(pool)
+	strategyRepo := store.NewStrategyRepo(pool) // Phase A (2026-09-02)
 
-	ocrClient := bigmodel.NewOcrClient(cfg.BigModelAPIKey, cfg.BigModelBase, cfg.OcrTimeoutSec)
+	// Phase B+ (2026-09-03): VLM-only 模式, 不再需要 OCR client
+	//   老: ocrClient (hand_write) + llmClient (glm-4-flash) → 0 rows (OCR 严重误读)
+	//   新: vlmClient (glm-4v 多模态) → 13位 barcode 100% 正确, qty 100% 正确
+	//   llmClient 保留给 seasonClassifier 等用
 	llmClient := bigmodel.NewLlmClient(cfg.BigModelAPIKey, cfg.BigModelBase, cfg.LlmTimeoutSec)
+	vlmClient := bigmodel.NewVlmClient(cfg.BigModelAPIKey, cfg.BigModelBase, cfg.LlmTimeoutSec+30)
 	// 数据源: 启动后即固定,只走 .env / cfg 配置 (2026-08-31 简化,移除 dsstate 持久化 + 切换 API)
 	initialDS := cfg.DataSource
 	log.Printf("[main] datasource: %s (from env/cfg, 启动后即固定)", initialDS)
@@ -91,8 +98,6 @@ func main() {
 	// 2026-09-02: 所有 cube 调用统一走 Gateway,业务代码不直接 import parser/agent
 	//   Gateway 持 CubeClient interface,*agent.Client 自动满足
 	gateway := business.NewGateway(agentClient, businessReg)
-
-	psr := parser.New(ocrClient, llmClient, agentClient)
 
 	gin.SetMode(gin.ReleaseMode)
 
@@ -133,6 +138,10 @@ func main() {
 	cashRepo := store.NewCashBalanceRepo(pool)        // W4
 	payRepo := store.NewSupplierPaymentRepo(pool)     // W4
 
+	// Phase A (2026-09-02): BizExecutor 业务字段执行器
+	//   Orchestrator 的 SkuLoader 用它从 cube 拉该 supplier 的 SKU 库
+	bizExecutor := business.NewExecutorFromGateway(gateway)
+
 	// W2.5 + W4.3: Agent Runner (W2 wecom 桥 + W2.5 HTTP 触发共用)
 	//   agentEnabled 跟 W2 wecom 桥保持一致 (用同一个 env)
 	//   agentRunner 可能为 nil (LLM 不可用时 tools-only 模式), handler.AgentChat 走降级
@@ -157,24 +166,24 @@ func main() {
 	authSvc := auth.NewService(authStore, authSign, authWeCom)
 
 	h := &handler.Handler{
-		UploadDir:           cfg.UploadDir,
-		PublicBase:          cfg.PublicBaseURL,
-		MaxUpload:           int64(cfg.MaxUploadMB) * 1024 * 1024,
-		Parser:              psr,
-		Agent:               agentClient,
-		BusinessReg:         businessReg,
-		Sessions:            sessionRepo,
-		Templates:           templateRepo,
-		CashRepo:            cashRepo,    // W4
-		PayRepo:             payRepo,     // W4
-		RestockSvc:          restockSvc, // 2026-08-28: 采购收货单附加 plan_qty
-		AlertSvc:            alertSvc,   // 2026-09-01 W3.2: 采购订单智能提醒
-		AgentRunner:         agentRunner, // W2.5: H5 端 Agent chat
-		FuzzyDistance:       cfg.FuzzyDistance,
-		DefaultOcrModel:     cfg.OCRModel,
-		DefaultLlmModel:     cfg.LLMModel,
-		DefaultUseLlm:       cfg.UseLlm,
-		DefaultFuzzyDist:    cfg.FuzzyDistance,
+		UploadDir:       cfg.UploadDir,
+		PublicBase:      cfg.PublicBaseURL,
+		MaxUpload:       int64(cfg.MaxUploadMB) * 1024 * 1024,
+		// Phase A (2026-09-02): Orchestrator 字段在 agentRunner 初始化后填(下方)
+		Orchestrator:    nil,
+		Agent:           agentClient,
+		BizExecutor:     bizExecutor, // 2026-09-02 新增
+		BusinessReg:     businessReg,
+		Sessions:        sessionRepo,
+		Strategies:      strategyRepo, // Phase A 新增
+		// SkillStore + Orchestrator 在 agentRunner 初始化后注入
+		SkillStore:      nil,
+		CashRepo:        cashRepo,    // W4
+		PayRepo:         payRepo,     // W4
+		RestockSvc:      restockSvc, // 2026-08-28: 采购收货单附加 plan_qty
+		AlertSvc:        alertSvc,   // 2026-09-01 W3.2: 采购订单智能提醒
+		AgentRunner:     agentRunner, // W2.5: H5 端 Agent chat
+		// Phase B+ (2026-09-03): 删 DefaultOcrModel/DefaultLlmModel 字段 (VLM 内部固定)
 	}
 
 	// 注册企微消息回调 (新版 restock 不推群, 只做消息接收)
@@ -207,6 +216,41 @@ func main() {
 		}
 	} else {
 		log.Printf("[main] Agent Bridge 未启动 (enabled=%v, chats=%d)", agentEnabled, len(agentChatIDs))
+	}
+
+	// Phase A (2026-09-02): 注入 SkillStore + Orchestrator 到 handler
+	//   - agentRunner 启动后才有 skillStore (内部用 NewStore + Load)
+	//   - Orchestrator 需要 SkuLoader (从 BizExecutor 拿)
+	//   - 即使 Agent 未启用 (COLLECTAI_AGENT_ENABLED=false), 也构造一个轻量 skill store
+	//     让 OCR 解析不依赖 Agent runner,但 skill 系统是 Loader 的事
+	var skillStore *skill.Store
+	if agentRunner != nil {
+		skillStore = agentRunner.SkillStore()
+	} else {
+		ss, err := agent.NewStandaloneSkillStore(os.Getenv("COLLECTAI_SKILL_ROOTS"))
+		if err != nil {
+			log.Printf("[main] NewStandaloneSkillStore 失败: %v (Orchestrator 将不可用)", err)
+		} else {
+			skillStore = ss
+		}
+	}
+	h.SkillStore = skillStore
+	if skillStore != nil {
+		skuLoader := bizSkuLoaderAdapter{exec: bizExecutor}
+		// Phase B+ (2026-09-03): VLM-only, vlmModel 走 env VLM_MODEL (默认 glm-4v)
+		vlmModel := strings.TrimSpace(os.Getenv("VLM_MODEL"))
+		if vlmModel == "" {
+			vlmModel = "glm-4v"
+		}
+		orch, err := parser.NewOrchestrator(vlmClient, skuLoader, strategyRepo, skillStore, vlmModel)
+		if err != nil {
+			log.Printf("[main] Orchestrator 构造失败: %v (CreateSession 将不可用)", err)
+		} else {
+			h.Orchestrator = orch
+			log.Printf("[main] Orchestrator ready (skill count=%d)", skillStore.Count())
+		}
+	} else {
+		log.Printf("[main] SkillStore 不可用,Orchestrator 暂不可用(创建 session 会报 skill 缺失)")
 	}
 
 	// W3.3 堆头费到期 cron: 启动时跑一次 + 每日 21:00 跑
@@ -544,4 +588,46 @@ func runMonthly(ctx context.Context, fn func(context.Context), day, hour, minute
 		case <-timer.C:
 		}
 	}
+}
+
+// bizSkuLoaderAdapter Phase A (2026-09-02): 把 business.Executor 适配成 parser.SkuLoader
+//   - 调 bizExecutor.SearchProducts(supplier, limit) 拿业务字段 map
+//   - 转 []model.SkuRow 给 SkuMatcher
+type bizSkuLoaderAdapter struct {
+	exec *business.Executor
+}
+
+func (a bizSkuLoaderAdapter) LoadBySupplier(ctx context.Context, supplier string, limit int) ([]model.SkuRecord, error) {
+	bizRows, err := a.exec.SearchProducts(supplier, limit)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]model.SkuRecord, 0, len(bizRows))
+	for _, br := range bizRows {
+		rec := model.SkuRecord{
+			Barcode:      asAnyString(br["barcode"]),
+			Name:         asAnyString(br["product_name"]),
+			MainSuppId:   asAnyString(br["supplier_id"]),
+			MainSuppName: asAnyString(br["supplier_name"]),
+			SrcSheet:     asAnyString(br["category"]),
+		}
+		if v, ok := br["stock_qty"]; ok && v != nil {
+			if f, ok := v.(float64); ok {
+				f2 := f
+				rec.StockQty = &f2
+			}
+		}
+		out = append(out, rec)
+	}
+	return out, nil
+}
+
+func asAnyString(v any) string {
+	if v == nil {
+		return ""
+	}
+	if s, ok := v.(string); ok {
+		return s
+	}
+	return fmt.Sprintf("%v", v)
 }

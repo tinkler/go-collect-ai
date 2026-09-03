@@ -97,10 +97,13 @@ func NewRouter(h *handler.Handler, cfg *config.Config, restockSvc *restock.Servi
 			authed.GET("/suppliers", auth.RequirePerm("session:read"), h.ListSuppliers)
 			authed.GET("/suppliers/by-brand", auth.RequirePerm("session:read"), h.ListSuppliersByBrand)
 
-			// templates
-			authed.GET("/templates", auth.RequirePerm("session:read"), h.ListTemplates)
-			authed.GET("/templates/all", auth.RequirePerm("session:read"), h.ListAllTemplates)
-			authed.POST("/templates/sync", auth.RequirePerm("admin"), h.SyncTemplates)
+			// Phase A (2026-09-02): supplier_parse_strategy 端点 (取代旧 /templates)
+			//   - 查:     GET  /suppliers/:name/strategy
+			//   - 改:     PUT  /suppliers/:name/strategy
+			//   - 优化:   POST /suppliers/:name/strategy/optimize (Phase A 占位, Phase B 接 LLM)
+			authed.GET("/suppliers/:name/strategy", auth.RequirePerm("session:read"), h.GetStrategy)
+			authed.PUT("/suppliers/:name/strategy", auth.RequirePerm("session:update"), h.UpsertStrategy)
+			authed.POST("/suppliers/:name/strategy/optimize", auth.RequirePerm("admin"), h.OptimizeStrategy)
 
 			// W4: 现金日报 + 供应商结算建议
 			authed.POST("/cash/balance", auth.RequirePerm("cash:write"), h.SetCashBalance)

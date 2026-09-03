@@ -1,0 +1,169 @@
+{
+  "skill": "restock-strategy",
+  "version": "1.0.0",
+  "run_at": "2026-09-02T10:18:54Z",
+  "summary": {
+    "total": 4,
+    "passed": 4,
+    "failed": 0,
+    "pass_rate": 1.0
+  },
+  "cases": [
+    {
+      "id": "case-001",
+      "prompt": "这个 P0 是什么意思,要立即发吗?",
+      "status": "pass",
+      "passed": 8,
+      "total": 8,
+      "results": [
+        {
+          "check": "description 含触发词 'P0'",
+          "passed": true,
+          "info": "contains('P0')"
+        },
+        {
+          "check": "body 引用 scripts/days_until_stockout.py",
+          "passed": true,
+          "info": "contains('scripts/days_until_stockout.py')"
+        },
+        {
+          "check": "body 引用 scripts/compute_suggest_qty.py",
+          "passed": true,
+          "info": "contains('scripts/compute_suggest_qty.py')"
+        },
+        {
+          "check": "body 引用 references/priority_semantics.md",
+          "passed": true,
+          "info": "contains('references/priority_semantics.md')"
+        },
+        {
+          "check": "run_script scripts/days_until_stockout.py rc",
+          "passed": true,
+          "info": "rc=0"
+        },
+        {
+          "check": "json_field(priority)",
+          "passed": true,
+          "info": "json_field(priority) == 'P0', got 'P0'"
+        },
+        {
+          "check": "contains(rationale)",
+          "passed": true,
+          "info": "contains('0.17')"
+        },
+        {
+          "check": "read_file references/priority_semantics.md 非空",
+          "passed": true,
+          "info": "len=1197"
+        }
+      ]
+    },
+    {
+      "id": "case-002",
+      "prompt": "汇一瓶装水建议补 60 瓶,够吗?",
+      "status": "pass",
+      "passed": 7,
+      "total": 7,
+      "results": [
+        {
+          "check": "body 引用 scripts/compute_suggest_qty.py",
+          "passed": true,
+          "info": "contains('scripts/compute_suggest_qty.py')"
+        },
+        {
+          "check": "body 引用 references/category_lead_days.md",
+          "passed": true,
+          "info": "contains('references/category_lead_days.md')"
+        },
+        {
+          "check": "run_script scripts/compute_suggest_qty.py rc",
+          "passed": true,
+          "info": "rc=0"
+        },
+        {
+          "check": "json_field(final_qty)",
+          "passed": true,
+          "info": "json_field(final_qty) == 276, got 276"
+        },
+        {
+          "check": "json_field(fill_rate_adjusted)",
+          "passed": true,
+          "info": "json_field(fill_rate_adjusted) == 268.42, got 268.42"
+        },
+        {
+          "check": "contains(rationale)",
+          "passed": true,
+          "info": "contains('0.95')"
+        },
+        {
+          "check": "read_file references/category_lead_days.md 非空",
+          "passed": true,
+          "info": "len=1028"
+        }
+      ]
+    },
+    {
+      "id": "case-003",
+      "prompt": "为什么这条 P1 自动升到 P0 了?",
+      "status": "pass",
+      "passed": 4,
+      "total": 4,
+      "results": [
+        {
+          "check": "description 含触发词 'P0'",
+          "passed": true,
+          "info": "contains('P0')"
+        },
+        {
+          "check": "description 含触发词 'P1'",
+          "passed": true,
+          "info": "contains('P1')"
+        },
+        {
+          "check": "body 引用 references/escalation_rules.md",
+          "passed": true,
+          "info": "contains('references/escalation_rules.md')"
+        },
+        {
+          "check": "read_file references/escalation_rules.md 非空",
+          "passed": true,
+          "info": "len=821"
+        }
+      ]
+    },
+    {
+      "id": "case-004",
+      "prompt": "这家供应商靠谱吗,补货量要调吗?",
+      "status": "pass",
+      "passed": 5,
+      "total": 5,
+      "results": [
+        {
+          "check": "body 引用 scripts/supplier_fill_rate.py",
+          "passed": true,
+          "info": "contains('scripts/supplier_fill_rate.py')"
+        },
+        {
+          "check": "run_script scripts/supplier_fill_rate.py rc",
+          "passed": true,
+          "info": "rc=0"
+        },
+        {
+          "check": "json_field(fill_rate)",
+          "passed": true,
+          "info": "json_field(fill_rate) == 0.92, got 0.92"
+        },
+        {
+          "check": "json_field(tier)",
+          "passed": true,
+          "info": "json_field(tier) == 'fair', got 'fair'"
+        },
+        {
+          "check": "json_field(adjustment_factor)",
+          "passed": true,
+          "info": "json_field(adjustment_factor) == 1.11, got 1.11"
+        }
+      ]
+    }
+  ]
+}

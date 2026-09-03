@@ -1,153 +1,34 @@
+// Package parser - 启发式解析 (Phase A, 2026-09-02)
+//
+// 取代旧 Parser.Parser + ParseImageBytes/ParseFile/parseAfterOcr/parseLines/buildUserPrompt
+// 保留:
+//   - heuristicParse: LLM 不可用 / 失败 / 手写供应商时的兜底
+//   - 旧 toSkuRecords 删除 (handler 已用业务字段直接返 model.SkuRecord)
+//
+// 关键的"业务判断"(在 skill 里):
+//   - 拆行规则 → skills/ocr-purchase/SKILL.md 步骤 1
+//   - 规格 vs 数量 → skills/ocr-purchase/SKILL.md 步骤 3
+//   - 数量识别 → skills/ocr-purchase/SKILL.md 步骤 2
+//
+// heuristicParse 只做最朴素的兜底:
+//   - 6-14 位纯数字 → barcode
+//   - 行内最大数字 → qty
+//   - 其它 → name
 package parser
 
 import (
-	"context"
 	"fmt"
 	"log"
 	"strings"
 
 	"github.com/tinkler/collect-ai/internal/model"
-	"github.com/tinkler/collect-ai/internal/parser/agent"
-	"github.com/tinkler/collect-ai/internal/parser/bigmodel"
-	"github.com/tinkler/collect-ai/internal/parser/matcher"
 )
 
-// Parser OCR + LLM + 匹配 完整流程
-//   - useLlm / fuzzy 每次调用传, 不存在 client 上 (per-template 切换)
-type Parser struct {
-	ocr *bigmodel.OcrClient
-	llm *bigmodel.LlmClient
-	agt *agent.Client
-}
-
-func New(ocr *bigmodel.OcrClient, llm *bigmodel.LlmClient, agt *agent.Client) *Parser {
-	return &Parser{ocr: ocr, llm: llm, agt: agt}
-}
-
-// ParseImageBytes 收图 bytes → 返回已匹配的 SkuRow 列表
-//   supplier:     必填, 用于加载 SKU 库
-//   mode:         "inventory" (默认) / "purchase"
-//   customPrompt: 可选, 模板自带 LLM 提示词 (空 = 用 default prompt)
-//   ocrModel:     BigModel OCR tool_type (空 = client 兜底 "hand_write")
-//   llmModel:     BigModel LLM model (空 = client 兜底 "glm-4-flash")
-//   useLlm:       true=LLM / false=纯启发式
-//   fuzzy:        SkuMatcher 模糊匹配距离
-//   → 这 4 个字段都允许 per-template 覆盖, 解析时由 handler 按 template 决议后传入
-func (p *Parser) ParseImageBytes(ctx context.Context, imgBytes []byte, fileName, supplier, mode, customPrompt, ocrModel, llmModel string, useLlm bool, fuzzy int) ([]model.SkuRow, []model.OcrLine, []byte, error) {
-	if p == nil {
-		return nil, nil, nil, fmt.Errorf("parser 未初始化")
-	}
-	if supplier == "" {
-		return nil, nil, nil, fmt.Errorf("supplier 必填")
-	}
-	// 1) OCR
-	raw, err := p.ocr.RecognizeBytes(fileName, imgBytes, ocrModel)
-	if err != nil {
-		return nil, nil, nil, fmt.Errorf("OCR 失败: %w", err)
-	}
-	return p.parseAfterOcr(ctx, raw, imgBytes, supplier, mode, customPrompt, llmModel, useLlm, fuzzy)
-}
-
-// ParseFile 同上, 但从文件读
-func (p *Parser) ParseFile(ctx context.Context, path, supplier, mode, customPrompt, ocrModel, llmModel string, useLlm bool, fuzzy int) ([]model.SkuRow, []model.OcrLine, []byte, error) {
-	imgBytes, err := readFileBytes(path)
-	if err != nil {
-		return nil, nil, nil, err
-	}
-	raw, err := p.ocr.RecognizeFile(path, ocrModel)
-	if err != nil {
-		return nil, nil, nil, fmt.Errorf("OCR 失败: %w", err)
-	}
-	return p.parseAfterOcr(ctx, raw, imgBytes, supplier, mode, customPrompt, llmModel, useLlm, fuzzy)
-}
-
-func (p *Parser) parseAfterOcr(ctx context.Context, rawBlocks []model.OcrWordBlock, imgBytes []byte, supplier, mode, customPrompt, llmModel string, useLlm bool, fuzzy int) ([]model.SkuRow, []model.OcrLine, []byte, error) {
-	// 2) 按 top 分行 + 拆合并行
-	lines := ParseOcrResponse(rawBlocks)
-	log.Printf("[parser] OCR → %d 行", len(lines))
-
-	// 3) 解析行 (LLM 优先, 失败回退启发式)
-	parsed, err := p.parseLines(ctx, lines, mode, customPrompt, llmModel, useLlm)
-	if err != nil {
-		return nil, lines, imgBytes, fmt.Errorf("解析行失败: %w", err)
-	}
-	log.Printf("[parser] 解析 → %d 条 (raw %d 行, use_llm=%v)", len(parsed), len(lines), useLlm)
-
-	// 4) 加载供应商 SKU
-	skus, err := p.agt.LoadSupplierSkus(supplier, 5000)
-	if err != nil {
-		return nil, lines, imgBytes, fmt.Errorf("加载 SKU 失败: %w", err)
-	}
-	log.Printf("[parser] 供应商 [%s] → %d 条 SKU", supplier, len(skus))
-
-	// 5) 级联匹配
-	m := matcher.New(toSkuRecords(skus), fuzzy)
-	rows := make([]model.SkuRow, 0, len(parsed))
-	for i, ocr := range parsed {
-		rows = append(rows, m.Match(ocr, i+1))
-	}
-
-	// 6) 盘点模式: 重算 StockDiff / StockMismatch
-	if mode == string(model.ModeInventory) {
-		for i := range rows {
-			if rows[i].StockQty != nil && rows[i].Qty != nil {
-				diff := float64(*rows[i].Qty) - *rows[i].StockQty
-				rows[i].StockDiff = &diff
-				rows[i].StockMismatch = diff != 0
-				if rows[i].StockMismatch && rows[i].Status == "OK" {
-					rows[i].Status = "盘存差异"
-				}
-			}
-		}
-	}
-	return rows, lines, imgBytes, nil
-}
-
-func (p *Parser) parseLines(ctx context.Context, lines []model.OcrLine, mode, customPrompt, llmModel string, useLlm bool) ([]model.ParsedOcrRow, error) {
-	if !useLlm {
-		return heuristicParse(lines), nil
-	}
-	modeEnum := model.ModeInventory
-	if mode == string(model.ModePurchase) {
-		modeEnum = model.ModePurchase
-	}
-	sysPrompt := customPrompt
-	if sysPrompt == "" {
-		sysPrompt = bigmodel.DefaultSystemPrompt(modeEnum)
-	}
-	userPrompt := buildUserPrompt(lines)
-	content, err := p.llm.ChatCompletion(sysPrompt, userPrompt, llmModel)
-	if err != nil {
-		log.Printf("[parser] LLM 失败, fallback 启发式: %v", err)
-		return heuristicParse(lines), nil
-	}
-	// 调试: dump LLM 原始输出前 500 字符
-	preview := content
-	if len(preview) > 500 {
-		preview = preview[:500] + "..."
-	}
-	log.Printf("[parser] LLM 输出: %s", preview)
-	rows, err := bigmodel.ParseLlmJson(content)
-	if err != nil {
-		log.Printf("[parser] LLM JSON 解析失败, fallback 启发式: %v", err)
-		return heuristicParse(lines), nil
-	}
-	return rows, nil
-}
-
-func buildUserPrompt(lines []model.OcrLine) string {
-	var sb strings.Builder
-	for i, l := range lines {
-		words := make([]string, 0, len(l.Blocks))
-		for _, b := range l.Blocks {
-			words = append(words, b.Words)
-		}
-		fmt.Fprintf(&sb, "[行%d] top=%d  text=\"%s\"\n", i+1, l.Top, strings.Join(words, " "))
-	}
-	return fmt.Sprintf("OCR 识别的文本行如下 (%d 行):\n%s\n\n请按规则解析为 JSON 数组:", len(lines), sb.String())
-}
-
-// heuristicParse LLM 不可用时的兜底: 6-14 位纯数字 → barcode, 短数字 → qty
+// heuristicParse LLM 不可用 / 失败 / 手写供应商时的兜底
+//   - 6-14 位纯数字 → barcode
+//   - 短数字 → qty
+//   - 其它文本 → name
+//   跟旧 parser.go:151 等价 (Phase A 保留, 无变化)
 func heuristicParse(lines []model.OcrLine) []model.ParsedOcrRow {
 	out := make([]model.ParsedOcrRow, 0, len(lines))
 	for _, l := range lines {
@@ -175,9 +56,6 @@ func heuristicParse(lines []model.OcrLine) []model.ParsedOcrRow {
 		}
 		out = append(out, row)
 	}
+	log.Printf("[heuristic] parsed %d lines", len(out))
 	return out
-}
-
-func readFileBytes(path string) ([]byte, error) {
-	return osReadFile(path)
 }

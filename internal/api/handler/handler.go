@@ -16,6 +16,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/tinkler/collect-ai/internal/agent"
+	"github.com/tinkler/collect-ai/internal/agent/skill"
 	"github.com/tinkler/collect-ai/internal/auth"
 	"github.com/tinkler/collect-ai/internal/business"
 	"github.com/tinkler/collect-ai/internal/model"
@@ -28,63 +29,27 @@ import (
 )
 
 // Handler 持有依赖
+//
+// Phase A (2026-09-02): Parser → Orchestrator, TemplateRepo 移除, parse_session.template_id 字段去掉
+//   - 取代原半硬编码 + template 覆盖老路
+//   - 详见 docs/ocr-purchase-skill-architecture.md
 type Handler struct {
-	UploadDir     string
-	PublicBase    string
-	MaxUpload     int64 // bytes
-	Parser        *parser.Parser
-	Agent         *parseragent.Client  // 仅用于 Ping / GetDataSource (2026-09-02: cube 调用已收编到 BizExecutor)
-	BizExecutor   *business.Executor   // 2026-09-02: cube 业务字段调用入口
-	BusinessReg   *business.Registry   // 业务字段映射(products / suppliers 跨数据源)
-	Sessions      *store.SessionRepo
-	Templates     *store.TemplateRepo
-	CashRepo      *store.CashBalanceRepo         // W4: 现金日报
-	PayRepo       *store.SupplierPaymentRepo     // W4: 供应商结算建议
-	RestockSvc    *restock.Service               // 2026-08-28: 采购收货单附加 plan_qty
-	AlertSvc      *purchasealert.Service         // 2026-09-01 W3.2: 采购订单智能提醒
-	AgentRunner   *agent.Runner                  // W2.5: H5 触发 Agent
-	FuzzyDistance int // rematch 用 (旧接口保留)
-	// 兜底值 (per-template 没配时, 用这几个)
-	DefaultOcrModel  string
-	DefaultLlmModel  string
-	DefaultUseLlm    bool
-	DefaultFuzzyDist int
-}
-
-// resolveTemplateConfig 根据 template_id 查 PG, 合并兜底值
-//   - 优先顺序: 显式 override (customPrompt) > template.X > handler 兜底 (env)
-//   - template 不存在 / template_id 为空 → 直接用兜底
-//   - use_llm / fuzzy_distance 是 nullable (DB NULL / Go nil) → 区分"未配"和"显式 false / 0"
-func (h *Handler) resolveTemplateConfig(ctx context.Context, templateID, customPrompt string) (effectivePrompt, effectiveOcrModel, effectiveLlmModel string, useLlm bool, fuzzyDist int, tpl *model.Template) {
-	effectiveOcrModel = h.DefaultOcrModel
-	effectiveLlmModel = h.DefaultLlmModel
-	useLlm = h.DefaultUseLlm
-	fuzzyDist = h.DefaultFuzzyDist
-	if templateID == "" {
-		return
-	}
-	t, err := h.Templates.GetByID(ctx, templateID)
-	if err != nil || t == nil {
-		return // 查不到也别报错, 走兜底
-	}
-	tpl = t
-	if t.OcrModel != "" {
-		effectiveOcrModel = t.OcrModel
-	}
-	if t.LlmModel != "" {
-		effectiveLlmModel = t.LlmModel
-	}
-	if t.UseLlm != nil {
-		useLlm = *t.UseLlm
-	}
-	if t.FuzzyDistance != nil {
-		fuzzyDist = *t.FuzzyDistance
-	}
-	if customPrompt == "" {
-		customPrompt = t.LlmPrompt
-	}
-	effectivePrompt = customPrompt
-	return
+	UploadDir   string
+	PublicBase  string
+	MaxUpload   int64 // bytes
+	Orchestrator *parser.Orchestrator // Phase A: 新增, OCR + Strategy + LLM 编排
+	Agent       *parseragent.Client   // 仅用于 Ping / GetDataSource (2026-09-02: cube 调用已收编到 BizExecutor)
+	BizExecutor *business.Executor    // 2026-09-02: cube 业务字段调用入口
+	BusinessReg *business.Registry    // 业务字段映射(products / suppliers 跨数据源)
+	Sessions    *store.SessionRepo
+	Strategies  *store.StrategyRepo   // Phase A: 新增, per-supplier 特定解析策略
+	SkillStore  *skill.Store          // Phase A: 新增, 读 skills/ocr-purchase/SKILL.md
+	CashRepo    *store.CashBalanceRepo
+	PayRepo     *store.SupplierPaymentRepo
+	RestockSvc  *restock.Service
+	AlertSvc    *purchasealert.Service
+	AgentRunner *agent.Runner
+	// Phase B+ (2026-09-03): 删 DefaultOcrModel/DefaultLlmModel 字段 (VLM 内部固定 glm-4v)
 }
 
 // ============== Health ==============
@@ -222,66 +187,14 @@ func (h *Handler) ListSuppliersByBrand(c *gin.Context) {
 	})
 }
 
-// ============== Templates ==============
-
-// ListTemplates 飞书端: 拉某供应商的模板 (默认 + purchase only)
-func (h *Handler) ListTemplates(c *gin.Context) {
-	supplier := c.Query("supplier")
-	onlyDefault := c.Query("default") == "1" || c.Query("default") == "true"
-	mode := c.Query("mode") // "purchase" | "inventory" | "" (auto)
-	purchaseOnly := c.Query("purchase") == "1" || c.Query("purchase") == "true" || mode == "purchase"
-	if mode == "" {
-		// 飞书端默认只看 purchase
-		purchaseOnly = true
-	}
-	list, err := h.Templates.ListForSupplier(c.Request.Context(), supplier, mode, onlyDefault, purchaseOnly)
-	if err != nil {
-		c.JSON(500, gin.H{"error": err.Error()})
-		return
-	}
-	c.JSON(200, gin.H{"templates": list, "count": len(list)})
-}
-
-// SyncTemplates C# 端调用: 整体覆盖同步
-func (h *Handler) SyncTemplates(c *gin.Context) {
-	var req struct {
-		Templates []model.Template `json:"templates"`
-	}
-	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(400, gin.H{"error": "bad json: " + err.Error()})
-		return
-	}
-	if err := h.Templates.UpsertAll(c.Request.Context(), req.Templates); err != nil {
-		c.JSON(500, gin.H{"error": err.Error()})
-		return
-	}
-	c.JSON(200, gin.H{"synced": len(req.Templates)})
-}
-
-// ListAllTemplates C# 端管理界面用
-func (h *Handler) ListAllTemplates(c *gin.Context) {
-	list, err := h.Templates.ListAll(c.Request.Context())
-	if err != nil {
-		c.JSON(500, gin.H{"error": err.Error()})
-		return
-	}
-	c.JSON(200, gin.H{"templates": list, "count": len(list)})
-}
-
 // ============== Parse (不存库) ==============
 
 func (h *Handler) Parse(c *gin.Context) {
 	supplier := c.Query("supplier")
-	mode := c.DefaultQuery("mode", "purchase")
 	if supplier == "" {
 		c.JSON(400, gin.H{"error": "supplier 必填 (query ?supplier=xxx)"})
 		return
 	}
-	customPrompt := c.Query("prompt")
-	templateID := c.Query("template_id")
-
-	effectivePrompt, effectiveOcrModel, effectiveLlmModel, useLlm, fuzzyDist, _ :=
-		h.resolveTemplateConfig(c.Request.Context(), templateID, customPrompt)
 
 	file, header, err := c.Request.FormFile("file")
 	if err != nil {
@@ -295,21 +208,19 @@ func (h *Handler) Parse(c *gin.Context) {
 		return
 	}
 
-	rows, lines, _, err := h.Parser.ParseImageBytes(c.Request.Context(), imgBytes, header.Filename,
-		supplier, mode, effectivePrompt, effectiveOcrModel, effectiveLlmModel, useLlm, fuzzyDist)
+	// Phase B+ (2026-09-03): VLM-only 模式, 不再传 ocr/llm model (Orchestrator 内部固定 glm-4v)
+	res, err := h.Orchestrator.Parse(c.Request.Context(), imgBytes, header.Filename,
+		supplier)
 	if err != nil {
 		c.JSON(500, gin.H{"error": err.Error()})
 		return
 	}
 	c.JSON(200, gin.H{
-		"supplier":       supplier,
-		"mode":           mode,
-		"ocr_lines":      len(lines),
-		"ocr_model":      effectiveOcrModel,
-		"llm_model":      effectiveLlmModel,
-		"use_llm":        useLlm,
-		"fuzzy_distance": fuzzyDist,
-		"rows":           rows,
+		"supplier":         supplier,
+		"strategy_version": res.StrategyVersion,
+		"is_handwrite":     res.IsHandwrite,
+		"is_generic":       res.IsGeneric,
+		"rows":             res.Rows,
 	})
 }
 
@@ -323,7 +234,8 @@ func (h *Handler) Rematch(c *gin.Context) {
 		c.JSON(400, gin.H{"error": "supplier 必填 (query ?supplier=xxx)"})
 		return
 	}
-	mode := c.DefaultQuery("mode", "purchase")
+	// Phase A: mode 参数已废,固定走 purchase 模式
+	_ = c.DefaultQuery("mode", "purchase")
 
 	var req struct {
 		Rows []model.SkuRow `json:"rows"`
@@ -344,8 +256,8 @@ func (h *Handler) Rematch(c *gin.Context) {
 		return
 	}
 
-	// 重新匹配
-	m := matcher.New(skus, h.FuzzyDistance)
+	// 重新匹配 (Phase A: FuzzyDistance 字段已删, 用 0 兜底)
+	m := matcher.New(skus, 0)
 	out := make([]model.SkuRow, 0, len(req.Rows))
 	for i, r := range req.Rows {
 		// 转成 ParsedOcrRow
@@ -369,23 +281,11 @@ func (h *Handler) Rematch(c *gin.Context) {
 		out = append(out, matched)
 	}
 
-	// 盘点模式: 重算 StockDiff
-	if mode == string(model.ModeInventory) {
-		for i := range out {
-			if out[i].StockQty != nil && out[i].Qty != nil {
-				diff := float64(*out[i].Qty) - *out[i].StockQty
-				out[i].StockDiff = &diff
-				out[i].StockMismatch = diff != 0
-				if out[i].StockMismatch && out[i].Status == "OK" {
-					out[i].Status = "盘存差异"
-				}
-			}
-		}
-	}
+	// Phase A (2026-09-02): 盘点模式已下线, 不再重算 StockDiff
+	// 参见 docs/ocr-purchase-skill-architecture.md §三
 
 	c.JSON(200, gin.H{
 		"supplier":      supplier,
-		"mode":          mode,
 		"sku_count":     len(skus),
 		"rows":          out,
 		"rematched":     len(out),
@@ -399,12 +299,12 @@ func (h *Handler) Rematch(c *gin.Context) {
 //   多图: form-data 用 files[] 重复提交, 或 files (单字段多文件)
 //   单图兼容: 仍可用 file 字段(向后兼容飞书 H5)
 //   2026-08-28 加入多图支持
+//
+// Phase A (2026-09-02): 删 template_id / template_name / prompt 参数, 改用 Orchestrator.Parse
+//   - 内部根据 supplier 查 supplier_parse_strategy 自动选 generic / specific / handwrite 路径
+//   - 解析成功后记 strategy_version 到 parse_session (0 = 通用, >0 = 特定 strategy 版本)
 func (h *Handler) CreateSession(c *gin.Context) {
 	supplier := c.Query("supplier")
-	mode := c.DefaultQuery("mode", "purchase")
-	templateID := c.Query("template_id")
-	templateName := c.Query("template_name")
-	customPrompt := c.Query("prompt")
 	note := c.Query("note")
 	source := c.DefaultQuery("source", "feishu")
 
@@ -412,9 +312,6 @@ func (h *Handler) CreateSession(c *gin.Context) {
 		c.JSON(400, gin.H{"error": "supplier 必填"})
 		return
 	}
-
-	effectivePrompt, effectiveOcrModel, effectiveLlmModel, useLlm, fuzzyDist, _ :=
-		h.resolveTemplateConfig(c.Request.Context(), templateID, customPrompt)
 
 	// 收集所有文件(多图): 优先 files[] 数组, 其次 files 多文件, 最后单图 file
 	type uploaded struct {
@@ -494,6 +391,11 @@ func (h *Handler) CreateSession(c *gin.Context) {
 	}
 
 	// 逐张图 OCR + 匹配, 合并 rows
+	s := &model.Session{
+		ID:           id,
+		SupplierName: supplier,
+		Mode:         model.ModePurchase, // Phase A: 固定 purchase
+	}
 	var allRows []model.SkuRow
 	var imagePaths, imageURLs []string
 	for idx, u := range uploads {
@@ -516,18 +418,25 @@ func (h *Handler) CreateSession(c *gin.Context) {
 			imageURLs = append(imageURLs, fmt.Sprintf("/uploads/%s/%s", bucket, fileName))
 		}
 
-		rows, _, _, err := h.Parser.ParseImageBytes(c.Request.Context(), u.bytes, u.header.Filename,
-			supplier, mode, effectivePrompt, effectiveOcrModel, effectiveLlmModel, useLlm, fuzzyDist)
+		// Phase A: 改用 Orchestrator (template_id / customPrompt 都不再需要, 走 strategy.body)
+		// Phase B+ (2026-09-03): VLM-only 模式
+		res, err := h.Orchestrator.Parse(c.Request.Context(), u.bytes, u.header.Filename,
+			supplier)
 		if err != nil {
-			c.JSON(500, gin.H{"error": fmt.Sprintf("OCR 第 %d 张失败: %s", idx+1, err.Error())})
+			c.JSON(500, gin.H{"error": fmt.Sprintf("VLM 第 %d 张失败: %s", idx+1, err.Error())})
 			return
 		}
 		// 续接 seq (从已有 max 续)
 		baseSeq := len(allRows)
+		rows := res.Rows
 		for i := range rows {
 			rows[i].Seq = baseSeq + i + 1
 		}
 		allRows = append(allRows, rows...)
+		// 记录本次解析的 strategy_version (多图时取第一张的版本号)
+		if idx == 0 {
+			s.StrategyVersion = res.StrategyVersion
+		}
 	}
 
 	// 单图兼容字段(取第一张)
@@ -540,20 +449,14 @@ func (h *Handler) CreateSession(c *gin.Context) {
 		imageURL = imageURLs[0]
 	}
 
-	s := &model.Session{
-		ID:           id,
-		SupplierName: supplier,
-		TemplateID:   templateID,
-		TemplateName: templateName,
-		Mode:         model.TemplateMode(mode),
-		ImagePath:    imagePath,
-		ImageURL:     imageURL,
-		ImagePaths:   imagePaths,
-		ImageURLs:    imageURLs,
-		Source:       source,
-		Note:         note,
-		Rows:         allRows,
-	}
+	// 填充 s 剩余字段
+	s.ImagePath = imagePath
+	s.ImageURL = imageURL
+	s.ImagePaths = imagePaths
+	s.ImageURLs = imageURLs
+	s.Source = source
+	s.Note = note
+	s.Rows = allRows
 	if err := h.Sessions.Create(c.Request.Context(), s); err != nil {
 		c.JSON(500, gin.H{"error": "存库失败: " + err.Error()})
 		return
@@ -838,6 +741,83 @@ func (h *Handler) DeleteSession(c *gin.Context) {
 	c.JSON(200, gin.H{"deleted": id})
 }
 
+// ============== Strategy (Phase A, 2026-09-02) ==============
+//   per-supplier 特定解析策略, 取代旧 template
+//   Phase A: 3 个端点 (GET / PUT / POST optimize) 全部可用
+//     - GET  /suppliers/:name/strategy        查 (没有返 404)
+//     - PUT  /suppliers/:name/strategy        改 (覆盖 body/overlay/hints/handwrite/enabled)
+//     - POST /suppliers/:name/strategy/optimize 触发 LLM 优化 (Phase A: 占位,Phase B 实现)
+
+// GetStrategy 查某 supplier 的 strategy
+//   不存在 → 404 + {"exists": false} (前端可据此显示"未建"提示)
+func (h *Handler) GetStrategy(c *gin.Context) {
+	name := c.Param("name")
+	if name == "" {
+		c.JSON(400, gin.H{"error": "name 必填"})
+		return
+	}
+	s, err := h.Strategies.GetBySupplier(c.Request.Context(), name)
+	if err != nil {
+		c.JSON(500, gin.H{"error": err.Error()})
+		return
+	}
+	if s == nil {
+		c.JSON(404, gin.H{"exists": false, "supplier": name})
+		return
+	}
+	c.JSON(200, gin.H{"exists": true, "strategy": s})
+}
+
+// UpsertStrategy 覆盖式改 strategy (运营手动纠错用)
+//   body: 完整 model.Strategy JSON (含 supplier_name 必填)
+//   行为: Upsert,version 由调用方管理 (建议 +1)
+//   注意: 不并发安全(Phase A 单调用方),Phase B 改乐观锁
+func (h *Handler) UpsertStrategy(c *gin.Context) {
+	name := c.Param("name")
+	var s model.Strategy
+	if err := c.ShouldBindJSON(&s); err != nil {
+		c.JSON(400, gin.H{"error": "bad json: " + err.Error()})
+		return
+	}
+	if s.SupplierName == "" {
+		s.SupplierName = name
+	}
+	if s.SupplierName != name {
+		c.JSON(400, gin.H{"error": "URL name 与 JSON supplier_name 不一致"})
+		return
+	}
+	if err := h.Strategies.Upsert(c.Request.Context(), &s); err != nil {
+		c.JSON(500, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(200, gin.H{"upserted": true, "strategy": s})
+}
+
+// OptimizeStrategy 触发 LLM 优化 (Phase A: 占位,Phase B 接入 optimize-parse-strategy skill)
+//   行为:
+//     - 现在: 立即触发通用流程 + 记 last_auto_optimized_at
+//     - Phase B: 调 runner.Run 让 LLM 读 diff + 调 invoke_skill("optimize-parse-strategy")
+//   前端可手动触发或等自动阈值 (edit_count >= 3)
+func (h *Handler) OptimizeStrategy(c *gin.Context) {
+	name := c.Param("name")
+	if name == "" {
+		c.JSON(400, gin.H{"error": "name 必填"})
+		return
+	}
+	// Phase A 占位: 只重置 edit_count,Phase B 接入完整 LLM 优化流程
+	// (Phase B: 拿最近 N 次 session 的 LLM 解析结果 + 人工修正 diff, 调 optimize-parse-strategy skill)
+	if err := h.Strategies.ResetEditCount(c.Request.Context(), name); err != nil {
+		c.JSON(500, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(200, gin.H{
+		"optimized":    false,
+		"phase":        "A",
+		"note":         "Phase A 仅重置 edit_count,Phase B 接入完整 LLM 优化",
+		"supplier":     name,
+	})
+}
+
 // ============== Row 操作 ==============
 
 func (h *Handler) UpdateRow(c *gin.Context) {
@@ -899,22 +879,8 @@ func (h *Handler) ExportSession(c *gin.Context) {
 		c.JSON(404, gin.H{"error": "not found"})
 		return
 	}
-	if s.Mode == model.ModeInventory {
-		// 盘点模式: 检查差异
-		var mism int
-		for _, r := range s.Rows {
-			if r.StockMismatch {
-				mism++
-			}
-		}
-		if mism > 0 {
-			c.JSON(409, gin.H{
-				"error":             "盘点模式有差异行, 请先确认",
-				"stock_mismatch_count": mism,
-			})
-			return
-		}
-	}
+	// Phase A (2026-09-02): 盘点模式已下线, ExportSession 不再检查 StockMismatch
+	// 参见 docs/ocr-purchase-skill-architecture.md §三
 
 	var sb stringBuilder
 	// 头: 注释行

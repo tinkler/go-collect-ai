@@ -304,6 +304,41 @@ func Migrate(ctx context.Context, pool *pgxpool.Pool) error {
 		`DROP TABLE IF EXISTS restock_feedback CASCADE`,
 		`DROP TABLE IF EXISTS restock_sales_watch CASCADE`,
 		`DROP TABLE IF EXISTS supplier_reliability CASCADE`,
+
+		// ============================================================
+		// OCR 解析供应商特定策略 (Phase A, 2026-09-02) — docs/ocr-purchase-skill-architecture.md
+		// 每家供应商一条;is_handwrite=true 走纯启发式不开 LLM
+		// 通用解析累计 5 次触发自动建策略;edit_count>=3 触发自优化 (Phase B)
+		// ============================================================
+		`CREATE TABLE IF NOT EXISTS supplier_parse_strategy (
+			supplier_name        TEXT PRIMARY KEY,
+			is_handwrite         BOOLEAN NOT NULL DEFAULT FALSE,
+			enabled              BOOLEAN NOT NULL DEFAULT TRUE,
+			body                 TEXT NOT NULL DEFAULT '',
+			sku_hints            JSONB NOT NULL DEFAULT '{}'::jsonb,
+			llm_prompt_overlay   TEXT NOT NULL DEFAULT '',
+			strategy_version     INT  NOT NULL DEFAULT 0,
+			generic_apply_count  INT  NOT NULL DEFAULT 0,
+			edit_count           INT  NOT NULL DEFAULT 0,
+			created_at           TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+			last_edited_at       TIMESTAMPTZ,
+			last_auto_optimized_at TIMESTAMPTZ,
+			last_applied_at      TIMESTAMPTZ,
+			note                 TEXT NOT NULL DEFAULT ''
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_sps_handwrite ON supplier_parse_strategy(is_handwrite) WHERE is_handwrite = TRUE`,
+		`CREATE INDEX IF NOT EXISTS idx_sps_needs_build ON supplier_parse_strategy(generic_apply_count) WHERE body = '' OR enabled = FALSE`,
+
+		// 2026-09-02: parse_session 加 strategy_version (Phase A 新增, 替代 template_id)
+		//   - 落库时记本次解析用的 strategy 版本(0 = 通用解析)
+		`ALTER TABLE parse_session ADD COLUMN IF NOT EXISTS strategy_version INT NOT NULL DEFAULT 0`,
+
+		// 2026-09-02 Phase A: 删旧 template 表 / parse_session.template_id / parse_session.template_name
+		//   - 旧 schema 残留 2 个 NOT NULL 列, drop 掉让 Phase A 的 INSERT 能跑
+		//   - CASCADE 防止有 FK 引用(虽然 phase A 已经不引用了)
+		`ALTER TABLE parse_session DROP COLUMN IF EXISTS template_id CASCADE`,
+		`ALTER TABLE parse_session DROP COLUMN IF EXISTS template_name CASCADE`,
+		`DROP TABLE IF EXISTS template CASCADE`,
 	}
 	for _, s := range stmts {
 		if _, err := pool.Exec(ctx, s); err != nil {

@@ -59,12 +59,12 @@ func (r *SessionRepo) Create(ctx context.Context, s *model.Session) error {
 
 	_, err = tx.Exec(ctx, `
 		INSERT INTO parse_session
-		(id, supplier_name, template_id, template_name, mode, image_path, image_url, image_paths, image_urls, source, raw_ocr_json, note, created_at, updated_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+		(id, supplier_name, mode, image_path, image_url, image_paths, image_urls, source, raw_ocr_json, note, strategy_version, created_at, updated_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
 	`,
-		s.ID, s.SupplierName, s.TemplateID, s.TemplateName, string(s.Mode),
+		s.ID, s.SupplierName, string(s.Mode),
 		s.ImagePath, s.ImageURL, string(imagePathsJSON), string(imageURLsJSON),
-		s.Source, rawOCR, s.Note, s.CreatedAt, s.UpdatedAt)
+		s.Source, rawOCR, s.Note, s.StrategyVersion, s.CreatedAt, s.UpdatedAt)
 	if err != nil {
 		return fmt.Errorf("insert session: %w", err)
 	}
@@ -90,16 +90,16 @@ func (r *SessionRepo) Get(ctx context.Context, id string) (*model.Session, error
 	var mode string
 	var imagePathsJSON, imageURLsJSON []byte
 	err := r.pool.QueryRow(ctx, `
-		SELECT id, supplier_name, template_id, template_name, mode, image_path, image_url, image_paths, image_urls, source, COALESCE(note,''), created_at, updated_at
+		SELECT id, supplier_name, mode, image_path, image_url, image_paths, image_urls, source, COALESCE(note,''), strategy_version, created_at, updated_at
 		FROM parse_session WHERE id = $1
-	`, id).Scan(&s.ID, &s.SupplierName, &s.TemplateID, &s.TemplateName, &mode, &s.ImagePath, &s.ImageURL, &imagePathsJSON, &imageURLsJSON, &s.Source, &s.Note, &s.CreatedAt, &s.UpdatedAt)
+	`, id).Scan(&s.ID, &s.SupplierName, &mode, &s.ImagePath, &s.ImageURL, &imagePathsJSON, &imageURLsJSON, &s.Source, &s.Note, &s.StrategyVersion, &s.CreatedAt, &s.UpdatedAt)
 	if err == pgx.ErrNoRows {
 		return nil, nil
 	}
 	if err != nil {
 		return nil, err
 	}
-	s.Mode = model.TemplateMode(mode)
+	s.Mode = model.Mode(mode)
 	// image_paths / image_urls 兼容: 老库可能 NULL 或 '[]'
 	_ = json.Unmarshal(imagePathsJSON, &s.ImagePaths)
 	_ = json.Unmarshal(imageURLsJSON, &s.ImageURLs)
@@ -124,7 +124,7 @@ func (r *SessionRepo) ListSummaries(ctx context.Context, supplier string, from t
 	if limit <= 0 || limit > 500 {
 		limit = 50
 	}
-	q := `SELECT s.id, s.supplier_name, s.template_name, s.mode,
+	q := `SELECT s.id, s.supplier_name, s.strategy_version, s.mode,
 		COALESCE((SELECT COUNT(*) FROM parse_row r WHERE r.session_id=s.id AND NOT r.is_deleted), 0),
 		CASE WHEN jsonb_array_length(s.image_paths) > 0
 		     THEN jsonb_array_length(s.image_paths)
@@ -154,10 +154,10 @@ func (r *SessionRepo) ListSummaries(ctx context.Context, supplier string, from t
 	for rows.Next() {
 		var s model.SessionSummary
 		var mode string
-		if err := rows.Scan(&s.ID, &s.SupplierName, &s.TemplateName, &mode, &s.RowCount, &s.ImageCount, &s.Source, &s.CreatedAt, &s.UpdatedAt); err != nil {
+		if err := rows.Scan(&s.ID, &s.SupplierName, &s.StrategyVersion, &mode, &s.RowCount, &s.ImageCount, &s.Source, &s.CreatedAt, &s.UpdatedAt); err != nil {
 			return nil, err
 		}
-		s.Mode = model.TemplateMode(mode)
+		s.Mode = model.Mode(mode)
 		out = append(out, s)
 	}
 	return out, rows.Err()

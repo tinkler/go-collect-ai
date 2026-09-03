@@ -39,13 +39,19 @@ func New(skus []model.SkuRecord, fuzzyDist int) *SkuMatcher {
 	}
 	for _, s := range skus {
 		if s.Barcode != "" {
-			if _, exists := m.byBarcode[s.Barcode]; !exists {
-				m.byBarcode[s.Barcode] = s
-			}
-			// W3.1 L3: barcode 后 4 位入桶
-			if len(s.Barcode) >= 4 {
-				suf := s.Barcode[len(s.Barcode)-4:]
-				m.byBarcodeSuffix4[suf] = append(m.byBarcodeSuffix4[suf], s)
+			// 2026-09-02 Phase A: cube 返的 barcode 带尾空格 (e.g. "447600408           "),
+			//   Match 时 OCR 端会 TrimSpace, 但索引时没 trim, 永远 miss.
+			//   索引 + 后 4 位桶都先 TrimSpace 一次.
+			bc := strings.TrimSpace(s.Barcode)
+			if bc != "" {
+				if _, exists := m.byBarcode[bc]; !exists {
+					m.byBarcode[bc] = s
+				}
+				// W3.1 L3: barcode 后 4 位入桶
+				if len(bc) >= 4 {
+					suf := bc[len(bc)-4:]
+					m.byBarcodeSuffix4[suf] = append(m.byBarcodeSuffix4[suf], s)
+				}
 			}
 		}
 		if s.Name != "" {

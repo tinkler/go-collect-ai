@@ -69,3 +69,4 @@ collect-ai-server-darwin-arm64
 *.zip
 *.tar.gz
 scripts/
+**/__pycache__/ 

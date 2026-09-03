@@ -1,0 +1,16 @@
+{
+  "skill": "restock-strategy",
+  "version": "1.0.0",
+  "generated_at": "2026-09-02T10:18:54Z",
+  "metrics": {
+    "total_cases": 4,
+    "passed": 4,
+    "failed": 0,
+    "pass_rate": 1.0,
+    "fail_rate": 0.0,
+    "issue_count": 0
+  },
+  "category_breakdown": {},
+  "issues": [],
+  "next_action": "[OK] 全部 pass,继续扩大 eval 覆盖(加新 case)"
+}

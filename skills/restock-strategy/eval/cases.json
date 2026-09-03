@@ -1,0 +1,49 @@
+{
+  "skill": "restock-strategy",
+  "version": "1.0.0",
+  "cases": [
+    {
+      "id": "case-001",
+      "prompt": "这个 P0 是什么意思,要立即发吗?",
+      "context": {"restock_task": {"priority": "P0", "inv_snapshot": 5, "daily_avg": 30}},
+      "expected_skill": "restock-strategy",
+      "expected_output_keywords": ["P0", "立即", "断货", "库存"],
+      "expected_script_path": ["scripts/days_until_stockout.py", "scripts/compute_suggest_qty.py"],
+      "expected_reference_path": ["references/priority_semantics.md"],
+      "script_path": "scripts/days_until_stockout.py",
+      "script_args": {"inv_snapshot": 5, "daily_avg": 30}
+    },
+    {
+      "id": "case-002",
+      "prompt": "汇一瓶装水建议补 60 瓶,够吗?",
+      "context": {"daily_avg": 30, "lead_days": 7, "fill_rate": 0.95},
+      "expected_skill": "restock-strategy",
+      "expected_output_keywords": ["补货", "276", "fill_rate", "供应商"],
+      "expected_script_path": ["scripts/compute_suggest_qty.py"],
+      "expected_reference_path": ["references/category_lead_days.md"],
+      "script_path": "scripts/compute_suggest_qty.py",
+      "script_args": {"daily_avg": 30, "lead_days": 7, "safety_days": 1.5, "fill_rate": 0.95, "ceil_unit": 12}
+    },
+    {
+      "id": "case-003",
+      "prompt": "为什么这条 P1 自动升到 P0 了?",
+      "context": {"priority_history": "P1 -> P0", "elapsed_hours": 13},
+      "expected_skill": "restock-strategy",
+      "expected_output_keywords": ["P1", "P0", "升级", "12"],
+      "expected_script_path": [],
+      "expected_reference_path": ["references/escalation_rules.md"],
+      "script_args": null
+    },
+    {
+      "id": "case-004",
+      "prompt": "这家供应商靠谱吗,补货量要调吗?",
+      "context": {"supplier": "汇一", "delivered_qty": 920, "ordered_qty": 1000},
+      "expected_skill": "restock-strategy",
+      "expected_output_keywords": ["交付率", "fill_rate", "补货", "调整"],
+      "expected_script_path": ["scripts/supplier_fill_rate.py"],
+      "expected_reference_path": [],
+      "script_path": "scripts/supplier_fill_rate.py",
+      "script_args": {"delivered_qty": 920, "ordered_qty": 1000}
+    }
+  ]
+}

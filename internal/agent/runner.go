@@ -14,6 +14,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"os"
 	"strings"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -25,6 +26,7 @@ import (
 	"trpc.group/trpc-go/trpc-agent-go/runner"
 	"trpc.group/trpc-go/trpc-agent-go/tool"
 
+	"github.com/tinkler/collect-ai/internal/agent/skill"
 	"github.com/tinkler/collect-ai/internal/agent/tools"
 	"github.com/tinkler/collect-ai/internal/business"
 )
@@ -48,6 +50,15 @@ type Config struct {
 
 	// Instruction System prompt (留空用 defaultInstruction)
 	Instruction string
+
+	// SkillRoots skill 扫描根(逗号分隔追加到默认 root,env COLLECTAI_SKILL_ROOTS)
+	// 默认包含 ./skills/ + ~/.claude/skills/ + ~/.agents/skills/
+	// 推荐:留空,用默认就行(已涵盖项目内 + 两个标准用户级落点)
+	SkillRoots string
+
+	// SkillsEnabled 是否启用 skill 系统(env COLLECTAI_AGENT_SKILLS_ENABLED, 默认 true)
+	// 设为 false 时不加载 skill、不注入 prompt、不注册 invoke_skill tool
+	SkillsEnabled bool
 }
 
 // DefaultLLMBaseURL 默认 DeepSeek 端点
@@ -95,6 +106,11 @@ type Runner struct {
 	toolsByName map[string]tool.Tool
 	llmAgent    agent.Agent
 	runner      runner.Runner
+
+	// 2026-09-02: Agent Skills (Anthropic spec) — 推理逻辑热更新
+	skillStore  *skill.Store
+	skillWatch  *skill.Watcher
+	invokeSkill tool.Tool // invoke_skill 暴露给 LLM
 }
 
 // NewRunner 构造 Runner
@@ -106,14 +122,56 @@ func NewRunner(ctx context.Context, cfg Config, pool *pgxpool.Pool, gateway *bus
 	if pool == nil {
 		return nil, fmt.Errorf("agent: pg pool 必填")
 	}
-	// 1) 工具注册
-	allTools := []tool.Tool{
+
+	// 1) 业务工具注册
+	bizTools := []tool.Tool{
 		tools.RememberSupplierPolicy(pool),
 		tools.QuerySupplierPolicy(pool),
 		tools.RecordSpecialDate(pool),
 		tools.QueryUpcomingDates(pool),
 		tools.RecordPromotionFee(pool),
 		tools.ListPromotionFee(pool),
+	}
+
+	// 2) Skill 系统(Anthropic Agent Skills 规范)
+	//    推理逻辑外置,SKILL.md + scripts/ 热更新
+	//    失败不阻塞 Runner(降级为不带 skill)
+	skillStore := skill.NewStore()
+	var skillWatcher *skill.Watcher
+	var invokeSkillTool tool.Tool
+	if cfg.SkillsEnabled {
+		wd, _ := os.Getwd()
+		roots := skill.RootsFromEnvOrDefault(wd, cfg.SkillRoots)
+		skillStore.SetRoots(roots)
+
+		if result, err := skill.Load(roots); err == nil {
+			skillStore.Replace(result.Skills)
+			if msg := result.FormatErrors(); msg != "" {
+				log.Printf("[agent] %s", strings.TrimSpace(msg))
+			}
+			log.Printf("[agent] skills 加载: %d 个 skill 从 %d 个 root", len(result.Skills), len(result.Roots))
+			for _, sk := range result.Skills {
+				log.Printf("[agent]   - %s [%s] (%d scripts, %d refs)", sk.Manifest.Name, sk.Source, len(sk.Scripts), len(sk.References))
+			}
+		} else {
+			log.Printf("[agent] skill 初始加载失败(继续): %v", err)
+		}
+
+		invokeSkillTool = skill.NewInvokeSkillTool(skillStore)
+
+		// 启动热更新
+		w, err := skill.NewWatcher(skillStore, roots, skill.DefaultLoader())
+		if err != nil {
+			log.Printf("[agent] skill watcher 启动失败(无热更新): %v", err)
+		} else {
+			skillWatcher = w
+		}
+	}
+
+	// 3) 合并工具: 业务 + invoke_skill
+	allTools := append([]tool.Tool{}, bizTools...)
+	if invokeSkillTool != nil {
+		allTools = append(allTools, invokeSkillTool)
 	}
 	toolsByName := make(map[string]tool.Tool, len(allTools))
 	for _, t := range allTools {
@@ -126,9 +184,12 @@ func NewRunner(ctx context.Context, cfg Config, pool *pgxpool.Pool, gateway *bus
 		gateway:     gateway,
 		tools:       allTools,
 		toolsByName: toolsByName,
+		skillStore:  skillStore,
+		skillWatch:  skillWatcher,
+		invokeSkill: invokeSkillTool,
 	}
 
-	// 2) LLM Agent (可选)
+	// 4) LLM Agent (可选)
 	if !cfg.Enabled {
 		log.Printf("[agent] LLM 关闭 (Enabled=false),tools 仍可用")
 		return r, nil
@@ -142,6 +203,13 @@ func NewRunner(ctx context.Context, cfg Config, pool *pgxpool.Pool, gateway *bus
 	modelName := orDefault(cfg.ModelName, DefaultLLMModel)
 	appName := orDefault(cfg.AppName, DefaultAppName)
 	instruction := orDefault(cfg.Instruction, defaultInstruction)
+
+	// 把 skill L1 拼到 instruction 后(让 LLM 看到所有可用 skill 的 name+description)
+	// 关键:不修改 llmagent 的 instruction(它构造时固定),而是每次 Run 时再注入
+	// 但为了简化 L1 可见性,这里先拼到 instruction 字符串(LLM Agent 构造期)
+	if skillBlock := skillStore.L1Prompt(); skillBlock != "" {
+		instruction = instruction + "\n\n" + skillBlock
+	}
 
 	mdl := openai.New(modelName,
 		openai.WithAPIKey(cfg.APIKey),
@@ -157,7 +225,8 @@ func NewRunner(ctx context.Context, cfg Config, pool *pgxpool.Pool, gateway *bus
 
 	r.llmAgent = ag
 	r.runner = runner.NewRunner(appName, ag)
-	log.Printf("[agent] Runner ready: model=%s base=%s tools=%d", modelName, baseURL, len(allTools))
+	log.Printf("[agent] Runner ready: model=%s base=%s tools=%d skills=%d",
+		modelName, baseURL, len(allTools), skillStore.Count())
 	return r, nil
 }
 
@@ -187,6 +256,19 @@ func (r *Runner) AgentName() string {
 
 // ErrLLMNotConfigured LLM 未配置
 var ErrLLMNotConfigured = fmt.Errorf("agent: LLM 未配置,无法执行对话;工具可单独调用")
+
+// Close 释放资源(skill watcher 等)
+func (r *Runner) Close() {
+	if r.skillWatch != nil {
+		r.skillWatch.Stop()
+		r.skillWatch = nil
+	}
+}
+
+// SkillStore 暴露 skill 列表(供 HTTP / CLI 直接查询,无需 LLM)
+func (r *Runner) SkillStore() *skill.Store {
+	return r.skillStore
+}
 
 // Run 执行 LLM Agent 一轮对话
 //   LLM 未配置时返 ErrLLMNotConfigured
@@ -228,12 +310,14 @@ func LoadConfigFromEnv(getEnv func(string) string) Config {
 		return v
 	}
 	return Config{
-		Enabled:     strings.EqualFold(get("COLLECTAI_AGENT_ENABLED", "false"), "true"),
-		BaseURL:     get("COLLECTAI_LLM_BASE_URL", DefaultLLMBaseURL),
-		APIKey:      get("COLLECTAI_LLM_API_KEY", ""),
-		ModelName:   get("COLLECTAI_LLM_MODEL", DefaultLLMModel),
-		AppName:     get("COLLECTAI_AGENT_APP_NAME", DefaultAppName),
-		Instruction: get("COLLECTAI_AGENT_INSTRUCTION", ""),
+		Enabled:      strings.EqualFold(get("COLLECTAI_AGENT_ENABLED", "false"), "true"),
+		BaseURL:      get("COLLECTAI_LLM_BASE_URL", DefaultLLMBaseURL),
+		APIKey:       get("COLLECTAI_LLM_API_KEY", ""),
+		ModelName:    get("COLLECTAI_LLM_MODEL", DefaultLLMModel),
+		AppName:      get("COLLECTAI_AGENT_APP_NAME", DefaultAppName),
+		Instruction:  get("COLLECTAI_AGENT_INSTRUCTION", ""),
+		SkillRoots:   get("COLLECTAI_SKILL_ROOTS", ""),
+		SkillsEnabled: !strings.EqualFold(get("COLLECTAI_AGENT_SKILLS_ENABLED", "true"), "false"),
 	}
 }
 

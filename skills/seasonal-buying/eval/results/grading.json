@@ -1,0 +1,179 @@
+{
+  "skill": "seasonal-buying",
+  "version": "1.0.0",
+  "run_at": "2026-09-02T10:18:55Z",
+  "summary": {
+    "total": 4,
+    "passed": 4,
+    "failed": 0,
+    "pass_rate": 1.0
+  },
+  "cases": [
+    {
+      "id": "case-001",
+      "prompt": "下个月要过节了,要不要备货?",
+      "status": "pass",
+      "passed": 9,
+      "total": 9,
+      "results": [
+        {
+          "check": "body 引用 scripts/compute_window.py",
+          "passed": true,
+          "info": "contains('scripts/compute_window.py')"
+        },
+        {
+          "check": "body 引用 references/chinese_holidays_2026.md",
+          "passed": true,
+          "info": "contains('references/chinese_holidays_2026.md')"
+        },
+        {
+          "check": "body 引用 references/season_taxonomy.md",
+          "passed": true,
+          "info": "contains('references/season_taxonomy.md')"
+        },
+        {
+          "check": "run_script scripts/compute_window.py rc",
+          "passed": true,
+          "info": "rc=0"
+        },
+        {
+          "check": "json_field(next_event.name)",
+          "passed": true,
+          "info": "json_field(next_event.name) == '中秋节', got '中秋节'"
+        },
+        {
+          "check": "json_field(next_event.days_until)",
+          "passed": true,
+          "info": "json_field(next_event.days_until) == 23, got 23"
+        },
+        {
+          "check": "json_field(next_event.recommended_multiplier)",
+          "passed": true,
+          "info": "json_field(next_event.recommended_multiplier) == 5.0, got 5.0"
+        },
+        {
+          "check": "read_file references/chinese_holidays_2026.md 非空",
+          "passed": true,
+          "info": "len=2058"
+        },
+        {
+          "check": "read_file references/season_taxonomy.md 非空",
+          "passed": true,
+          "info": "len=800"
+        }
+      ]
+    },
+    {
+      "id": "case-002",
+      "prompt": "雪糕到了,要不要备点?",
+      "status": "pass",
+      "passed": 5,
+      "total": 5,
+      "results": [
+        {
+          "check": "body 引用 scripts/compute_window.py",
+          "passed": true,
+          "info": "contains('scripts/compute_window.py')"
+        },
+        {
+          "check": "body 引用 references/season_taxonomy.md",
+          "passed": true,
+          "info": "contains('references/season_taxonomy.md')"
+        },
+        {
+          "check": "run_script scripts/compute_window.py rc",
+          "passed": true,
+          "info": "rc=0"
+        },
+        {
+          "check": "contains(active_seasons)",
+          "passed": true,
+          "info": "contains('雪糕季')"
+        },
+        {
+          "check": "read_file references/season_taxonomy.md 非空",
+          "passed": true,
+          "info": "len=800"
+        }
+      ]
+    },
+    {
+      "id": "case-003",
+      "prompt": "春节前 3 天要备 5 倍量,帮我看看",
+      "status": "pass",
+      "passed": 6,
+      "total": 6,
+      "results": [
+        {
+          "check": "body 引用 scripts/compute_window.py",
+          "passed": true,
+          "info": "contains('scripts/compute_window.py')"
+        },
+        {
+          "check": "body 引用 references/chinese_holidays_2026.md",
+          "passed": true,
+          "info": "contains('references/chinese_holidays_2026.md')"
+        },
+        {
+          "check": "run_script scripts/compute_window.py rc",
+          "passed": true,
+          "info": "rc=0"
+        },
+        {
+          "check": "json_field(next_event.name)",
+          "passed": true,
+          "info": "json_field(next_event.name) == '春节', got '春节'"
+        },
+        {
+          "check": "json_field(next_event.recommended_multiplier)",
+          "passed": true,
+          "info": "json_field(next_event.recommended_multiplier) == 8.0, got 8.0"
+        },
+        {
+          "check": "read_file references/chinese_holidays_2026.md 非空",
+          "passed": true,
+          "info": "len=2058"
+        }
+      ]
+    },
+    {
+      "id": "case-004",
+      "prompt": "618 来了,需要备什么?",
+      "status": "pass",
+      "passed": 6,
+      "total": 6,
+      "results": [
+        {
+          "check": "description 含触发词 '618'",
+          "passed": true,
+          "info": "contains('618')"
+        },
+        {
+          "check": "body 引用 scripts/compute_window.py",
+          "passed": true,
+          "info": "contains('scripts/compute_window.py')"
+        },
+        {
+          "check": "body 引用 references/chinese_holidays_2026.md",
+          "passed": true,
+          "info": "contains('references/chinese_holidays_2026.md')"
+        },
+        {
+          "check": "run_script scripts/compute_window.py rc",
+          "passed": true,
+          "info": "rc=0"
+        },
+        {
+          "check": "json_field(next_event.name)",
+          "passed": true,
+          "info": "json_field(next_event.name) == '618', got '618'"
+        },
+        {
+          "check": "read_file references/chinese_holidays_2026.md 非空",
+          "passed": true,
+          "info": "len=2058"
+        }
+      ]
+    }
+  ]
+}
