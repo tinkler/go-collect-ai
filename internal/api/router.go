@@ -129,6 +129,9 @@ func NewRouter(h *handler.Handler, cfg *config.Config, restockSvc *restock.Servi
 			authed.POST("/sessions/:id/images", limiter.Middleware(wait), auth.RequirePerm("session:update"), h.AppendImages)
 			// W4.1: 轻量状态查询 (前端轮询用, 不拉 rows)
 			authed.GET("/sessions/:id/analysis-status", auth.RequirePerm("session:read"), h.GetAnalysisStatus)
+			// 2026-09-03: 手动重跑 purchase-alert skill (不改 rows, 只重算 alerts)
+			//   跟 EditRow 同 perm (session:update), 跟 images 共用限流 (避免被刷)
+			authed.POST("/sessions/:id/analysis", auth.RequirePerm("session:update"), h.TriggerAnalysis)
 
 			// 采购计划
 			authed.GET("/purchase-plans", auth.RequirePerm("plan:read"), restock.RestockPurchasePlansList(restockSvc))

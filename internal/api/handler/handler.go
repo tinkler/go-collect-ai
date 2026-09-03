@@ -503,6 +503,76 @@ func (h *Handler) GetAnalysisStatus(c *gin.Context) {
 	})
 }
 
+// TriggerAnalysis (2026-09-03) 重新触发 LLM/purchase-alert 策略分析
+//   场景: 用户在收货单详情页手动按"重新分析"按钮
+//   - 不重跑 OCR/解析 (rows 已经是用户编辑过的最终结果)
+//   - 复用 StartAnalysisAsync: 内部 cancel 旧 run + 启新 run, 并发安全
+//   - body: { "force": true } → 即使 status='running' 也允许重跑 (默认拒重入, 10s 节流)
+//   权限: session:update (跟 EditRow 同级, 不要给 read 用户)
+//   注意: 不进限流中间件, 跟 analysis-status 同级 (后台 goroutine 自己跑)
+func (h *Handler) TriggerAnalysis(c *gin.Context) {
+	id := c.Param("id")
+	if id == "" {
+		c.JSON(400, gin.H{"error": "session id 必填"})
+		return
+	}
+
+	// 1) 确认 session 存在 + mode=purchase (purchase 模式才有 alert skill)
+	existing, err := h.Sessions.Get(c.Request.Context(), id)
+	if err != nil {
+		c.JSON(500, gin.H{"error": err.Error()})
+		return
+	}
+	if existing == nil {
+		c.JSON(404, gin.H{"error": "session not found"})
+		return
+	}
+	if existing.Mode != model.ModePurchase {
+		c.JSON(400, gin.H{"error": "只有采购模式 session 支持策略分析 (mode=" + string(existing.Mode) + ")"})
+		return
+	}
+
+	// 2) 读 body { force } — 默认不强制
+	var body struct {
+		Force bool `json:"force"`
+	}
+	_ = c.ShouldBindJSON(&body) // body 可空
+
+	// 3) 节流: 如果已经在 running, 默认 10s 内拒重入 (用户连点保护)
+	if h.AlertSvc == nil {
+		c.JSON(503, gin.H{"error": "alert service 未配置"})
+		return
+	}
+	if !body.Force {
+		var status string
+		var lastAt *time.Time
+		err := h.Pool.QueryRow(c.Request.Context(), `
+			SELECT analysis_status, analysis_at
+			FROM parse_session WHERE id = $1
+		`, id).Scan(&status, &lastAt)
+		if err == nil && status == "running" {
+			// 10s 节流: 用户短时间内连点, 第二次直接告诉 "已经在跑"
+			if lastAt != nil && time.Since(*lastAt) < 10*time.Second {
+				c.JSON(409, gin.H{
+					"error":   "分析正在进行中, 10s 内不要重复触发",
+					"status":  "running",
+					"started": lastAt,
+				})
+				return
+			}
+		}
+	}
+
+	// 4) 触发 (异步, 立即返回)
+	h.AlertSvc.StartAnalysisAsync(id, h.Sessions.Get)
+
+	c.JSON(200, gin.H{
+		"session_id":      id,
+		"analysis_status": "pending", // 几秒后变 running
+		"triggered":       true,
+	})
+}
+
 
 
 // CreateSession multipart 收图(支持 1 张或多张) + 存库
