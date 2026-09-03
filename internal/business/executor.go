@@ -61,7 +61,9 @@ func (e *Executor) searchProducts(supplierKeyword string, limit int, ds string) 
 	if !ok {
 		return nil, fmt.Errorf("business: products %s not configured", ds)
 	}
-	bizFields := []string{"barcode", "product_name", "supplier_id", "supplier_name", "category", "brand", "stock_qty"}
+	// 2026-09-03: 加 unit 字段 (mapping 已定义 → t_bd_item_info.unit_no)
+	//   跟 SearchProducts handler 字段列表保持一致
+	bizFields := []string{"barcode", "product_name", "supplier_id", "supplier_name", "category", "brand", "stock_qty", "unit"}
 
 	// 2026-09-02 重构: filter 翻译走 Registry,不再手拼 ref
 	keywords := splitAndTrim(supplierKeyword, ";,\n\r\t ")

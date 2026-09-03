@@ -33,7 +33,8 @@ type Sender interface {
 }
 
 // AgentRunner LLM Agent 抽象(*Runner 已实现)
-//   让 Bridge 可被单测 mock,避免引入真实 LLM 依赖
+//
+//	让 Bridge 可被单测 mock,避免引入真实 LLM 依赖
 type AgentRunner interface {
 	Enabled() bool
 	Run(ctx context.Context, userID, sessionID, message string) (<-chan *RunnerEvent, error)
@@ -78,9 +79,9 @@ type Bridge struct {
 	sender Sender
 
 	mu      sync.Mutex
-	chatSet map[string]struct{} // 白名单 set
+	chatSet map[string]struct{}     // 白名单 set
 	workers map[string]chan msgItem // per-chat queue (lazy init)
-	rate    map[string][]time.Time // chat -> 最近 1 分钟 send 时间
+	rate    map[string][]time.Time  // chat -> 最近 1 分钟 send 时间
 }
 
 // msgItem 排队消息
@@ -118,7 +119,8 @@ func NewBridge(cfg BridgeConfig, runner AgentRunner, sender Sender) *Bridge {
 }
 
 // Handle wcm.OnAgentMessage 钩子入口
-//   立即返回;消息入 per-chat queue,worker 串行处理
+//
+//	立即返回;消息入 per-chat queue,worker 串行处理
 func (b *Bridge) Handle(chatID, userID, text string) {
 	chatID = strings.TrimSpace(chatID)
 	text = strings.TrimSpace(text)
@@ -166,7 +168,8 @@ func (b *Bridge) shouldHandle(chatID string) bool {
 }
 
 // allowSend 频控: 超 PerMinuteRate/chat/分钟 → false
-//   顺便 record 一次发送(扣配额)
+//
+//	顺便 record 一次发送(扣配额)
 func (b *Bridge) allowSend(chatID string) bool {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -191,6 +194,17 @@ func (b *Bridge) allowSend(chatID string) bool {
 func (b *Bridge) processOne(parent context.Context, chatID, userID, text string) {
 	ctx, cancel := context.WithTimeout(parent, b.cfg.RunTimeout)
 	defer cancel()
+
+	// 调试快速通道: @机器人 + 文字 == "调试" → 返 chat_id 等诊断信息
+	// 走频控(占 1 条配额防滥用),不走 LLM,不截断
+	if isDebugCommand(text) {
+		if !b.allowSend(chatID) {
+			b.sendSafe(ctx, chatID, "本群消息太多,我先停一下,稍等几秒再试")
+			return
+		}
+		b.sendDebugInfo(ctx, chatID, userID)
+		return
+	}
 
 	// 频控
 	if !b.allowSend(chatID) {
@@ -251,9 +265,63 @@ func (b *Bridge) sendSafe(ctx context.Context, chatID, text string) {
 	}
 }
 
+// isDebugCommand 判断是否是 "调试" 调试命令
+//
+// 严格匹配: 跳过所有 @xxx 形式的 at 标记后,只剩一个 token == "调试"
+//
+// 命中:
+//   - "调试"
+//   - "@机器人 调试"
+//   - "@机器人  调试"  (中间多余空格)
+//
+// 不命中:
+//   - "@机器人 调试 info"      (还有别的内容)
+//   - "@机器人 调 试"            (两个字分开,严格匹配)
+//   - "调试一下"                 (前缀匹配了,严格 "调试" 才算)
+//
+// 为什么不用 strings.Contains: 防误触发 — "帮我调试一下" 这种文本不该命中
+func isDebugCommand(text string) bool {
+	parts := strings.Fields(text)
+	nonAt := make([]string, 0, len(parts))
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		// 跳过 @xxx 形式的 at 标记 (整 token 以 @ 开头)
+		if strings.HasPrefix(p, "@") {
+			continue
+		}
+		nonAt = append(nonAt, p)
+	}
+	return len(nonAt) == 1 && nonAt[0] == "调试"
+}
+
+// sendDebugInfo 发送调试诊断信息(含 chat_id)
+//
+// 不调 LLM, 不截断, 占 1 条频控配额
+// 信息故意简短(< 200 字),便于用户直接复制贴出来对照
+func (b *Bridge) sendDebugInfo(ctx context.Context, chatID, userID string) {
+	llmStatus := "disabled"
+	if b.runner != nil && b.runner.Enabled() {
+		llmStatus = "enabled"
+	}
+	// 用 \n 真实换行,企微 text 消息会原样显示
+	msg := fmt.Sprintf(
+		"🤖 调试 OK\nchat_id: %s\nuser_id: %s\nllm: %s\nts: %s",
+		chatID,
+		userID,
+		llmStatus,
+		time.Now().Format("2006-01-02 15:04:05"),
+	)
+	log.Printf("[bridge] DEBUG chat=%s user=%s llm=%s", chatID, userID, llmStatus)
+	b.sendSafe(ctx, chatID, msg)
+}
+
 // extractTextDelta 从 trpc-agent-go event 抽一个文本 chunk
-//   streaming: 走 Choice.Delta.Content
-//   非 streaming: 走 Choice.Message.Content
+//
+//	streaming: 走 Choice.Delta.Content
+//	非 streaming: 走 Choice.Message.Content
 func extractTextDelta(ev *event.Event) string {
 	if ev.Response == nil {
 		return ""

@@ -18,10 +18,10 @@ import (
 
 type mockRunner struct {
 	enabled bool
-	reply   string    // 累积成单一 chunk 模拟"非 streaming 一次性返回"
-	asDelta bool      // true: 通过 Choice.Delta.Content 模拟 streaming
+	reply   string // 累积成单一 chunk 模拟"非 streaming 一次性返回"
+	asDelta bool   // true: 通过 Choice.Delta.Content 模拟 streaming
 	delay   time.Duration
-	fail    error     // 模拟 runner.Run 返回 error
+	fail    error // 模拟 runner.Run 返回 error
 	called  int
 }
 
@@ -76,7 +76,7 @@ func makeMessageEvent(content string) *RunnerEvent {
 	return &RunnerEvent{Raw: &event.Event{
 		Response: &model.Response{
 			Choices: []model.Choice{{
-				Index:  0,
+				Index:   0,
 				Message: model.Message{Content: content, Role: "assistant"},
 			}},
 		},
@@ -91,7 +91,7 @@ func makeMessageEvent(content string) *RunnerEvent {
 type mockSender struct {
 	mu      sync.Mutex
 	sent    []sentMsg
-	failN   int   // 前 N 次 SendText 返 error
+	failN   int // 前 N 次 SendText 返 error
 	failErr error
 }
 
@@ -373,4 +373,158 @@ func max(a, b int) int {
 		return a
 	}
 	return b
+}
+
+// ============================================================
+// 调试命令 (W5+)
+// ============================================================
+
+func TestIsDebugCommand(t *testing.T) {
+	cases := []struct {
+		text string
+		want bool
+	}{
+		// 命中
+		{"调试", true},
+		{"@机器人 调试", true},
+		{"@AIBot 调试", true},
+		{"@机器人  调试", true}, // 多空格
+		{"  调试  ", true},
+
+		// 不命中
+		{"", false},
+		{"@机器人", false},          // 没"调试"
+		{"帮我调试一下", false},        // 前缀"调试"但不是"调试"
+		{"调试 hello", false},      // 有额外内容
+		{"@机器人 调试 extra", false}, // 有额外内容
+		{"@机器人 调 试", false},      // 两个字分开
+		{"查询调试日志", false},        // "调试" 在中间
+		{"hello", false},
+	}
+	for _, c := range cases {
+		t.Run(c.text, func(t *testing.T) {
+			if got := isDebugCommand(c.text); got != c.want {
+				t.Errorf("isDebugCommand(%q) = %v, want %v", c.text, got, c.want)
+			}
+		})
+	}
+}
+
+func TestBridge_DebugCommand_ReplyChatID(t *testing.T) {
+	sender := &mockSender{}
+	runner := &mockRunner{enabled: true, reply: "LLM 不该被调"}
+	bridge := NewBridge(BridgeConfig{ChatIDs: []string{"c1"}}, runner, sender)
+
+	bridge.Handle("c1", "u1", "调试")
+	if !waitFor(t, 500*time.Millisecond, func() bool { return len(sender.Sent()) == 1 }) {
+		t.Fatal("expected 1 message")
+	}
+	sent := sender.Sent()
+	if !strings.Contains(sent[0].Text, "chat_id: c1") {
+		t.Errorf("调试回复应含 'chat_id: c1', got: %q", sent[0].Text)
+	}
+	if !strings.Contains(sent[0].Text, "user_id: u1") {
+		t.Errorf("调试回复应含 'user_id: u1', got: %q", sent[0].Text)
+	}
+	if !strings.Contains(sent[0].Text, "llm: enabled") {
+		t.Errorf("调试回复应含 'llm: enabled', got: %q", sent[0].Text)
+	}
+	if runner.called != 0 {
+		t.Errorf("调试路径不应调 runner,实际调了 %d 次", runner.called)
+	}
+}
+
+func TestBridge_DebugCommand_AtBotPrefix(t *testing.T) {
+	sender := &mockSender{}
+	runner := &mockRunner{enabled: true, reply: "x"}
+	bridge := NewBridge(BridgeConfig{ChatIDs: []string{"c1"}}, runner, sender)
+
+	// 群里 @ 机器人发"调试",文本格式通常是 "@机器人 调试"
+	bridge.Handle("c1", "u1", "@AIBot 调试")
+	if !waitFor(t, 500*time.Millisecond, func() bool { return len(sender.Sent()) == 1 }) {
+		t.Fatal("expected 1 message")
+	}
+	if !strings.Contains(sender.Sent()[0].Text, "chat_id: c1") {
+		t.Errorf("@机器人 调试 应命中调试路径, got: %q", sender.Sent()[0].Text)
+	}
+	if runner.called != 0 {
+		t.Errorf("调试路径不应调 runner, got %d calls", runner.called)
+	}
+}
+
+func TestBridge_DebugCommand_NoMatch_GoesToLLM(t *testing.T) {
+	sender := &mockSender{}
+	runner := &mockRunner{enabled: true, reply: "我收到了"}
+	bridge := NewBridge(BridgeConfig{ChatIDs: []string{"c1"}}, runner, sender)
+
+	// "帮我调试一下" 不该命中,应走 LLM
+	bridge.Handle("c1", "u1", "帮我调试一下")
+	if !waitFor(t, 500*time.Millisecond, func() bool { return len(sender.Sent()) == 1 }) {
+		t.Fatal("expected 1 message")
+	}
+	if sender.Sent()[0].Text != "我收到了" {
+		t.Errorf("非调试消息应走 LLM, got: %q", sender.Sent()[0].Text)
+	}
+	if runner.called != 1 {
+		t.Errorf("非调试消息应调 runner 1 次, got %d", runner.called)
+	}
+}
+
+func TestBridge_DebugCommand_LLMDisabled_StillReplies(t *testing.T) {
+	// LLM 不可用时,调试路径仍要能回 (否则调试功能也用不了)
+	sender := &mockSender{}
+	runner := &mockRunner{enabled: false}
+	bridge := NewBridge(BridgeConfig{ChatIDs: []string{"c1"}}, runner, sender)
+
+	bridge.Handle("c1", "u1", "调试")
+	if !waitFor(t, 500*time.Millisecond, func() bool { return len(sender.Sent()) == 1 }) {
+		t.Fatal("expected 1 message")
+	}
+	sent := sender.Sent()
+	if !strings.Contains(sent[0].Text, "llm: disabled") {
+		t.Errorf("LLM 禁用时调试回复应含 'llm: disabled', got: %q", sent[0].Text)
+	}
+	if !strings.Contains(sent[0].Text, "chat_id: c1") {
+		t.Errorf("LLM 禁用时调试回复仍应含 chat_id, got: %q", sent[0].Text)
+	}
+}
+
+func TestBridge_DebugCommand_ConsumesRateLimit(t *testing.T) {
+	// 调试占 1 条频控,防滥用
+	sender := &mockSender{}
+	runner := &mockRunner{enabled: true, reply: "ok"}
+	bridge := NewBridge(BridgeConfig{
+		ChatIDs:       []string{"c1"},
+		PerMinuteRate: 2, // 2/min 上限
+	}, runner, sender)
+
+	// 1) 调试(占 1 条)
+	bridge.Handle("c1", "u1", "调试")
+	// 2) 调试(占第 2 条)
+	bridge.Handle("c1", "u1", "@bot 调试")
+	// 3) 正常消息(应被频控挡)
+	bridge.Handle("c1", "u1", "hi")
+
+	if !waitFor(t, 2*time.Second, func() bool { return len(sender.Sent()) == 3 }) {
+		t.Fatalf("expected 3 messages (2 debug + 1 rate-limit), got %d", len(sender.Sent()))
+	}
+
+	debugCount := 0
+	rateLimitCount := 0
+	for _, m := range sender.Sent() {
+		if strings.Contains(m.Text, "chat_id:") {
+			debugCount++
+		} else if strings.Contains(m.Text, "消息太多") {
+			rateLimitCount++
+		}
+	}
+	if debugCount != 2 {
+		t.Errorf("调试消息应 2 条, got %d (sent=%+v)", debugCount, sender.Sent())
+	}
+	if rateLimitCount != 1 {
+		t.Errorf("频控降级应 1 条, got %d (sent=%+v)", rateLimitCount, sender.Sent())
+	}
+	if runner.called != 0 {
+		t.Errorf("调试路径不应触发 runner, got %d calls", runner.called)
+	}
 }

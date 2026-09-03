@@ -197,26 +197,41 @@ func main() {
 	//   env: COLLECTAI_AGENT_CHAT_IDS=chat_id1,chat_id2 (逗号或空格分隔)
 	//        COLLECTAI_AGENT_ENABLED=true|false (默认 true, 需时显式关)
 	// (agentEnabled / agentChatIDs / agentRunner 已在 W2.5 块定义, 这里直接用)
-	if agentEnabled && len(agentChatIDs) > 0 {
-		agentCfg := agent.LoadConfigFromEnv(os.Getenv)
+	// W4.2.1 修复: agentRunner 创建条件不再绑 wecom bridge 配置
+	//   - 之前:  if agentEnabled && len(agentChatIDs) > 0
+	//   - bug:    用户不接管企微群 (没设 COLLECTAI_AGENT_CHAT_IDS) → agentRunner 永远是 nil
+	//            → alertSvc 永远走 fallback Go rules, 跟 LLM key 无关
+	//   - 修复:  agentRunner 创建条件 = agentEnabled && LLM key 非空
+	//            wecom bridge 启动条件独立判断 = agentChatIDs 非空
+	agentCfg := agent.LoadConfigFromEnv(os.Getenv)
+	if agentEnabled && strings.TrimSpace(agentCfg.APIKey) != "" {
 		var err error
 		agentRunner, err = agent.NewRunner(context.Background(), agentCfg, pool, gateway)
 		if err != nil {
-			log.Printf("[main] agent.NewRunner 失败: %v (Bridge 不启动)", err)
+			log.Printf("[main] agent.NewRunner 失败: %v (LLM 任务降级为 fallback)", err)
 		} else {
-			bridge := agent.NewBridge(agent.DefaultBridgeConfig(), agentRunner, agent.NewWecomSender(wecomClient))
-			// 白名单 set 覆盖默认
-			bridge = agent.NewBridge(agent.BridgeConfig{
-				ChatIDs:       agentChatIDs,
-				MaxReplyChars: 200,
-				PerMinuteRate: 25,
-				RunTimeout:    60 * time.Second,
-			}, agentRunner, agent.NewWecomSender(wecomClient))
-			wecomClient.OnAgentMessage(bridge.Handle)
-			log.Printf("[main] Agent Bridge ready: chats=%d llm=%v model=%s", len(agentChatIDs), agentRunner.Enabled(), agentCfg.ModelName)
+			log.Printf("[main] Agent Runner ready: llm=%v model=%s (供 purchase-alert 等 skill 调)",
+				agentRunner.Enabled(), agentCfg.ModelName)
 		}
 	} else {
-		log.Printf("[main] Agent Bridge 未启动 (enabled=%v, chats=%d)", agentEnabled, len(agentChatIDs))
+		log.Printf("[main] Agent Runner 未启动 (enabled=%v, llm_key=%s)",
+			agentEnabled, maskAPIKey(agentCfg.APIKey))
+	}
+
+	// wecom bridge 独立判断: 接管企微群消息 → 调 agentRunner.Run
+	if agentEnabled && len(agentChatIDs) > 0 && agentRunner != nil {
+		bridge := agent.NewBridge(agent.DefaultBridgeConfig(), agentRunner, agent.NewWecomSender(wecomClient))
+		// 白名单 set 覆盖默认
+		bridge = agent.NewBridge(agent.BridgeConfig{
+			ChatIDs:       agentChatIDs,
+			MaxReplyChars: 200,
+			PerMinuteRate: 25,
+			RunTimeout:    60 * time.Second,
+		}, agentRunner, agent.NewWecomSender(wecomClient))
+		wecomClient.OnAgentMessage(bridge.Handle)
+		log.Printf("[main] Agent Bridge ready: chats=%d", len(agentChatIDs))
+	} else if agentEnabled && len(agentChatIDs) > 0 {
+		log.Printf("[main] Agent Bridge 跳过 (agentRunner 未就绪, LLM key 缺失)")
 	}
 
 	// Phase A (2026-09-02): 注入 SkillStore + Orchestrator 到 handler
@@ -656,4 +671,13 @@ func asAnyString(v any) string {
 		return s
 	}
 	return fmt.Sprintf("%v", v)
+}
+
+// maskAPIKey 脱敏输出 API key (用于日志, 只显示前后 4 字符)
+func maskAPIKey(key string) string {
+	key = strings.TrimSpace(key)
+	if len(key) <= 8 {
+		return "***"
+	}
+	return key[:4] + "***" + key[len(key)-4:]
 }

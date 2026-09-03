@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"testing"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/tinkler/collect-ai/internal/model"
@@ -272,4 +273,61 @@ func indexOfStr(haystack, needle string) int {
 		}
 	}
 	return -1
+}
+
+// W4.2.1 regression: fallback (Go rules) 路径必须写 analysis_status=done
+//   之前 bug: applyViaGoRules 跑完不写 status, 前端永远轮询"分析中"
+//   现在: applyViaGoRules 末尾调 writeAnalysisStatus("done")
+//
+// 不依赖 DB: 验证 nil pool 时 writeAnalysisStatus 不 panic
+func TestWriteAnalysisStatus_NilPoolSafe(t *testing.T) {
+	svc := NewService(nil) // nil pool
+	// 不应 panic
+	svc.writeAnalysisStatus(context.Background(), "sess-1", "done", "")
+	svc.writeAnalysisStatus(context.Background(), "sess-1", "failed", "error")
+	svc.writeAnalysisStatus(context.Background(), "", "done", "") // 空 ID 也安全
+}
+
+func TestApply_FallbackWritesDone(t *testing.T) {
+	pool, cleanup := testPoolFallback(t)
+	defer cleanup()
+	if pool == nil {
+		t.Skip("PG unavailable, skipping integration test")
+	}
+
+	sessID := "11111111-aaaa-bbbb-cccc-111111111111"
+	setupAlertsTable(t, pool)
+	// 准备 session + analysis_status='pending' (模拟刚创建)
+	_, err := pool.Exec(context.Background(), `
+		INSERT INTO parse_session (id, supplier_name, mode, analysis_status)
+		VALUES ($1, '汇一', 'purchase', 'pending')
+		ON CONFLICT (id) DO UPDATE SET analysis_status='pending', analysis_at=NULL, analysis_error=''
+	`, sessID)
+	if err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = pool.Exec(context.Background(), `DELETE FROM purchase_session_alert WHERE session_id = $1`, sessID)
+		_, _ = pool.Exec(context.Background(), `DELETE FROM parse_session WHERE id = $1`, sessID)
+	})
+
+	// 没 agentRunner → 走 fallback Go rules
+	svc := NewService(pool)
+	qty := 1
+	sess := makeSession(sessID, "汇一", makeRow(1, "汇一", "可口可乐", &qty))
+	_, _ = svc.Apply(context.Background(), sess) // 期望 nil pool 错误, 或 alerts 0 都可接受, 关键是 status 写对了
+
+	// 验: DB analysis_status 必须是 done (W4.2.1 修复后行为)
+	var status string
+	var at *time.Time
+	if err := pool.QueryRow(context.Background(),
+		`SELECT analysis_status, analysis_at FROM parse_session WHERE id = $1`, sessID).Scan(&status, &at); err != nil {
+		t.Fatalf("re-query status: %v", err)
+	}
+	if status != "done" {
+		t.Errorf("analysis_status = %q, want done (W4.2.1 fix)", status)
+	}
+	if at == nil {
+		t.Error("analysis_at should be non-null after done")
+	}
 }

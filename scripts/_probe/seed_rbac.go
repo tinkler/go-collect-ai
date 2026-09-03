@@ -26,18 +26,23 @@ func main() {
 		{"manager", "plan:read"}, {"manager", "plan:create"},
 		{"manager", "restock:feedback"},
 		{"manager", "inventory:view"}, {"manager", "inventory:adjust"},
+		{"manager", "supplier:view"}, // 2026-09-03: 跟库存数权限隔离对称,经理可见供应商
 		{"manager", "report:view"}, {"manager", "user:manage"},
 		{"buyer", "session:create"}, {"buyer", "session:read"},
 		{"buyer", "session:update"}, {"buyer", "session:delete"},
 		{"buyer", "row:update"}, {"buyer", "row:delete"},
 		{"buyer", "plan:read"}, {"buyer", "plan:create"},
 		{"buyer", "plan:approve"}, {"buyer", "inventory:view"},
+		{"buyer", "supplier:view"}, // 2026-09-03: 采购日常要按供应商选品,必须可见
 		{"cashier", "session:read"}, {"cashier", "plan:read"},
 		{"cashier", "restock:feedback"},
+		// 2026-09-03: cashier / floor 不给 supplier:view
+		//   收银/卖场员工不需要看"哪个供应商供货",只管收银/补货操作
 		{"floor", "plan:read"}, {"floor", "restock:feedback"},
 		{"office", "plan:read"}, {"office", "plan:create"},
 		{"office", "inventory:view"}, {"office", "report:view"},
 		{"office", "restock:feedback"},
+		{"office", "supplier:view"}, // 2026-09-03: 办公室做报表需要看供应商
 	}
 	for _, rp := range rps {
 		_, _ = conn.Exec(ctx, `INSERT INTO role_permissions (role_id, perm_id) VALUES ($1,$2) ON CONFLICT DO NOTHING`, rp.role, rp.perm)

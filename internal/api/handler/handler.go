@@ -1297,13 +1297,15 @@ func splitAndTrim(s string, seps string) []string {
 
 // SearchProducts GET /api/v1/products/search?supplier=xxx&limit=100
 //   数据源启动后即固定(2026-08-31),不再接受 ?datasource= 覆盖
-//   业务字段:barcode/product_name/supplier_id/supplier_name/category/brand/stock_qty
+//   业务字段:barcode/product_name/supplier_id/supplier_name/category/brand/stock_qty/unit
 //   业务字段查询(前端直接调)
-//   业务字段:barcode/product_name/supplier_id/supplier_name/category/brand/stock_qty
 //
-// 2026-09-01 权限隔离: stock_qty 字段需 inventory:view perm
-//   - 无 perm → stock_qty 既不入 query measures 也不入 response
-//   - meta.inv_viewable=false → 前端显"无权限"而不是"无库存字段"
+// 权限隔离 (2026-09-01 库存 + 2026-09-03 供应商 + 单位):
+//   - stock_qty       需 inventory:view perm (无 → 不查不返回)
+//   - supplier_id /
+//     supplier_name   需 supplier:view  perm (无 → 不查不返回)
+//   - unit            不做权限控制(所有用户都能看商品计量单位)
+//   - meta.inv_viewable / meta.supplier_viewable 告诉前端哪些字段被权限过滤
 func (h *Handler) SearchProducts(c *gin.Context) {
 	if err := h.Agent.Ping(); err != nil {
 		c.JSON(503, gin.H{"error": "agent 不可达: " + err.Error()})
@@ -1340,17 +1342,25 @@ func (h *Handler) SearchProducts(c *gin.Context) {
 	}
 
 	// 2026-09-01: 权限隔离 — 无 inventory:view 则不查不返回 stock_qty
-	invViewable := auth.HasPerm(auth.RoleFromCtx(c), "inventory:view")
+	// 2026-09-03: 加 supplier:view 隔离 (跟 restock 模块 permSupplierView 一致)
+	role := auth.RoleFromCtx(c)
+	invViewable := auth.HasPerm(role, "inventory:view")
+	supplierViewable := auth.HasPerm(role, "supplier:view")
 
 	// 默认拉所有可用业务字段
-	bizFields := []string{"barcode", "product_name", "supplier_id", "supplier_name", "category", "brand", "stock_qty", "price"}
-	if !invViewable {
-		// 过滤掉 stock_qty: 既不进 query measures 也不进 response
+	// 2026-09-03: 加 unit 字段 (mapping.go:332 已定义 → t_bd_item_info.unit_no)
+	bizFields := []string{"barcode", "product_name", "supplier_id", "supplier_name", "category", "brand", "stock_qty", "unit", "price"}
+	if !invViewable || !supplierViewable {
+		// 过滤掉无 perm 的敏感字段: 既不进 query measures/dimensions 也不进 response
 		filtered := bizFields[:0]
 		for _, bf := range bizFields {
-			if bf != "stock_qty" {
-				filtered = append(filtered, bf)
+			if !invViewable && bf == "stock_qty" {
+				continue
 			}
+			if !supplierViewable && (bf == "supplier_id" || bf == "supplier_name") {
+				continue
+			}
+			filtered = append(filtered, bf)
 		}
 		bizFields = filtered
 	}
@@ -1389,7 +1399,8 @@ func (h *Handler) SearchProducts(c *gin.Context) {
 		"datasource": ds,
 		"cube":       h.BizExecutor.CubeOf("products"),
 		"meta": gin.H{
-			"inv_viewable": invViewable,
+			"inv_viewable":      invViewable,
+			"supplier_viewable": supplierViewable,
 		},
 	})
 }

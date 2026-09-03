@@ -158,8 +158,11 @@ func (s *Service) applyViaSkill(ctx context.Context, sess *model.Session) ([]Ale
 	// 4) LLM 已通过 insert_purchase_alert 落库, 重新读 alerts
 	alerts, err := s.ListAlertsBySession(ctx, sess.ID)
 	if err != nil {
+		s.writeAnalysisStatus(ctx, sess.ID, "failed", "read alerts: "+err.Error())
 		return nil, fmt.Errorf("read alerts after LLM: %w", err)
 	}
+	// 5) 写 done (W4.2.1: 跟 fallback 路径行为一致)
+	s.writeAnalysisStatus(ctx, sess.ID, "done", "")
 	return alerts, nil
 }
 
@@ -200,10 +203,16 @@ rows (本次采购商品):
 }
 
 // applyViaGoRules fallback: 跑 Go rules (W3.2 - W4.1 老路径, 保持兼容)
+//
+// W4.2.1 fix: 跑完必须写 analysis_status=done/failed, 跟 applyViaSkill 行为一致
+//   - 否则前端永远轮询"正在排队分析中", 1 小时后还在 pending
+//   - writeAnalysisStatus 在 s.pool 为 nil 时静默跳过 (兼容单测)
 func (s *Service) applyViaGoRules(ctx context.Context, sess *model.Session) ([]Alert, error) {
 	// 1) 加载上下文
 	rc, err := s.loadContext(ctx, sess)
 	if err != nil {
+		// loadContext 失败: 写 failed, 但仍返 err 让调用方知道
+		s.writeAnalysisStatus(ctx, sess.ID, "failed", err.Error())
 		return nil, fmt.Errorf("load context: %w", err)
 	}
 
@@ -233,10 +242,36 @@ func (s *Service) applyViaGoRules(ctx context.Context, sess *model.Session) ([]A
 	if len(alerts) > 0 {
 		if err := s.insertAlerts(ctx, alerts); err != nil {
 			log.Printf("[purchasealert] insertAlerts err: %v", err)
+			s.writeAnalysisStatus(ctx, sess.ID, "failed", err.Error())
 			return alerts, fmt.Errorf("insert alerts: %w", err)
 		}
 	}
+	// 4) 写 done (跟 StartAnalysisAsync 的 LLM 路径行为一致)
+	s.writeAnalysisStatus(ctx, sess.ID, "done", "")
 	return alerts, nil
+}
+
+// writeAnalysisStatus 写 status 到 PG (W4.2.1 修 fallback 不写 done 的 bug)
+//   pool nil 静默跳过 (单测不连 DB)
+//   error 静默忽略 (主流程已返 alerts, status 写失败不影响业务)
+func (s *Service) writeAnalysisStatus(ctx context.Context, sessionID, status, errMsg string) {
+	if s.pool == nil || sessionID == "" {
+		return
+	}
+	var at interface{}
+	if status == "done" {
+		at = time.Now()
+	} else {
+		at = nil
+	}
+	_, err := s.pool.Exec(ctx, `
+		UPDATE parse_session
+		SET analysis_status = $2, analysis_at = $3, analysis_error = $4, updated_at = NOW()
+		WHERE id = $1
+	`, sessionID, status, at, errMsg)
+	if err != nil {
+		log.Printf("[purchasealert] writeAnalysisStatus(%s, %s) err: %v", sessionID, status, err)
+	}
 }
 
 // loadContext 加载供应商政策 + 节假日 + 阈值 (app_settings) + active promos
