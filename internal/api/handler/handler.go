@@ -685,6 +685,9 @@ func (h *Handler) CreateSession(c *gin.Context) {
 	if s.Mode == model.ModePurchase && h.RestockSvc != nil {
 		_ = h.RestockSvc.AttachPlanQtyToRows(c.Request.Context(), s.SupplierName, s.Rows)
 	}
+	// 2026-09-03: 反查 hbpos t_bd_item_info, 把 barcode → item_no 写到 row.ItemNo
+	//   企业微信"复制"按钮要的就是 item_no, 不是条码; cube 失败也不阻塞
+	h.enrichRowsWithItemNo(c.Request.Context(), s.Rows)
 	// W4.1: 异步触发策略分析 (立即返回, 不等 LLM)
 	if s.Mode == model.ModePurchase && h.AlertSvc != nil {
 		h.AlertSvc.StartAnalysisAsync(id, h.Sessions.Get)
@@ -728,6 +731,9 @@ func (h *Handler) GetSession(c *gin.Context) {
 	if s.Mode == model.ModePurchase && h.RestockSvc != nil {
 		_ = h.RestockSvc.AttachPlanQtyToRows(c.Request.Context(), s.SupplierName, s.Rows)
 	}
+	// 2026-09-03: 反查 hbpos t_bd_item_info, 把 barcode → item_no 写到 row.ItemNo
+	//   企业微信"复制"按钮要的就是 item_no, 不是条码; cube 失败也不阻塞
+	h.enrichRowsWithItemNo(c.Request.Context(), s.Rows)
 	// W4.1: 异步分析 — 不再同步 Apply, 直接读 alerts
 	//   analysis_status='done' 时返回 alerts + summary
 	//   analysis_status='pending'/'running'/'failed' 时 alerts 可能是空或旧值, 前端按 status 处理
