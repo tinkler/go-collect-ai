@@ -106,6 +106,39 @@ description: 测试路径穿越防护
 	}
 }
 
+// TestInvokeSkill_ReadFileRejectsScriptsDir 验证 read_file 不允许读 scripts/ 下的脚本
+// (防止 LLM 用 read_file 误读 .py 源码, 脚本必须用 run_script 跑)
+func TestInvokeSkill_ReadFileRejectsScriptsDir(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, filepath.Join(root, "demo", "SKILL.md"), `---
+name: demo
+description: 测试 read_file 拒绝 scripts/ 下的脚本
+---
+# body
+`)
+	scriptDir := filepath.Join(root, "demo", "scripts")
+	if err := os.MkdirAll(scriptDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, filepath.Join(scriptDir, "compute.py"), "print(1)")
+
+	res, _ := Load([]string{root})
+	store := NewStore()
+	store.Replace(res.Skills)
+
+	_, err := runInvoke(context.Background(), store, InvokeSkillReq{
+		SkillName: "demo",
+		Action:    "read_file",
+		Path:      "scripts/compute.py",
+	})
+	if err == nil {
+		t.Fatal("read_file 读 scripts/ 应被拒绝")
+	}
+	if !strings.Contains(err.Error(), "scripts/") {
+		t.Errorf("err 应说明 scripts/ 限制,got %q", err.Error())
+	}
+}
+
 func TestInvokeSkill_RunScript(t *testing.T) {
 	root := t.TempDir()
 	writeFile(t, filepath.Join(root, "demo", "SKILL.md"), `---

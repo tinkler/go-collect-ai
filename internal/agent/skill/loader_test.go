@@ -152,11 +152,11 @@ body
 		t.Fatalf("want 1, got %d", len(res.Skills))
 	}
 	sk := res.Skills[0]
-	if len(sk.Scripts) != 1 || sk.Scripts[0] != "compute.py" {
-		t.Errorf("scripts = %v, want [compute.py]", sk.Scripts)
+	if len(sk.Scripts) != 1 || sk.Scripts[0] != "scripts/compute.py" {
+		t.Errorf("scripts = %v, want [scripts/compute.py] (带前缀)", sk.Scripts)
 	}
-	if len(sk.References) != 1 || sk.References[0] != "facts.md" {
-		t.Errorf("references = %v, want [facts.md]", sk.References)
+	if len(sk.References) != 1 || sk.References[0] != "references/facts.md" {
+		t.Errorf("references = %v, want [references/facts.md] (带前缀)", sk.References)
 	}
 }
 

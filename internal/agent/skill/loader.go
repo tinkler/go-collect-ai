@@ -122,9 +122,11 @@ func LoadOne(skillDir, source string) (*Skill, error) {
 	}
 
 	// 枚举子目录
-	scripts := listDirFiles(filepath.Join(skillDir, "scripts"))
-	refs := listDirFiles(filepath.Join(skillDir, "references"))
-	assets := listDirFiles(filepath.Join(skillDir, "assets"))
+	// 路径带子目录前缀(scripts/xxx.py / references/yyy.md),跟 LLM 调 invoke_skill 的 path 写法一致
+	// LLM 看到 scripts=["scripts/run_analysis.py"] 不会再裸名 path="run_analysis.py"
+	scripts := listDirFiles(filepath.Join(skillDir, "scripts"), "scripts")
+	refs := listDirFiles(filepath.Join(skillDir, "references"), "references")
+	assets := listDirFiles(filepath.Join(skillDir, "assets"), "assets")
 
 	return &Skill{
 		Manifest:   *manifest,
@@ -181,7 +183,10 @@ func decodeFM(fm, body string) (*Manifest, string, error) {
 	return &m, strings.TrimSpace(body), nil
 }
 
-func listDirFiles(dir string) []string {
+// listDirFiles 枚举 dir 下的所有文件(不递归子目录)
+//   subdir 用于拼前缀; 空字符串则返回裸文件名(兼容调用方)
+//   例: listDirFiles("/x/scripts", "scripts") → ["scripts/foo.py", "scripts/bar.py"]
+func listDirFiles(dir, subdir string) []string {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return nil // 目录不存在是合法的
@@ -191,7 +196,11 @@ func listDirFiles(dir string) []string {
 		if e.IsDir() {
 			continue
 		}
-		out = append(out, e.Name())
+		if subdir != "" {
+			out = append(out, filepath.ToSlash(filepath.Join(subdir, e.Name())))
+		} else {
+			out = append(out, e.Name())
+		}
 	}
 	sort.Strings(out)
 	return out

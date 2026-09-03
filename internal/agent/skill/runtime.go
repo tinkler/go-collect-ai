@@ -233,6 +233,12 @@ func doReadFile(sk *Skill, r InvokeSkillReq) (InvokeSkillResp, error) {
 	if err != nil || strings.HasPrefix(rel, "..") || strings.Contains(rel, ".."+string(filepath.Separator)) {
 		return InvokeSkillResp{}, fmt.Errorf("path %q 非法,必须位于 %s 内", r.Path, sk.Root)
 	}
+	// read_file 只允许读 references/ 和 assets/ 下的文件
+	// scripts/ 下的脚本必须用 run_script 跑(防止 LLM 误读 .py 源码)
+	relSlash := filepath.ToSlash(rel)
+	if !strings.HasPrefix(relSlash, "references/") && !strings.HasPrefix(relSlash, "assets/") {
+		return InvokeSkillResp{}, fmt.Errorf("path %q 不允许 read_file:只支持 references/ 和 assets/ 下的文件;scripts/ 下的脚本请用 action=run_script", r.Path)
+	}
 	full := filepath.Join(sk.Root, r.Path)
 	data, err := os.ReadFile(full)
 	if err != nil {
