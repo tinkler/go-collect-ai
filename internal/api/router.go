@@ -125,6 +125,10 @@ func NewRouter(h *handler.Handler, cfg *config.Config, restockSvc *restock.Servi
 			authed.GET("/sessions/:id/export", auth.RequirePerm("session:read"), h.ExportSession)
 			authed.PUT("/sessions/:id/rows/:rowId", auth.RequirePerm("row:update"), h.UpdateRow)
 			authed.DELETE("/sessions/:id/rows/:rowId", auth.RequirePerm("row:delete"), h.DeleteRow)
+			// W4.1: 追加图片到已有 session (重复图去重 + 续接 seq)
+			authed.POST("/sessions/:id/images", limiter.Middleware(wait), auth.RequirePerm("session:update"), h.AppendImages)
+			// W4.1: 轻量状态查询 (前端轮询用, 不拉 rows)
+			authed.GET("/sessions/:id/analysis-status", auth.RequirePerm("session:read"), h.GetAnalysisStatus)
 
 			// 采购计划
 			authed.GET("/purchase-plans", auth.RequirePerm("plan:read"), restock.RestockPurchasePlansList(restockSvc))

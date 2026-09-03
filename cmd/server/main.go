@@ -174,6 +174,7 @@ func main() {
 		Agent:           agentClient,
 		BizExecutor:     bizExecutor, // 2026-09-02 新增
 		BusinessReg:     businessReg,
+		Pool:            pool,        // W4.1: GetAnalysisStatus 轻量查询
 		Sessions:        sessionRepo,
 		Strategies:      strategyRepo, // Phase A 新增
 		// SkillStore + Orchestrator 在 agentRunner 初始化后注入
@@ -235,6 +236,17 @@ func main() {
 		}
 	}
 	h.SkillStore = skillStore
+	// W4.2: 把 agentRunner + skillStore 注入 alertSvc
+	//   alertSvc.Apply 优先调 agentRunner.RunAnalysis 跑 purchase-alert skill
+	//   LLM 不可用 / skill 缺失 / 跑失败 → fallback 到 Go rules
+	if agentRunner != nil && skillStore != nil {
+		alertSvc.SetAgentRunner(agentRunner)
+		alertSvc.SetSkillLoader(&skillStoreAdapter{store: skillStore})
+		log.Printf("[main] alertSvc 走 LLM skill 路径 (purchase-alert), 失败 fallback Go rules")
+	} else {
+		log.Printf("[main] alertSvc 走 Go rules fallback (agentRunner=%v skillStore=%v)",
+			agentRunner != nil, skillStore != nil)
+	}
 	if skillStore != nil {
 		skuLoader := bizSkuLoaderAdapter{exec: bizExecutor}
 		// Phase B+ (2026-09-03): VLM-only, vlmModel 走 env VLM_MODEL (默认 glm-4v)
@@ -588,6 +600,20 @@ func runMonthly(ctx context.Context, fn func(context.Context), day, hour, minute
 		case <-timer.C:
 		}
 	}
+}
+
+// skillStoreAdapter 把 *skill.Store 适配成 purchasealert.SkillLoader
+//   purchasealert 不直接 import skill 包 (避免循环), 通过 interface 注入
+type skillStoreAdapter struct {
+	store *skill.Store
+}
+
+func (a *skillStoreAdapter) GetBody(name string) (string, bool) {
+	sk, ok := a.store.Get(name)
+	if !ok {
+		return "", false
+	}
+	return sk.Body, true
 }
 
 // bizSkuLoaderAdapter Phase A (2026-09-02): 把 business.Executor 适配成 parser.SkuLoader

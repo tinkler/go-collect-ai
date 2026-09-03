@@ -94,6 +94,9 @@ type SkuRecord struct {
 type SkuRow struct {
 	RowID         int64    `json:"row_id"`        // DB id, PUT/DELETE 用
 	Seq           int      `json:"seq"`
+	// 2026-09-03: image_index 标识属于 session 第几张图 (0-based)
+	//   append-images 时按最大 image_index 续接
+	ImageIndex    int      `json:"image_index"`
 	RawBarcode    string   `json:"raw_barcode"`
 	RawName       string   `json:"raw_name"`
 	RawQty        string   `json:"raw_qty"`
@@ -165,26 +168,48 @@ type Session struct {
 	ImageURL        string `json:"image_url"`   // 兼容: 多图时为第一张
 	ImagePaths      []string `json:"image_paths"`  // 多图: 相对路径数组
 	ImageURLs       []string `json:"image_urls"`   // 多图: 完整 URL 数组
+	// 2026-09-03: image_hashes 数组, 元素 = sha256 hex (64 字符)
+	//   append-images 时用此判重, 已存在的 hash 跳过解析
+	ImageHashes  []string  `json:"image_hashes"`
+	// 2026-09-03: 异步策略分析状态 (W4.1)
+	//   pending  - 刚创建/append, 还没开始分析
+	//   running  - Apply 跑中 (LLM)
+	//   done     - 分析完成, 可读 alerts
+	//   failed   - 分析异常, 看 analysis_error
+	AnalysisStatus string     `json:"analysis_status"`
+	AnalysisAt     *time.Time `json:"analysis_at,omitempty"`
+	AnalysisError  string     `json:"analysis_error,omitempty"`
 	Source          string `json:"source"`         // csharp / feishu / wecom_h5
 	Note            string `json:"note,omitempty"`
 	CreatedAt       time.Time `json:"created_at"`
 	UpdatedAt       time.Time `json:"updated_at"`
 	Rows            []SkuRow  `json:"rows,omitempty"`
 	// 2026-09-01 W3.2: 智能提醒 (purchasealert 规则引擎产出)
-	Alerts       []AlertItem `json:"alerts,omitempty"`
+	Alerts []AlertItem `json:"alerts,omitempty"`
+	// 2026-09-03 W4.1: 总结栏 (RowID=0 的 alerts, 显示在图片卡片下)
+	//   堆头签了哪 / 节假日 lead / 策略备注等
+	Summary []AlertItem `json:"summary,omitempty"`
 }
 
 // AlertItem 采购订单智能提醒 (W3.2)
 //   跟 purchasealert.Alert 同字段,放 model 包避免循环依赖
+//
+// 2026-09-03 W4.1: 加 Category 决定前端 icon 段位
+//   - block             红色感叹号 (限入场)
+//   - warn              橙色感叹号 (高库存/不允许退货)
+//   - info              灰普通感叹号 (难消化/反季/节假日)
+//   - highlight_dui     绿色"贴切"标志 (堆头陈列)
+//   - highlight_others  绿色"其它"标志 (快讯/端架)
 type AlertItem struct {
-	AlertID  int64      `json:"alert_id"`
-	RowID    int64      `json:"row_id"`
-	Rule     string     `json:"rule"`
-	Severity string     `json:"severity"`
-	Message  string     `json:"message"`
-	AckedAt  *time.Time `json:"acked_at,omitempty"`
-	AckedBy  string     `json:"acked_by,omitempty"`
-	CreatedAt time.Time `json:"created_at,omitempty"`
+	AlertID   int64      `json:"alert_id"`
+	RowID     int64      `json:"row_id"`
+	Rule      string     `json:"rule"`
+	Severity  string     `json:"severity"`
+	Category  string     `json:"category"`
+	Message   string     `json:"message"`
+	AckedAt   *time.Time `json:"acked_at,omitempty"`
+	AckedBy   string     `json:"acked_by,omitempty"`
+	CreatedAt time.Time  `json:"created_at,omitempty"`
 }
 
 type SessionSummary struct {

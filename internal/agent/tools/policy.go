@@ -1,9 +1,9 @@
 // Package tools 提供 trpc-agent-go Function Tool 实现,挂接 collect-ai 现有 PG。
 //
 // 范围(模块 A, 智能采购 方案 2.3):
-//   - remember_supplier_policy / query_supplier_policy        (supplier_policy)
+//   - remember_supplier_policy / query_supplier_policy / delete_supplier_policy / list_supplier_keys  (supplier_policy)
 //   - record_special_date    / query_upcoming_dates           (special_calendar)
-//   - record_promotion_fee   / list_promotion_fee             (promotion_fee)
+//   - record_promotion_fee   / list_promotion_fee / cancel_promotion_fee (promotion_fee)
 //
 // 约束:
 //   - 工具名只允许 [a-zA-Z0-9_-]+,不能含中文(DeepSeek 严格校验)
@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"trpc.group/trpc-go/trpc-agent-go/tool/function"
 )
@@ -247,5 +248,188 @@ func QuerySupplierPolicy(pool *pgxpool.Pool) *function.FunctionTool[QuerySupplie
 	return function.NewFunctionTool(fn,
 		function.WithName("query_supplier_policy"),
 		function.WithDescription("查某供应商的政策清单(可按 key 过滤). 找不到返回空数组,不是错误."),
+	)
+}
+
+// ============================================================
+// 工具 3: delete_supplier_policy  (W4.2 decision-memory 撤销用)
+//   行为:
+//     - supplier 必填, key 可选
+//     - key 不传 → 删该 supplier 的所有 policy (整条清空)
+//     - key 传  → 只删该 supplier 的这一个 key
+//     - dry_run=true 返待删除清单,不入库
+//   返回: deleted_count + deleted_keys (用于二次确认)
+// ============================================================
+
+// DeleteSupplierPolicyReq 入参
+type DeleteSupplierPolicyReq struct {
+	Supplier string `json:"supplier" jsonschema:"description=供应商名称(必填),required"`
+	Key      string `json:"key,omitempty" jsonschema:"description=属性键(可选): 不传=删全部; 传=只删这一个 key. 允许的 key 见 list_supplier_keys"`
+	DryRun   bool   `json:"dry_run,omitempty" jsonschema:"description=二次确认模式: true=只返回待删除内容, false=真删"`
+}
+
+// DeleteSupplierPolicyResp 出参
+type DeleteSupplierPolicyResp struct {
+	Supplier     string   `json:"supplier"`
+	Action       string   `json:"action"`        // "dry_run" | "deleted" | "not_found"
+	DeletedCount int      `json:"deleted_count"`
+	DeletedKeys  []string `json:"deleted_keys,omitempty"`
+	KeptKeys     []string `json:"kept_keys,omitempty"` // dry_run 时返 (供 LLM 提示)
+}
+
+// DeleteSupplierPolicy 工具函数
+func DeleteSupplierPolicy(pool *pgxpool.Pool) *function.FunctionTool[DeleteSupplierPolicyReq, DeleteSupplierPolicyResp] {
+	fn := func(ctx context.Context, req DeleteSupplierPolicyReq) (DeleteSupplierPolicyResp, error) {
+		if pool == nil {
+			return DeleteSupplierPolicyResp{}, fmt.Errorf("delete_supplier_policy: pg pool 未初始化")
+		}
+		supplier := trimSpace(req.Supplier)
+		if supplier == "" {
+			return DeleteSupplierPolicyResp{}, fmt.Errorf("supplier 必填")
+		}
+		key := trimSpace(req.Key)
+
+		// 1) 先查存在性 + 拿待删 keys 列表
+		var existingKeys []string
+		{
+			var rows pgx.Rows
+			var err error
+			if key != "" {
+				rows, err = pool.Query(ctx, `SELECT key FROM supplier_policy WHERE supplier_name=$1 AND key=$2`, supplier, key)
+			} else {
+				rows, err = pool.Query(ctx, `SELECT key FROM supplier_policy WHERE supplier_name=$1 ORDER BY key`, supplier)
+			}
+			if err != nil {
+				return DeleteSupplierPolicyResp{}, fmt.Errorf("query existing: %w", err)
+			}
+			defer rows.Close()
+			for rows.Next() {
+				var k string
+				if err := rows.Scan(&k); err != nil {
+					return DeleteSupplierPolicyResp{}, err
+				}
+				existingKeys = append(existingKeys, k)
+			}
+			if err := rows.Err(); err != nil {
+				return DeleteSupplierPolicyResp{}, err
+			}
+		}
+		if len(existingKeys) == 0 {
+			return DeleteSupplierPolicyResp{
+				Supplier: supplier,
+				Action:   "not_found",
+			}, nil
+		}
+
+		// 2) dry_run 模式: 只返待删, 不动 DB
+		if req.DryRun {
+			return DeleteSupplierPolicyResp{
+				Supplier:     supplier,
+				Action:       "dry_run",
+				DeletedCount: len(existingKeys),
+				DeletedKeys:  existingKeys,
+			}, nil
+		}
+
+		// 3) 真删
+		var tag pgconn.CommandTag
+		var err error
+		if key != "" {
+			tag, err = pool.Exec(ctx, `DELETE FROM supplier_policy WHERE supplier_name=$1 AND key=$2`, supplier, key)
+		} else {
+			tag, err = pool.Exec(ctx, `DELETE FROM supplier_policy WHERE supplier_name=$1`, supplier)
+		}
+		if err != nil {
+			return DeleteSupplierPolicyResp{}, fmt.Errorf("delete: %w", err)
+		}
+
+		return DeleteSupplierPolicyResp{
+			Supplier:     supplier,
+			Action:       "deleted",
+			DeletedCount: int(tag.RowsAffected()),
+			DeletedKeys:  existingKeys,
+		}, nil
+	}
+	return function.NewFunctionTool(fn,
+		function.WithName("delete_supplier_policy"),
+		function.WithDescription("撤销 supplier 政策 (W4.2 decision-memory). supplier 必填. key 不传=删全部 policy (整条清空), 传=只删一个 key. dry_run=true 时只返回待删除清单, 不入DB. 找不返 not_found. 用于老板说'汇一以后不让退'→remember, '汇一政策都清掉'→delete(全部), '汇一黑名单解除'→delete(block_entry 单个)."),
+	)
+}
+
+// ============================================================
+// 工具 4: list_supplier_keys  (W4.2 decision-memory 列举白名单)
+//   返 7 个 key + 含义, 供 LLM 决策时参照
+// ============================================================
+
+// ListSupplierKeysReq 入参
+type ListSupplierKeysReq struct{}
+
+// ListSupplierKeysResp 出参
+type ListSupplierKeysResp struct {
+	Keys []SupplierKeySpec `json:"keys"`
+}
+
+// SupplierKeySpec 单个 key 的说明
+type SupplierKeySpec struct {
+	Key         string `json:"key"`
+	ValueType   string `json:"value_type"`            // bool / string / number / object
+	Description string `json:"description"`
+	Examples    string `json:"examples,omitempty"`
+}
+
+// 7 个 key 的白名单 (跟 allowedPolicyKeys 保持一致)
+var supplierKeyCatalog = []SupplierKeySpec{
+	{
+		Key:         "is_self_procure",
+		ValueType:   "bool",
+		Description: "是否自采供应商(老板自己进货,不入批发流程)",
+		Examples:    "true=自采, false=他采",
+	},
+	{
+		Key:         "allow_return",
+		ValueType:   "bool",
+		Description: "是否支持退货(合同条款, 影响 no_return 规则)",
+		Examples:    "true=可退, false=不退 (no_return alert 触发)",
+	},
+	{
+		Key:         "has_duitou",
+		ValueType:   "bool",
+		Description: "是否签了堆头陈列(供应商承担堆头费或店内有堆头协议)",
+		Examples:    "true=签了, 影响 has_duitou 规则 + high_stock 降级 A",
+	},
+	{
+		Key:         "has_duanjia",
+		ValueType:   "bool",
+		Description: "是否签了端架陈列",
+		Examples:    "true=签了",
+	},
+	{
+		Key:         "block_entry",
+		ValueType:   "bool",
+		Description: "是否限制入场(老板不想再跟这家做生意, 硬阻断, 永不降级)",
+		Examples:    "true=黑名单, false=正常",
+	},
+	{
+		Key:         "block_reason",
+		ValueType:   "string",
+		Description: "限入场原因 (跟 block_entry=true 配套)",
+		Examples:    "返点高 / 价格乱 / 老板不信任",
+	},
+	{
+		Key:         "note",
+		ValueType:   "string",
+		Description: "自由备注 (老板说的原话/上下文, 给以后的人工看)",
+		Examples:    "老板 2026-09-03 飞书群消息记录",
+	},
+}
+
+// ListSupplierKeys 工具函数
+func ListSupplierKeys(_ *pgxpool.Pool) *function.FunctionTool[ListSupplierKeysReq, ListSupplierKeysResp] {
+	fn := func(ctx context.Context, req ListSupplierKeysReq) (ListSupplierKeysResp, error) {
+		return ListSupplierKeysResp{Keys: supplierKeyCatalog}, nil
+	}
+	return function.NewFunctionTool(fn,
+		function.WithName("list_supplier_keys"),
+		function.WithDescription("列出 supplier_policy 允许的 7 个 key 白名单 (含 value 类型/含义/示例). 供 LLM 解读老板话时参照, 避免写错 key. 跟 query_supplier_policy 配合: 查现状 + 改现状."),
 	)
 }

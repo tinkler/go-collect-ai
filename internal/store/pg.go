@@ -339,6 +339,59 @@ func Migrate(ctx context.Context, pool *pgxpool.Pool) error {
 		`ALTER TABLE parse_session DROP COLUMN IF EXISTS template_id CASCADE`,
 		`ALTER TABLE parse_session DROP COLUMN IF EXISTS template_name CASCADE`,
 		`DROP TABLE IF EXISTS template CASCADE`,
+
+		// ============================================================
+		// 2026-09-03: 重复图去重 + 异步策略分析 (W4.1)
+		// 需求:
+		//   1) 上传重复图不重复处理 (image_hashes 数组 + image_index)
+		//   2) 解析后不等策略分析 (analysis_status: pending|running|done|failed)
+		//   3) 总结栏 + 行内图标 (alert.category)
+		// ============================================================
+
+		// parse_session: 加 image_hashes (JSONB 数组, 元素 = sha256 hex)
+		`ALTER TABLE parse_session ADD COLUMN IF NOT EXISTS image_hashes JSONB NOT NULL DEFAULT '[]'::jsonb`,
+		// parse_session: 加 analysis_status (分析状态)
+		`ALTER TABLE parse_session ADD COLUMN IF NOT EXISTS analysis_status TEXT NOT NULL DEFAULT 'pending'`,
+		// parse_session: 加 analysis_at (最近完成时间)
+		`ALTER TABLE parse_session ADD COLUMN IF NOT EXISTS analysis_at TIMESTAMPTZ`,
+		// parse_session: 加 analysis_error (失败原因)
+		`ALTER TABLE parse_session ADD COLUMN IF NOT EXISTS analysis_error TEXT NOT NULL DEFAULT ''`,
+		// GIN 索引: image_hashes 数组包含查询 (@>)
+		`CREATE INDEX IF NOT EXISTS idx_session_image_hashes ON parse_session USING GIN (image_hashes)`,
+		// 状态索引: 找 pending/running 的 session (cron 重试用)
+		`CREATE INDEX IF NOT EXISTS idx_session_analysis_status ON parse_session(analysis_status) WHERE analysis_status IN ('pending', 'running')`,
+
+		// parse_row: 加 image_index (属于第几张图, 0-based)
+		`ALTER TABLE parse_row ADD COLUMN IF NOT EXISTS image_index INT NOT NULL DEFAULT 0`,
+		// 索引: 按 image_index 查 (append 后回查用)
+		`CREATE INDEX IF NOT EXISTS idx_row_session_image ON parse_row(session_id, image_index)`,
+
+		// purchase_session_alert: 加 category (决定前端 icon 段位)
+		//   block            → 红色感叹号 (限入场)
+		//   warn             → 橙色感叹号 (高库存/不允许退货)
+		//   info             → 灰普通感叹号 (难消化/反季/节假日)
+		//   highlight_dui    → 绿色"贴切"标志 (堆头陈列)
+		//   highlight_others → 绿色"其它"标志 (快讯/端架/特殊活动)
+		`ALTER TABLE purchase_session_alert ADD COLUMN IF NOT EXISTS category TEXT NOT NULL DEFAULT 'info'`,
+		`CREATE INDEX IF NOT EXISTS idx_psalert_category ON purchase_session_alert(session_id, category)`,
+
+		// app_settings: 阈值配置 (K-V, 替换 Go 端硬编码)
+		//   - high_stock_threshold: 库存数 > 阈值 → 高库存
+		//   - low_movement_threshold: 30/60/90 天销量 < 阈值 → 难消化
+		//   - duitou_kinds: 算"堆头陈列"的 kind 集合 (JSON 数组)
+		//   - others_kinds: 算"快讯/其它活动"的 kind 集合
+		`CREATE TABLE IF NOT EXISTS app_settings (
+			key             TEXT PRIMARY KEY,
+			value           JSONB NOT NULL,
+			updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+		)`,
+		// 默认值: 阈值放数据, Go 端 0 业务判断
+		`INSERT INTO app_settings (key, value) VALUES
+			('high_stock_threshold', '50'::jsonb),
+			('low_movement_threshold_30d', '3'::jsonb),
+			('duitou_kinds', '["堆头"]'::jsonb),
+			('others_kinds', '["端架", "快讯", "DM", "特价", "海报"]'::jsonb)
+		ON CONFLICT (key) DO NOTHING`,
 	}
 	for _, s := range stmts {
 		if _, err := pool.Exec(ctx, s); err != nil {

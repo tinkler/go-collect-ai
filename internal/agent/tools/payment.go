@@ -10,6 +10,13 @@ import (
 	"trpc.group/trpc-go/trpc-agent-go/tool/function"
 )
 
+// allowedPromoKinds W4.2 promo-harvester 用的 kind 白名单
+//   跟 skills/promo-harvester/SKILL.md 同步
+var allowedPromoKinds = map[string]bool{
+	"堆头": true, "端架": true, "DM": true, "快讯": true,
+	"海报": true, "特价": true, "其他": true,
+}
+
 // ============================================================
 // 工具 7: compute_promotion_fee_share (W4 D 模块)
 //   算某 supplier 当月 promotion_fee 分摊 (按月在 period 内天数)
@@ -422,6 +429,162 @@ func SuggestSupplierPayment(pool *pgxpool.Pool) *function.FunctionTool[SuggestSu
 	return function.NewFunctionTool(fn,
 		function.WithName("suggest_supplier_payment"),
 		function.WithDescription("基于三维度算法(供应商费用支持/产品促销/产品动销)计算某 supplier 结算建议金额. 期 dry_run=true 显式确认. W5 升级 promo/sellthrough 用 cube 真实数据."),
+	)
+}
+
+// ============================================================
+// 工具: cancel_promotion_fee (W4.2 promo-harvester 撤销用)
+//   行为:
+//     - supplier 必填, kind 必填
+//     - period_end 可选, 默认 today (= 立即结束)
+//     - 查 supplier+kind 当前 period_end >= period_end 的所有 active 记录
+//     - 把这些记录的 period_end 改成 (period_end-1天), 标记"已结束"
+//     - 不真删 (保留历史, 运营可查)
+//     - 返 cancelled_count + cancelled_ids
+// ============================================================
+
+// CancelPromotionFeeReq 入参
+type CancelPromotionFeeReq struct {
+	Supplier  string `json:"supplier" jsonschema:"description=供应商名称(必填),required"`
+	Kind      string `json:"kind" jsonschema:"description=促销类型: 堆头|端架|DM|快讯|海报|特价|其他,required"`
+	PeriodEnd string `json:"period_end,omitempty" jsonschema:"description=结束日期 YYYY-MM-DD, 不传=今天"`
+	DryRun    bool   `json:"dry_run,omitempty" jsonschema:"description=二次确认模式: true=只返待撤销清单, false=真撤销"`
+	Note      string `json:"note,omitempty" jsonschema:"description=撤销原因, append 到原 note"`
+}
+
+// CancelPromotionFeeResp 出参
+type CancelPromotionFeeResp struct {
+	Supplier         string   `json:"supplier"`
+	Kind             string   `json:"kind"`
+	Action           string   `json:"action"` // "dry_run" | "cancelled" | "not_found"
+	PeriodEnd        string   `json:"period_end"`
+	CancelledCount   int      `json:"cancelled_count"`
+	CancelledIDs     []int64  `json:"cancelled_ids,omitempty"`
+	CancelledPeriods []string `json:"cancelled_periods,omitempty"` // 旧的 [start, end] 列表
+}
+
+// CancelPromotionFee 工具函数
+func CancelPromotionFee(pool *pgxpool.Pool) *function.FunctionTool[CancelPromotionFeeReq, CancelPromotionFeeResp] {
+	fn := func(ctx context.Context, req CancelPromotionFeeReq) (CancelPromotionFeeResp, error) {
+		if pool == nil {
+			return CancelPromotionFeeResp{}, fmt.Errorf("cancel_promotion_fee: pg pool 未初始化")
+		}
+		supplier := trimSpace(req.Supplier)
+		kind := trimSpace(req.Kind)
+		if supplier == "" {
+			return CancelPromotionFeeResp{}, fmt.Errorf("supplier 必填")
+		}
+		if kind == "" {
+			return CancelPromotionFeeResp{}, fmt.Errorf("kind 必填")
+		}
+		if !allowedPromoKinds[kind] {
+			return CancelPromotionFeeResp{}, fmt.Errorf("kind %q 不在白名单 (堆头|端架|DM|快讯|海报|特价|其他)", kind)
+		}
+
+		// 1) 解析 period_end (默认 today)
+		periodEnd := trimSpace(req.PeriodEnd)
+		if periodEnd == "" {
+			periodEnd = time.Now().Format("2006-01-02")
+		}
+		if _, err := time.Parse("2006-01-02", periodEnd); err != nil {
+			return CancelPromotionFeeResp{}, fmt.Errorf("period_end 格式错误,期望 YYYY-MM-DD: %w", err)
+		}
+
+		// 2) 查 active 记录 (period_end >= period_end)
+		rows, err := pool.Query(ctx, `
+			SELECT id, period_start, period_end FROM promotion_fee
+			WHERE supplier_name = $1 AND kind = $2 AND period_end >= $3::date
+			ORDER BY period_end ASC
+		`, supplier, kind, periodEnd)
+		if err != nil {
+			return CancelPromotionFeeResp{}, fmt.Errorf("query active: %w", err)
+		}
+		var ids []int64
+		var periods []string
+		for rows.Next() {
+			var id int64
+			var start, end time.Time
+			if err := rows.Scan(&id, &start, &end); err != nil {
+				rows.Close()
+				return CancelPromotionFeeResp{}, err
+			}
+			ids = append(ids, id)
+			periods = append(periods, fmt.Sprintf("%s~%s",
+				start.Format("2006-01-02"), end.Format("2006-01-02")))
+		}
+		rows.Close()
+		if err := rows.Err(); err != nil {
+			return CancelPromotionFeeResp{}, err
+		}
+		if len(ids) == 0 {
+			return CancelPromotionFeeResp{
+				Supplier:       supplier,
+				Kind:           kind,
+				Action:         "not_found",
+				PeriodEnd:      periodEnd,
+				CancelledCount: 0,
+			}, nil
+		}
+
+		// 3) dry_run 模式: 只返待撤销清单
+		if req.DryRun {
+			return CancelPromotionFeeResp{
+				Supplier:         supplier,
+				Kind:             kind,
+				Action:           "dry_run",
+				PeriodEnd:        periodEnd,
+				CancelledCount:   len(ids),
+				CancelledIDs:     ids,
+				CancelledPeriods: periods,
+			}, nil
+		}
+
+		// 4) 真撤销: UPDATE period_end = period_end-1天 (标记已结束, 保留历史)
+		tx, err := pool.Begin(ctx)
+		if err != nil {
+			return CancelPromotionFeeResp{}, fmt.Errorf("begin tx: %w", err)
+		}
+		defer tx.Rollback(ctx)
+
+		for _, id := range ids {
+			if req.Note != "" {
+				_, err = tx.Exec(ctx, `
+					UPDATE promotion_fee
+					SET period_end = $2::date - INTERVAL '1 day',
+					    note = CASE
+					        WHEN note = '' THEN $3
+					        ELSE note || ' | 撤销: ' || $3
+					    END
+					WHERE id = $1
+				`, id, periodEnd, req.Note)
+			} else {
+				_, err = tx.Exec(ctx, `
+					UPDATE promotion_fee
+					SET period_end = $2::date - INTERVAL '1 day'
+					WHERE id = $1
+				`, id, periodEnd)
+			}
+			if err != nil {
+				return CancelPromotionFeeResp{}, fmt.Errorf("update id=%d: %w", id, err)
+			}
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return CancelPromotionFeeResp{}, fmt.Errorf("commit: %w", err)
+		}
+
+		return CancelPromotionFeeResp{
+			Supplier:         supplier,
+			Kind:             kind,
+			Action:           "cancelled",
+			PeriodEnd:        periodEnd,
+			CancelledCount:   len(ids),
+			CancelledIDs:     ids,
+			CancelledPeriods: periods,
+		}, nil
+	}
+	return function.NewFunctionTool(fn,
+		function.WithName("cancel_promotion_fee"),
+		function.WithDescription("撤销某 supplier 的某 kind 的 active promotion_fee 记录 (W4.2 promo-harvester). supplier+kind 必填, kind 必须白名单 (堆头|端架|DM|快讯|海报|特价|其他). period_end 不传=今天. 行为: UPDATE period_end = (period_end - 1天) 标记已结束, 保留历史. dry_run=true 返待撤销清单. 用于老板说'X 堆头取消'/'X 端架下架'/'X DM 没了'."),
 	)
 }
 

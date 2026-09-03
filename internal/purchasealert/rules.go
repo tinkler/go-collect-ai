@@ -31,17 +31,33 @@ type Alert struct {
 	RowID    int64     `json:"row_id"` // 0 = 整张 session 级别(非 row-specific)
 	Rule     string    `json:"rule"`
 	Severity string    `json:"severity"`
-	Message  string    `json:"message"`
-	AckedAt  time.Time `json:"acked_at,omitempty"`
-	AckedBy  string    `json:"acked_by,omitempty"`
+	// 2026-09-03 W4.1: 决定前端 icon 段位
+	//   block            红色感叹号
+	//   warn             橙色感叹号
+	//   info             灰普通感叹号
+	//   highlight_dui    绿色"贴切"标志
+	//   highlight_others 绿色"其它"标志
+	Category  string    `json:"category"`
+	Message   string    `json:"message"`
+	AckedAt   time.Time `json:"acked_at,omitempty"`
+	AckedBy   string    `json:"acked_by,omitempty"`
 	CreatedAt time.Time `json:"created_at,omitempty"`
 }
 
 // Severity 等级
 const (
 	SeverityBlock = "block" // 阻断 (限入场)
-	SeverityWarn  = "warn"  // 警告 (不允许退货)
-	SeverityInfo  = "info"  // 提示 (季节/节假日)
+	SeverityWarn  = "warn"  // 警告 (不允许退货/高库存)
+	SeverityInfo  = "info"  // 提示 (季节/节假日/堆头/快讯)
+)
+
+// Category 前端 icon 段位 (W4.1)
+const (
+	CategoryBlock         = "block"            // 红色感叹号
+	CategoryWarn          = "warn"             // 橙色感叹号
+	CategoryInfo          = "info"             // 灰普通感叹号
+	CategoryHighlightDui  = "highlight_dui"    // 绿色"贴切"标志 (堆头)
+	CategoryHighlightOthers = "highlight_others" // 绿色"其它"标志 (快讯/端架)
 )
 
 // Rule 规则接口
@@ -56,6 +72,13 @@ type RuleContext struct {
 	SupplierPolicies map[string][]PolicyKV
 	// Holidays 接下来 N 天的节假日(已过滤)
 	Holidays []Holiday
+	// 2026-09-03 W4.1: 高库存/难消化阈值,从 app_settings 拉 (数据, 不是硬编码)
+	HighStockThreshold   float64
+	LowMovementThreshold float64
+	// 2026-09-03 W4.1: 促销 kind 分类,决定 highlight_dui / highlight_others
+	//   数据来源: app_settings.duitou_kinds / others_kinds
+	DuitouKinds  []string
+	OthersKinds  []string
 	// Now 当前时间(便于单测注入)
 	Now time.Time
 }
@@ -114,6 +137,7 @@ func (BlockEntryRule) Apply(_ context.Context, sess *model.Session, row *model.S
 					RowID:    row.RowID,
 					Rule:     "block_entry",
 					Severity: SeverityBlock,
+					Category: CategoryBlock, // 红色感叹号
 					Message:  msg,
 				}}
 			}
@@ -152,6 +176,7 @@ func (NoReturnRule) Apply(_ context.Context, sess *model.Session, row *model.Sku
 					RowID:    row.RowID,
 					Rule:     "no_return",
 					Severity: SeverityWarn,
+					Category: CategoryWarn, // 橙色感叹号
 					Message:  msg,
 				}}
 			}
@@ -235,6 +260,7 @@ func (OffseasonRule) Apply(_ context.Context, sess *model.Session, row *model.Sk
 				RowID:    row.RowID,
 				Rule:     "offseason",
 				Severity: SeverityInfo,
+				Category: CategoryInfo, // 灰普通感叹号
 				Message:  msg,
 			}}
 		}
@@ -281,6 +307,7 @@ func (HolidayLeadRule) Apply(_ context.Context, sess *model.Session, _ *model.Sk
 		RowID:    0, // session 级别
 		Rule:     "holiday_lead",
 		Severity: SeverityInfo,
+		Category: CategoryInfo, // 灰普通感叹号 (总结栏展示)
 		Message:  msg,
 	}}
 }
@@ -327,8 +354,220 @@ func (r LLMSeasonRule) Apply(_ context.Context, sess *model.Session, row *model.
 			RowID:    row.RowID,
 			Rule:     "llm_offseason",
 			Severity: SeverityInfo,
+			Category: CategoryInfo, // 灰普通感叹号
 			Message:  fmt.Sprintf("LLM 判定 [%s] 当前反季(类目性反季,非简单关键词),请确认是否真要补货", name),
 		}}
 	}
 	return nil
+}
+
+// ============================================================
+// 规则 6: HighStockRule (W4.1 新增)
+//   阈值从 app_settings.high_stock_threshold 拉 (数据, 不硬编码)
+//   row.StockQty > 阈值 → severity=warn, category=warn (橙感叹号)
+// ============================================================
+
+type HighStockRule struct{}
+
+func (HighStockRule) Name() string { return "high_stock" }
+
+func (HighStockRule) Apply(_ context.Context, sess *model.Session, row *model.SkuRow, rc RuleContext) []Alert {
+	if row == nil {
+		return nil
+	}
+	if rc.HighStockThreshold <= 0 {
+		return nil
+	}
+	stock := float64(0)
+	if row.StockQty != nil {
+		stock = *row.StockQty
+	}
+	if stock <= rc.HighStockThreshold {
+		return nil
+	}
+	name := row.MatchedName
+	if name == "" {
+		name = row.RawName
+	}
+	return []Alert{{
+		SessID:   sess.ID,
+		RowID:    row.RowID,
+		Rule:     "high_stock",
+		Severity: SeverityWarn,
+		Category: CategoryWarn, // 橙色感叹号
+		Message: fmt.Sprintf("商品 [%s] 当前库存 %.0f,超过阈值 %.0f,本次采购需谨慎(可能压库存)",
+			name, stock, rc.HighStockThreshold),
+	}}
+}
+
+// ============================================================
+// 规则 7: HasDuitouRule (W4.1 新增)
+//   supplier_policy.has_duitou=true (堆头费他们出/有堆头协议)
+//   AND 当前日期在 promotion_fee 期内 (period_start..period_end)
+//   → 总结栏 (row_id=0) 1 条 alert, 标 highlight_dui (绿色"贴切"标志)
+//   同一 supplier 命中多条 promotion_fee → 合并 1 条, 列出 kind+amount
+// ============================================================
+
+type HasDuitouRule struct {
+	// 用 PG 一次性查 promotion_fee 当前期内, 按 supplier 分组
+	// service.loadContext 里调用 RefreshActivePromos 预加载
+	// 这里只读 cache
+	ActivePromos map[string][]ActivePromo
+}
+
+// ActivePromo promotion_fee 当前期内
+type ActivePromo struct {
+	Kind   string
+	Amount float64
+	End    time.Time
+}
+
+func (HasDuitouRule) Name() string { return "has_duitou" }
+
+func (r HasDuitouRule) Apply(_ context.Context, sess *model.Session, row *model.SkuRow, rc RuleContext) []Alert {
+	// 总结栏规则,只跑 1 次 (row=nil) — 已在 service.Apply 调度
+	if row != nil {
+		return nil
+	}
+	// 收集 session 内所有 supplier
+	suppliers := map[string]struct{}{}
+	for _, r := range sess.Rows {
+		if r.IsDeleted || r.MatchedSupp == "" {
+			continue
+		}
+		suppliers[r.MatchedSupp] = struct{}{}
+	}
+	// 收集本期有堆头协议的 supplier
+	duiSups := map[string]struct{}{}
+	for sup, pols := range rc.SupplierPolicies {
+		for _, p := range pols {
+			if p.Key == "has_duitou" {
+				if v, ok := p.Val.(bool); ok && v {
+					duiSups[sup] = struct{}{}
+				}
+			}
+		}
+	}
+	// 取交集
+	var hits []string
+	for sup := range suppliers {
+		if _, ok := duiSups[sup]; ok {
+			hits = append(hits, sup)
+		}
+	}
+	if len(hits) == 0 {
+		return nil
+	}
+	// 拼堆头明细
+	var parts []string
+	for _, sup := range hits {
+		promos := r.ActivePromos[sup]
+		if len(promos) == 0 {
+			parts = append(parts, fmt.Sprintf("[%s] 已签堆头", sup))
+			continue
+		}
+		// 合并同 supplier 的所有堆头
+		var sub []string
+		for _, p := range promos {
+			if !containsString(rc.DuitouKinds, p.Kind) {
+				continue
+			}
+			sub = append(sub, fmt.Sprintf("%s ¥%.0f(至 %s)",
+				p.Kind, p.Amount, p.End.Format("01-02")))
+		}
+		if len(sub) > 0 {
+			parts = append(parts, fmt.Sprintf("[%s] %s", sup, joinComma(sub)))
+		}
+	}
+	if len(parts) == 0 {
+		return nil
+	}
+	msg := "本期堆头陈列: " + joinComma(parts)
+	return []Alert{{
+		SessID:   sess.ID,
+		RowID:    0, // 总结栏
+		Rule:     "has_duitou",
+		Severity: SeverityInfo,
+		Category: CategoryHighlightDui, // 绿色"贴切"标志
+		Message:  msg,
+	}}
+}
+
+// ============================================================
+// 规则 8: FlashPromoRule (W4.1 新增)
+//   promotion_fee 命中, kind 在 app_settings.others_kinds (快讯/端架/DM/特价/海报)
+//   按 supplier 分组, 每个 supplier + kind 1 条
+//   → category=highlight_others (绿色"其它"标志)
+// ============================================================
+
+type FlashPromoRule struct {
+	ActivePromos map[string][]ActivePromo
+}
+
+func (FlashPromoRule) Name() string { return "flash_promo" }
+
+func (r FlashPromoRule) Apply(_ context.Context, sess *model.Session, row *model.SkuRow, rc RuleContext) []Alert {
+	if row == nil {
+		return nil
+	}
+	supplier := strings.TrimSpace(row.MatchedSupp)
+	if supplier == "" {
+		return nil
+	}
+	promos, ok := r.ActivePromos[supplier]
+	if !ok {
+		return nil
+	}
+	// 找该 supplier 当前在期内的 "其它" kind
+	var kinds []string
+	for _, p := range promos {
+		if containsString(rc.OthersKinds, p.Kind) {
+			kinds = append(kinds, p.Kind)
+		}
+	}
+	if len(kinds) == 0 {
+		return nil
+	}
+	name := row.MatchedName
+	if name == "" {
+		name = row.RawName
+	}
+	return []Alert{{
+		SessID:   sess.ID,
+		RowID:    row.RowID,
+		Rule:     "flash_promo",
+		Severity: SeverityInfo,
+		Category: CategoryHighlightOthers, // 绿色"其它"标志
+		Message: fmt.Sprintf("商品 [%s] 供应商 [%s] 正在做 %s,注意陈列位置",
+			name, supplier, joinComma(kinds)),
+	}}
+}
+
+// ============================================================
+// 默认规则集 (W4.1)
+//   顺序敏感 — block 优先, 总结栏规则在最后
+// ============================================================
+
+// DefaultRulesWithDeps 默认注册 4 个规则 (无外部依赖)
+//   复杂规则 (HasDuitouRule / FlashPromoRule) 需走 NewServiceWithPromos 注入
+
+// helpers
+func containsString(arr []string, s string) bool {
+	for _, x := range arr {
+		if x == s {
+			return true
+		}
+	}
+	return false
+}
+
+func joinComma(parts []string) string {
+	out := ""
+	for i, p := range parts {
+		if i > 0 {
+			out += ", "
+		}
+		out += p
+	}
+	return out
 }

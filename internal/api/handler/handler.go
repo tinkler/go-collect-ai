@@ -15,6 +15,8 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/tinkler/collect-ai/internal/agent"
 	"github.com/tinkler/collect-ai/internal/agent/skill"
 	"github.com/tinkler/collect-ai/internal/auth"
@@ -41,6 +43,7 @@ type Handler struct {
 	Agent       *parseragent.Client   // 仅用于 Ping / GetDataSource (2026-09-02: cube 调用已收编到 BizExecutor)
 	BizExecutor *business.Executor    // 2026-09-02: cube 业务字段调用入口
 	BusinessReg *business.Registry    // 业务字段映射(products / suppliers 跨数据源)
+	Pool        *pgxpool.Pool         // W4.1: GetAnalysisStatus 轻量查询
 	Sessions    *store.SessionRepo
 	Strategies  *store.StrategyRepo   // Phase A: 新增, per-supplier 特定解析策略
 	SkillStore  *skill.Store          // Phase A: 新增, 读 skills/ocr-purchase/SKILL.md
@@ -295,6 +298,213 @@ func (h *Handler) Rematch(c *gin.Context) {
 
 // ============== Sessions ==============
 
+// AppendImages 追加图片到已有 session (W4.1 重复图去重)
+//   流程:
+//     1) 收图 (files[] / files / file) — 跟 CreateSession 一样
+//     2) 算每张图 sha256, 调 Sessions.AppendImages (内部判重)
+//     3) 重复的 hash → 跳过, 不解析, 不入 rows
+//     4) 新的 → 调 Orchestrator.Parse, 续接 seq + image_index
+//     5) 触发异步策略分析 (analysis_status 重置 pending → running → done)
+//   前端调用: 已经有一个 session, 用户点"添加图片"+"提交识别" → POST /sessions/:id/images
+//   Response 包含:
+//     - added_rows: 新加的行 (含新 row_id)
+//     - skipped_hashes: 已存在的 hash (UI 可提示"该图已识别过, 已跳过")
+//     - analysis_status: 当前状态 (前端轮询)
+func (h *Handler) AppendImages(c *gin.Context) {
+	id := c.Param("id")
+	if id == "" {
+		c.JSON(400, gin.H{"error": "session id 必填"})
+		return
+	}
+
+	// 1) 先确认 session 存在
+	existing, err := h.Sessions.Get(c.Request.Context(), id)
+	if err != nil {
+		c.JSON(500, gin.H{"error": err.Error()})
+		return
+	}
+	if existing == nil {
+		c.JSON(404, gin.H{"error": "session not found"})
+		return
+	}
+	supplier := existing.SupplierName
+
+	// 2) 收图 (复用 CreateSession 一样的多图逻辑)
+	if err := c.Request.ParseMultipartForm(32 << 20); err != nil {
+		log.Printf("[AppendImages] ParseMultipartForm err: %v", err)
+	}
+
+	type uploaded struct {
+		header *multipart.FileHeader
+		bytes  []byte
+	}
+	var uploads []uploaded
+
+	if files := c.Request.MultipartForm; files != nil && files.File != nil {
+		if fhs, ok := files.File["files[]"]; ok && len(fhs) > 0 {
+			for _, fh := range fhs {
+				f, err := fh.Open()
+				if err != nil {
+					c.JSON(400, gin.H{"error": "打开文件失败: " + err.Error()})
+					return
+				}
+				bytes, err := io.ReadAll(f)
+				f.Close()
+				if err != nil {
+					c.JSON(500, gin.H{"error": err.Error()})
+					return
+				}
+				uploads = append(uploads, uploaded{fh, bytes})
+			}
+		} else if fhs, ok := files.File["files"]; ok && len(fhs) > 0 {
+			for _, fh := range fhs {
+				f, err := fh.Open()
+				if err != nil {
+					c.JSON(400, gin.H{"error": "打开文件失败: " + err.Error()})
+					return
+				}
+				bytes, err := io.ReadAll(f)
+				f.Close()
+				if err != nil {
+					c.JSON(500, gin.H{"error": err.Error()})
+					return
+				}
+				uploads = append(uploads, uploaded{fh, bytes})
+			}
+		}
+	}
+	if len(uploads) == 0 {
+		file, header, err := c.Request.FormFile("file")
+		if err != nil {
+			c.JSON(400, gin.H{"error": "未收到 file/files: " + err.Error()})
+			return
+		}
+		defer file.Close()
+		bytes, err := io.ReadAll(file)
+		if err != nil {
+			c.JSON(500, gin.H{"error": err.Error()})
+			return
+		}
+		uploads = append(uploads, uploaded{header, bytes})
+	}
+	if len(uploads) == 0 {
+		c.JSON(400, gin.H{"error": "未收到任何图片"})
+		return
+	}
+
+	// 3) 算 hash + 落盘新文件 + 准备 candidate
+	bucket := id[:2]
+	absDir := filepath.Join(h.UploadDir, bucket)
+	if err := os.MkdirAll(absDir, 0o755); err != nil {
+		c.JSON(500, gin.H{"error": "创建上传目录失败: " + err.Error()})
+		return
+	}
+	candidates := make([]store.ImageCandidate, 0, len(uploads))
+	for _, u := range uploads {
+		hash := store.HashImageBytes(u.bytes)
+		// 用 hash 前 8 位 + 原 ext 做文件名 (避免重复, 也方便人查)
+		ext := filepath.Ext(u.header.Filename)
+		if ext == "" {
+			ext = ".jpg"
+		}
+		// 真正落盘在判重之后 (AppendImages 返回 skipped 时省一次写)
+		// 这里先全部写, 简化逻辑
+		fileName := fmt.Sprintf("%s_%s%s", id, hash[:8], ext)
+		_ = filepath.Join(bucket, fileName) // 暂存引用 (后续 v2 用, 现在只用 hash 判重)
+		absPath := filepath.Join(absDir, fileName)
+		if _, err := os.Stat(absPath); os.IsNotExist(err) {
+			if err := os.WriteFile(absPath, u.bytes, 0o644); err != nil {
+				c.JSON(500, gin.H{"error": "保存图片失败: " + err.Error()})
+				return
+			}
+		}
+		candidates = append(candidates, store.ImageCandidate{
+			Hash:     hash,
+			FileName: u.header.Filename,
+			ImgBytes: u.bytes,
+		})
+	}
+
+	// 4) 调 AppendImages (内部判重 + 解析新图 + 续接 seq)
+	addedRows, skippedHashes, newHashes, err := h.Sessions.AppendImages(
+		c.Request.Context(), id, candidates,
+		func(hash, fileName string, imgBytes []byte) ([]model.SkuRow, error) {
+			res, err := h.Orchestrator.Parse(c.Request.Context(), imgBytes, fileName, supplier)
+			if err != nil {
+				return nil, err
+			}
+			return res.Rows, nil
+		},
+	)
+	if err != nil {
+		c.JSON(500, gin.H{"error": "append 失败: " + err.Error()})
+		return
+	}
+
+	// 5) 触发异步策略分析 (append 后必重跑)
+	if h.AlertSvc != nil {
+		h.AlertSvc.StartAnalysisAsync(id, h.Sessions.Get)
+	}
+
+	// 6) 回填 row_id
+	for i := range addedRows {
+		if saved, err := h.Sessions.Get(c.Request.Context(), id); err == nil && saved != nil {
+			// 找刚加的行 (按 Seq + ImageIndex)
+			for _, r := range saved.Rows {
+				if r.Seq == addedRows[i].Seq && r.ImageIndex == addedRows[i].ImageIndex && addedRows[i].RowID == 0 {
+					addedRows[i].RowID = r.RowID
+					break
+				}
+			}
+		}
+	}
+
+	c.JSON(200, gin.H{
+		"session_id":      id,
+		"added_rows":      addedRows,
+		"added_count":     len(addedRows),
+		"skipped_hashes":  skippedHashes,
+		"skipped_count":   len(skippedHashes),
+		"new_hashes":      newHashes,
+		"new_count":       len(newHashes),
+		"analysis_status": "pending", // 后台分析中
+	})
+}
+
+// GetAnalysisStatus 轻量状态查询 (W4.1 轮询用)
+//   替代方案: 也可直接用 GET /sessions/:id 拿 analysis_status
+//   但轮询时不需要拉全部 rows, 这个端点更轻
+func (h *Handler) GetAnalysisStatus(c *gin.Context) {
+	id := c.Param("id")
+	var status, errMsg string
+	var at *time.Time
+	var alertCount int
+	err := h.Pool.QueryRow(c.Request.Context(), `
+		SELECT analysis_status, analysis_at, analysis_error
+		FROM parse_session WHERE id = $1
+	`, id).Scan(&status, &at, &errMsg)
+	if err == pgx.ErrNoRows {
+		c.JSON(404, gin.H{"error": "not found"})
+		return
+	}
+	if err != nil {
+		c.JSON(500, gin.H{"error": err.Error()})
+		return
+	}
+	_ = h.Pool.QueryRow(c.Request.Context(), `
+		SELECT COUNT(*) FROM purchase_session_alert WHERE session_id = $1
+	`, id).Scan(&alertCount)
+	c.JSON(200, gin.H{
+		"session_id":      id,
+		"analysis_status": status,
+		"analysis_at":     at,
+		"analysis_error":  errMsg,
+		"alert_count":     alertCount,
+	})
+}
+
+
+
 // CreateSession multipart 收图(支持 1 张或多张) + 存库
 //   多图: form-data 用 files[] 重复提交, 或 files (单字段多文件)
 //   单图兼容: 仍可用 file 字段(向后兼容飞书 H5)
@@ -397,7 +607,7 @@ func (h *Handler) CreateSession(c *gin.Context) {
 		Mode:         model.ModePurchase, // Phase A: 固定 purchase
 	}
 	var allRows []model.SkuRow
-	var imagePaths, imageURLs []string
+	var imagePaths, imageURLs, imageHashes []string
 	for idx, u := range uploads {
 		ext := filepath.Ext(u.header.Filename)
 		if ext == "" {
@@ -417,6 +627,8 @@ func (h *Handler) CreateSession(c *gin.Context) {
 		} else {
 			imageURLs = append(imageURLs, fmt.Sprintf("/uploads/%s/%s", bucket, fileName))
 		}
+		// W4.1: 算每张图 hash, 用于后续 append 去重
+		imageHashes = append(imageHashes, store.HashImageBytes(u.bytes))
 
 		// Phase A: 改用 Orchestrator (template_id / customPrompt 都不再需要, 走 strategy.body)
 		// Phase B+ (2026-09-03): VLM-only 模式
@@ -431,6 +643,8 @@ func (h *Handler) CreateSession(c *gin.Context) {
 		rows := res.Rows
 		for i := range rows {
 			rows[i].Seq = baseSeq + i + 1
+			// W4.1: 标记本行属于第几张图 (0-based)
+			rows[i].ImageIndex = idx
 		}
 		allRows = append(allRows, rows...)
 		// 记录本次解析的 strategy_version (多图时取第一张的版本号)
@@ -454,9 +668,11 @@ func (h *Handler) CreateSession(c *gin.Context) {
 	s.ImageURL = imageURL
 	s.ImagePaths = imagePaths
 	s.ImageURLs = imageURLs
+	s.ImageHashes = imageHashes
 	s.Source = source
 	s.Note = note
 	s.Rows = allRows
+	s.AnalysisStatus = "pending" // W4.1: 立即 pending, 后台跑分析
 	if err := h.Sessions.Create(c.Request.Context(), s); err != nil {
 		c.JSON(500, gin.H{"error": "存库失败: " + err.Error()})
 		return
@@ -468,6 +684,10 @@ func (h *Handler) CreateSession(c *gin.Context) {
 	// 采购模式 + 有 restock 服务: 附加 plan_qty
 	if s.Mode == model.ModePurchase && h.RestockSvc != nil {
 		_ = h.RestockSvc.AttachPlanQtyToRows(c.Request.Context(), s.SupplierName, s.Rows)
+	}
+	// W4.1: 异步触发策略分析 (立即返回, 不等 LLM)
+	if s.Mode == model.ModePurchase && h.AlertSvc != nil {
+		h.AlertSvc.StartAnalysisAsync(id, h.Sessions.Get)
 	}
 	c.JSON(200, s)
 }
@@ -508,17 +728,32 @@ func (h *Handler) GetSession(c *gin.Context) {
 	if s.Mode == model.ModePurchase && h.RestockSvc != nil {
 		_ = h.RestockSvc.AttachPlanQtyToRows(c.Request.Context(), s.SupplierName, s.Rows)
 	}
-	// W3.2: 采购模式 + Alert 服务 → 跑规则引擎 (幂等: 已有 alerts 跳过)
+	// W4.1: 异步分析 — 不再同步 Apply, 直接读 alerts
+	//   analysis_status='done' 时返回 alerts + summary
+	//   analysis_status='pending'/'running'/'failed' 时 alerts 可能是空或旧值, 前端按 status 处理
 	if s.Mode == model.ModePurchase && h.AlertSvc != nil {
 		ctx := c.Request.Context()
 		existing, _ := h.AlertSvc.ListAlertsBySession(ctx, id)
-		if len(existing) == 0 {
-			_, _ = h.AlertSvc.Apply(ctx, s)
-			existing, _ = h.AlertSvc.ListAlertsBySession(ctx, id)
-		}
-		s.Alerts = convertAlertsToModel(existing)
+		// W4.1: 拆分 row-specific alerts (表格行内 icon) + session-level summary (图片卡片下)
+		rowAlerts, summary := splitAlertsByScope(existing)
+		s.Alerts = convertAlertsToModel(rowAlerts)
+		s.Summary = convertAlertsToModel(summary)
 	}
 	c.JSON(200, s)
+}
+
+// splitAlertsByScope 拆分 row-specific vs session-level alerts (W4.1)
+//   row_id > 0 → row-specific (表格行内 icon)
+//   row_id = 0 → session-level (总结栏)
+func splitAlertsByScope(in []purchasealert.Alert) (rowAlerts []purchasealert.Alert, summary []purchasealert.Alert) {
+	for _, a := range in {
+		if a.RowID == 0 {
+			summary = append(summary, a)
+		} else {
+			rowAlerts = append(rowAlerts, a)
+		}
+	}
+	return
 }
 
 // convertAlertsToModel purchasealert.Alert → model.AlertItem (避免 handler 依赖 purchasealert.Alert 类型)

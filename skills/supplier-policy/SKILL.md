@@ -1,12 +1,13 @@
 ---
 name: supplier-policy
-description: 供应商政策解读与反回扣风险识别——把老板的自然语言(汇一自采/榄菊不让退/汇一堆头他们出/以后不进货/拉黑)准确映射到 7 个 policy key,识别反回扣危险信号(同品多供应商价差大/临时换供应商/堆头费异常高/临时涨价/私下返点),给出供应商分级与建议。Use this skill when the user asks about 供应商政策/供应商分级/防回扣/反回扣/自采/不让退/堆头谁出/不进某供应商/黑名单/拉黑/供应商评估/供应商分类/临时换供应商/报价异常/私下返点, or when the user says "汇一是自采的" / "榄菊不让退" / "以后不进货 X" / "拉黑" / "这家供应商怎么样" / "这个价格不对" / "临时换供应商" / "私下给我返点".
+description: 供应商政策"决策记忆"——把老板的自然语言(汇一自采/榄菊不让退/汇一堆头他们出/以后不进货/拉黑)准确映射到 7 个 policy key,支持 录入 / 撤销(整条) / 部分撤销(单个 key) 三种操作;同时识别反回扣危险信号(同品多供应商价差大/临时换供应商/堆头费异常高/临时涨价/私下返点),给出供应商分级与建议。Use this skill when the user asks about 供应商政策/供应商分级/防回扣/反回扣/自采/不让退/堆头谁出/不进某供应商/黑名单/拉黑/供应商评估/供应商分类/临时换供应商/报价异常/私下返点 / 解除黑名单 / 不限制X了 / X政策清空, or when the user says "汇一是自采的" / "榄菊不让退" / "以后不进货 X" / "拉黑" / "这家供应商怎么样" / "这个价格不对" / "临时换供应商" / "私下给我返点" / "汇一以后可以退了" / "解除榄菊黑名单" / "汇一政策全清".
 license: Internal-Project
 metadata:
-  version: "1.0.0"
+  version: "1.1.0"
   author: collect-ai
   category: supplier-management
   migrated_from: "internal/agent/tools/policy.go (remember_supplier_policy / query_supplier_policy) + 7 个 key 白名单"
+  extended_in: "W4.2 (2026-09-03) — 加 delete_supplier_policy + list_supplier_keys 工具 + 撤销/部分撤销工作流"
 compatibility: requires Python 3.x
 triggers:
   - 供应商政策
@@ -23,6 +24,12 @@ triggers:
   - 战略供应商
   - 临时换供应商
   - 报价异常
+  - 私下返点
+  - 解除黑名单
+  - 撤销政策
+  - 不限制
+  - 可以退了
+  - 政策清空
 ---
 
 # Supplier Policy(供应商政策 + 防回扣)
@@ -114,6 +121,109 @@ triggers:
 ### 步骤 5:供应商分级(可选)
 
 老板问"这家供应商怎么样"时,套用 `references/supplier_tiering.md` 给 A/B/C/D 分级。
+
+---
+
+## 决策记忆操作 (W4.2 新增)
+
+本 skill 不仅是"录入",还支持 **3 种操作** + **1 个查询**:
+
+| 操作 | 老板的话示例 | 调 tool | 关键差异 |
+|---|---|---|---|
+| **录入 (create/update)** | "汇一是自采" / "汇一以后可以退了" | `remember_supplier_policy` dry_run=true → confirm → dry_run=false | 同 key 二次写入会**覆盖** (UPSERT) |
+| **撤销单 key (partial revoke)** | "解除榄菊黑名单" / "汇一以后又可以退了" | `delete_supplier_policy(supplier, key=block_entry)` | 删一条,其它 key 保留 |
+| **撤销整条 (full revoke)** | "汇一政策全清" / "跟汇一没关系了" | `delete_supplier_policy(supplier)` (不传 key) | 删该 supplier 全部 policy |
+| **查询 (read)** | "汇一现在什么政策" | `query_supplier_policy(supplier)` | 读现状,准备后续操作 |
+
+### 撤销 / 部分撤销决策流程图
+
+```
+老板说 "汇一以后可以退了" / "解除榄菊黑名单"
+  ↓
+[1] 调 query_supplier_policy(supplier) → 拿到现状
+  ↓
+[2] 语义解析意图:
+    - "以后可以退了"  → 跟"之前不能退"对立 → 这是 UPDATE allow_return=true
+    - "解除黑名单"    → 这是 DELETE block_entry (单 key)
+    - "政策全清"      → 这是 DELETE 整条
+    - "不限制X了"     → 这是 DELETE block_entry (单 key)
+  ↓
+[3] 二次确认 (任何 DELETE 必走):
+    "汇一 删 1 条: allow_return=false → 删 (即变回 true 默认值, 不会被 block_entry 命中)
+     对吗?"
+  ↓
+[4a] UPDATE 路径 (录入):
+    → remember_supplier_policy(supplier="汇一", key="allow_return", value=true)
+  ↓
+[4b] DELETE 单 key 路径:
+    → delete_supplier_policy(supplier="汇一", key="block_entry")
+  ↓
+[4c] DELETE 整条 路径 (整条清空):
+    → delete_supplier_policy(supplier="汇一")  // key 留空
+  ↓
+[5] 落库 → 后续 CreateSession 触发 Apply → 相关 alert 重新评估
+```
+
+### 撤销映射表
+
+| 老板的话 | 操作 | tool 调用 |
+|---|---|---|
+| "汇一以后可以退了" | UPDATE allow_return=true | `remember_supplier_policy(supplier="汇一", key="allow_return", value=true)` |
+| "解除榄菊黑名单" | DELETE block_entry | `delete_supplier_policy(supplier="榄菊", key="block_entry")` |
+| "汇一不限制入场了" | DELETE block_entry | `delete_supplier_policy(supplier="汇一", key="block_entry")` |
+| "汇一政策全清" | DELETE 整条 | `delete_supplier_policy(supplier="汇一")` |
+| "汇一跟 X 没关系了" | DELETE 整条 | `delete_supplier_policy(supplier="汇一")` |
+| "汇一那个临时不允许进了,现在又让进" | DELETE block_entry (原因在 block_reason) | `delete_supplier_policy(supplier="汇一", key="block_entry")` + `delete_supplier_policy(supplier="汇一", key="block_reason")` |
+| "汇一没堆头了" | UPDATE has_duitou=false | `remember_supplier_policy(supplier="汇一", key="has_duitou", value=false)` |
+| "拉黑汇一" | UPDATE block_entry=true (新增) | `remember_supplier_policy(supplier="汇一", key="block_entry", value=true, source="user_chat")` |
+| "汇一是自采" | UPDATE is_self_procure=true | `remember_supplier_policy(supplier="汇一", key="is_self_procure", value=true)` |
+
+### 关键的"撤销"判定
+
+**"以后可以退了"** 这种否定翻转的句子,优先按 UPDATE 走 (因为 value 翻转为 true/false,跟现有 key 同一行覆盖即可)。
+不是 DELETE (DELETE 不会把 value 变 true,只是把 row 删了,下次跑规则会按"该 supplier 无 allow_return 政策" → 默认按规则 NoReturnRule 不命中)。
+
+**"解除黑名单"** 这种语义明确的"删除某条",走 DELETE 单 key。
+
+**"政策全清"** 这种"跟这家没关系了",走 DELETE 整条,慎用!先 query 现状给老板看,确认无误再删。
+
+### 撤销后下游影响 (重点!)
+
+- `DELETE allow_return` → 下次采购单 Apply → NoReturnRule 不命中 (假设有其它 supplier 不让退) → 不再报橙感叹号
+- `DELETE block_entry` → 下次采购单 Apply → BlockEntryRule 不命中 → 红感叹号消失
+- `DELETE has_duitou` → 下次 Apply → HasDuitouRule 不命中 (总结栏绿贴切标志消失) + HighStockRule 降级 A 不命中
+- `DELETE 整条` → 该 supplier 完全"无政策" (跟新供应商等价)
+
+### 二次确认模板 (DELETE 必走)
+
+```
+[1] 先 query 拿现状 (避免误删):
+    query_supplier_policy("汇一")  → 拿到 [is_self_procure=true, has_duitou=true, allow_return=false]
+
+[2] dry_run 预览删除清单:
+    delete_supplier_policy("汇一", key="allow_return", dry_run=true)
+    → 返 {action: "dry_run", deleted_count: 1, deleted_keys: ["allow_return"]}
+
+[3] 老板确认 "OK"
+
+[4] 真删:
+    delete_supplier_policy("汇一", key="allow_return", dry_run=false)
+    → 返 {action: "deleted", deleted_count: 1, deleted_keys: ["allow_return"]}
+```
+
+---
+
+## W4.2 关键工具变更
+
+| 工具 | 行为 | 何时调 |
+|---|---|---|
+| `remember_supplier_policy` | UPSERT (不变) | 录入 / 覆盖 / UPDATE 翻转 |
+| `query_supplier_policy` | 读 (不变) | 撤销前必查 |
+| `delete_supplier_policy` | **新增** | 撤销单 key / 撤销整条 |
+| `list_supplier_keys` | **新增** | 拿 7 个 key 白名单 + 含义,避免 LLM 写错 key |
+
+(详见 `references/tool-reference.md`, 4 个 tool 的完整调用格式)
+
 
 ## Scripts
 

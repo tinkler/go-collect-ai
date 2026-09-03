@@ -127,10 +127,13 @@ func NewRunner(ctx context.Context, cfg Config, pool *pgxpool.Pool, gateway *bus
 	bizTools := []tool.Tool{
 		tools.RememberSupplierPolicy(pool),
 		tools.QuerySupplierPolicy(pool),
+		tools.DeleteSupplierPolicy(pool), // W4.2 decision-memory: 撤销单 key / 整条
+		tools.ListSupplierKeys(pool),     // W4.2 decision-memory: 7 个 key 白名单
 		tools.RecordSpecialDate(pool),
 		tools.QueryUpcomingDates(pool),
 		tools.RecordPromotionFee(pool),
 		tools.ListPromotionFee(pool),
+		tools.CancelPromotionFee(pool), // W4.2 promo-harvester: 撤销堆头/端架/快讯等
 	}
 
 	// 2) Skill 系统(Anthropic Agent Skills 规范)
@@ -289,6 +292,64 @@ func (r *Runner) Run(ctx context.Context, userID, sessionID, message string) (<-
 		}
 	}()
 	return out, nil
+}
+
+// RunAnalysis 批量跑 LLM 任务, 等 IsRunnerCompletion 一次性返 (W4.2, purchase-alert skill 用)
+//
+// 跟 Run 的区别:
+//   - Run 返 streaming channel, 适合聊天场景 (前端打字机效果)
+//   - RunAnalysis 等所有 LLM 调 tool 完, 一次性返 final reply, 适合批量分析
+//
+// 用途:
+//   - purchase-alert skill 跑 7 规则: 拼 prompt → 调 RunAnalysis → LLM 调 8 个 tool 落库
+//   - 后续: 任何"给 LLM 一次任务, 收一次结果" 都用这个
+//
+// 入参:
+//   - userID:    用于 session 管理 (purchase-alert 用 "system", 不持久化 user 历史)
+//   - sessionID: 复用现有 parse_session.id 作为 runner session key, 方便幂等
+//   - prompt:    user message (含 skill 指令 + 任务数据)
+//
+// 出参:
+//   - finalReply: LLM 最后一条 assistant 消息 (字符串)
+//   - toolCallCount: 跑了多少个 tool (debug 用)
+//   - err:        LLM 不可用 / 跑超时 / Runner 异常
+func (r *Runner) RunAnalysis(ctx context.Context, userID, sessionID, prompt string) (finalReply string, toolCallCount int, err error) {
+	if !r.Enabled() {
+		return "", 0, ErrLLMNotConfigured
+	}
+	events, err := r.runner.Run(ctx, userID, sessionID, model.NewUserMessage(prompt))
+	if err != nil {
+		return "", 0, fmt.Errorf("runner.Run: %w", err)
+	}
+	for ev := range events {
+		if ev == nil {
+			continue
+		}
+		// 1) 统计 tool calls
+		if ev.Response != nil && len(ev.Response.Choices) > 0 {
+			for _, ch := range ev.Response.Choices {
+				if len(ch.Message.ToolCalls) > 0 {
+					toolCallCount += len(ch.Message.ToolCalls)
+				}
+			}
+		}
+		// 2) 收尾: RunnerCompletion 事件
+		if ev.IsRunnerCompletion() {
+			if ev.Response != nil && len(ev.Response.Choices) > 0 {
+				last := ev.Response.Choices[len(ev.Response.Choices)-1]
+				if last.Message.Content != "" {
+					finalReply = last.Message.Content
+				}
+			}
+			return finalReply, toolCallCount, nil
+		}
+		// 3) 错误事件
+		if ev.Response != nil && ev.Response.Error != nil {
+			return "", toolCallCount, fmt.Errorf("runner error: %s", ev.Response.Error.Message)
+		}
+	}
+	// channel 关了但没收到 RunnerCompletion (异常路径)
+	return finalReply, toolCallCount, fmt.Errorf("runner event channel closed without RunnerCompletion")
 }
 
 // RunnerEvent 简化的事件包装 (W1: 仅透传 Raw;W2 会按 EventType 分发)
