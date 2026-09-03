@@ -1,13 +1,15 @@
-package tools
+﻿package tools
 
 import (
 	"context"
 	"encoding/json"
 	"errors"
+	"strconv"
 	"testing"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/tinkler/collect-ai/internal/business"
 )
 
 // ============================================================
@@ -191,6 +193,32 @@ func setupPurchaseAlertTables(t *testing.T, pool *pgxpool.Pool) {
 			t.Fatalf("create table failed: %v (sql: %s)", err, s)
 		}
 	}
+}
+
+// marshalForTest 把任意 struct 编成 json.RawMessage 供 tool.Call 调
+//   之前 (2026-09-04 之前) 散落在多个 _test.go 引用但未定义, 致 tools 包 build 失败
+//   2026-09-04 统一补在 purchase_alert_test.go (payment_w42_test.go / policy_w42_test.go 都用这个)
+func marshalForTest(v any) json.RawMessage {
+	b, _ := json.Marshal(v)
+	return b
+}
+
+// itoaTest small helper for test assertions
+func itoaTest(n int64) string {
+	return strconv.FormatInt(n, 10)
+}
+
+// contains / indexOf 简单字符串包含检查 (避免引入 strings.Contains 编译时差)
+func contains(s, sub string) bool {
+	if len(sub) == 0 {
+		return true
+	}
+	for i := 0; i+len(sub) <= len(s); i++ {
+		if s[i:i+len(sub)] == sub {
+			return true
+		}
+	}
+	return false
 }
 
 // queryAppSettingsImpl helper: wraps tool.Call and asserts type
@@ -408,7 +436,7 @@ func TestQueryReturnOrder_FnNil_Downgrade(t *testing.T) {
 }
 
 func TestQueryReturnOrder_SupplierRequired(t *testing.T) {
-	fn := func(ctx context.Context, supplier, status string, days int) ([]ReturnOrder, string, error) {
+	fn := func(ctx context.Context, supplier, status string, days int) ([]business.ReturnOrder, string, error) {
 		t.Fatal("Fn should not be called when supplier empty")
 		return nil, "", nil
 	}
@@ -422,7 +450,7 @@ func TestQueryReturnOrder_SupplierRequired(t *testing.T) {
 }
 
 func TestQueryReturnOrder_InvalidDays(t *testing.T) {
-	fn := func(ctx context.Context, supplier, status string, days int) ([]ReturnOrder, string, error) {
+	fn := func(ctx context.Context, supplier, status string, days int) ([]business.ReturnOrder, string, error) {
 		t.Fatal("Fn should not be called when days invalid")
 		return nil, "", nil
 	}
@@ -441,9 +469,9 @@ func TestQueryReturnOrder_InvalidDays(t *testing.T) {
 func TestQueryReturnOrder_DefaultDays(t *testing.T) {
 	// days 留空 = 0, 应默认 30
 	var capturedDays int
-	fn := func(ctx context.Context, supplier, status string, days int) ([]ReturnOrder, string, error) {
+	fn := func(ctx context.Context, supplier, status string, days int) ([]business.ReturnOrder, string, error) {
 		capturedDays = days
-		return []ReturnOrder{}, "", nil
+		return []business.ReturnOrder{}, "", nil
 	}
 	_, err := queryReturnOrderImpl(context.Background(), fn, QueryReturnOrderReq{
 		Supplier: "汇一",
@@ -459,7 +487,7 @@ func TestQueryReturnOrder_DefaultDays(t *testing.T) {
 
 func TestQueryReturnOrder_FnReturnsHint_Downgrade(t *testing.T) {
 	// Fn 自己返 hint (e.g. "mapping 缺失") → 走降级路径
-	fn := func(ctx context.Context, supplier, status string, days int) ([]ReturnOrder, string, error) {
+	fn := func(ctx context.Context, supplier, status string, days int) ([]business.ReturnOrder, string, error) {
 		return nil, "entities.returns 未在 mapping.yaml 配", nil
 	}
 	resp, err := queryReturnOrderImpl(context.Background(), fn, QueryReturnOrderReq{
@@ -480,7 +508,7 @@ func TestQueryReturnOrder_FnReturnsHint_Downgrade(t *testing.T) {
 
 func TestQueryReturnOrder_FnReturnsError_Downgrade(t *testing.T) {
 	// Fn 返 error → 也走降级, 不阻断
-	fn := func(ctx context.Context, supplier, status string, days int) ([]ReturnOrder, string, error) {
+	fn := func(ctx context.Context, supplier, status string, days int) ([]business.ReturnOrder, string, error) {
 		return nil, "", errors.New("cube 连接超时")
 	}
 	resp, err := queryReturnOrderImpl(context.Background(), fn, QueryReturnOrderReq{
@@ -501,12 +529,12 @@ func TestQueryReturnOrder_FnReturnsError_Downgrade(t *testing.T) {
 
 func TestQueryReturnOrder_FnReturnsList(t *testing.T) {
 	// 正常路径: Fn 返 list → 计数 + 金额汇总 + 透传
-	fn := func(ctx context.Context, supplier, status string, days int) ([]ReturnOrder, string, error) {
-		return []ReturnOrder{
-			{BillNo: "TH001", Supplier: "汇一", ItemNo: "6901234567890", ItemName: "可口可乐 330ml",
-				Qty: 12, ReturnMoney: 36.00, Status: "pending", CreateDate: "2026-09-01", Reason: "近效期"},
-			{BillNo: "TH002", Supplier: "汇一", ItemNo: "6909876543210", ItemName: "百事可乐 500ml",
-				Qty: 24, ReturnMoney: 84.50, Status: "pending", CreateDate: "2026-09-02", Reason: "破损"},
+	fn := func(ctx context.Context, supplier, status string, days int) ([]business.ReturnOrder, string, error) {
+		return []business.ReturnOrder{
+			{BillNo: "RO202609030001", SupplierID: "0001", Supplier: "汇一",
+				ReturnMoney: 36.00, Status: "pending", CreateDate: "2026-09-01", BranchNo: "0001"},
+			{BillNo: "RO202609030002", SupplierID: "0001", Supplier: "汇一",
+				ReturnMoney: 84.50, Status: "pending", CreateDate: "2026-09-02", BranchNo: "0001"},
 		}, "", nil
 	}
 	resp, err := queryReturnOrderImpl(context.Background(), fn, QueryReturnOrderReq{
@@ -529,7 +557,7 @@ func TestQueryReturnOrder_FnReturnsList(t *testing.T) {
 	if len(resp.Returns) != 2 {
 		t.Errorf("Returns len = %d, want 2", len(resp.Returns))
 	}
-	if resp.Returns[0].BillNo != "TH001" {
+	if resp.Returns[0].BillNo != "RO202609030001" {
 		t.Errorf("Returns[0].BillNo = %q", resp.Returns[0].BillNo)
 	}
 	if resp.Hint != "" {
@@ -539,8 +567,8 @@ func TestQueryReturnOrder_FnReturnsList(t *testing.T) {
 
 func TestQueryReturnOrder_FnReturnsEmpty(t *testing.T) {
 	// Fn 返空 list = 该 supplier 无未审批退货单 = 不报 (但 tool 调用成功)
-	fn := func(ctx context.Context, supplier, status string, days int) ([]ReturnOrder, string, error) {
-		return []ReturnOrder{}, "", nil
+	fn := func(ctx context.Context, supplier, status string, days int) ([]business.ReturnOrder, string, error) {
+		return []business.ReturnOrder{}, "", nil
 	}
 	resp, err := queryReturnOrderImpl(context.Background(), fn, QueryReturnOrderReq{
 		Supplier: "汇一",
@@ -564,7 +592,7 @@ func TestQueryReturnOrder_FnReturnsEmpty(t *testing.T) {
 func TestQueryReturnOrder_AllDaysValid(t *testing.T) {
 	// 验证 4 个合法 days 都能通过
 	for _, d := range []int{7, 30, 60, 90} {
-		fn := func(ctx context.Context, supplier, status string, days int) ([]ReturnOrder, string, error) {
+		fn := func(ctx context.Context, supplier, status string, days int) ([]business.ReturnOrder, string, error) {
 			return nil, "", nil
 		}
 		_, err := queryReturnOrderImpl(context.Background(), fn, QueryReturnOrderReq{
@@ -575,54 +603,4 @@ func TestQueryReturnOrder_AllDaysValid(t *testing.T) {
 			t.Errorf("days=%d 应合法, got err: %v", d, err)
 		}
 	}
-}
-
-// contains small helper
-func contains(s, sub string) bool {
-	return len(sub) == 0 || (len(s) >= len(sub) && (s == sub || indexOf(s, sub) >= 0))
-}
-
-func indexOf(s, sub string) int {
-	for i := 0; i+len(sub) <= len(s); i++ {
-		if s[i:i+len(sub)] == sub {
-			return i
-		}
-	}
-	return -1
-}
-
-// ============================================================
-// helpers
-// ============================================================
-
-// itoaTest small helper, named differently from tools_test.go's itoa
-func itoaTest(n int64) string {
-	if n == 0 {
-		return "0"
-	}
-	neg := n < 0
-	if neg {
-		n = -n
-	}
-	var buf [20]byte
-	i := len(buf)
-	for n > 0 {
-		i--
-		buf[i] = byte('0' + n%10)
-		n /= 10
-	}
-	if neg {
-		i--
-		buf[i] = '-'
-	}
-	return string(buf[i:])
-}
-
-// marshalForTest wraps json.Marshal for tool.Call args
-func marshalForTest(v any) []byte {
-	b, err := json.Marshal(v)
-	if err != nil {
-		panic(err)
-	}
-	return b
 }

@@ -36,9 +36,14 @@ type yamlEntity struct {
 
 // yamlFieldDef 字段定义 YAML
 type yamlFieldDef struct {
-	Type        string `yaml:"type"`
-	Description string `yaml:"description"`
-	Required    bool   `yaml:"required"`
+	Type        string            `yaml:"type"`
+	Description string            `yaml:"description"`
+	Required    bool              `yaml:"required"`
+	// ValueMap 业务值 → 物理值翻译表 (W4.4, 2026-09-04)
+	//   例: status: {pending: "0", approved: "1"}
+	//   filter 传 {field:"status", op:"equals", values:["pending"]}
+	//   自动翻成 {member:"approve_flag", op:"equals", values:["0"]}
+	ValueMap map[string]string `yaml:"value_map,omitempty"`
 }
 
 // yamlSource 单数据源 YAML
@@ -99,6 +104,7 @@ func buildEntity(defaultName string, ye yamlEntity) (*EntityMapping, error) {
 			Type:        ft,
 			Required:    yf.Required,
 			Description: yf.Description,
+			ValueMap:    yf.ValueMap, // W4.4: 业务值→物理值翻译表 (空/nil = 不翻译)
 		}
 	}
 

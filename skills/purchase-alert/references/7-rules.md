@@ -294,15 +294,30 @@ if flash:
 
 ---
 
-## 规则 8: pending_return(未审批退货单) — W4.4 新增, 2026-09-03
+## 规则 8: pending_return(未审批退货单) — W4.4 新增, 2026-09-04 激活
 
 > **目的**: 提醒收货人:**这批货供应商有未处理的退货单, 先确认退货已退出仓库, 再决定是否收货。** 防止重复收货 + 防止错收已退货品。
 
-### 数据源
-- 走 cube 端 `t_rm_returnflow` (HBPoS) 或其它数据源
-- 业务字段名 (bill_no / supplier_name / item_no / item_name / qty / return_money / status / create_date / reason)
-- 经 `business.Gateway.RawQuery` 或 `BizExecutor.SearchReturnsBySupplier`, **严禁直接 import parser/agent**
-- **当前未配置**: 等 mvs_1b47f8887e3c416195f506869c7d4bd8 加 cube plugin + `configs/mappings.yaml` `entities.returns` 段
+### 数据源 (W4.4 已落地)
+- 走 cube 端 `supplier_returns` (HBPoS `t_pm_sheet_master WHERE trans_no='RO' AND sale_way='A'`)
+  - 物理 cube: cube-agent-server `plugins/supplier_returns/plugin.yaml` (3484 行 / 2026-09-03 实测)
+  - 物理主表: `t_pm_sheet_master` (近 1 年, `oper_date >= DATEADD(YEAR, -1, GETDATE())`)
+- 业务字段 (mapping.yaml `entities.returns` 段):
+  - `bill_no` ← `sheet_no` (退货单号, 主表 PK)
+  - `supplier_id` ← `supcust_no` (供应商编号)
+  - `supplier_name` ← `sup_name` (供应商名, cube SQL LEFT JOIN `t_bd_supcust_info`)
+  - `status` ← `approve_flag` (HBPoS: '0'=未审核 / '1'=已审核; 业务翻译: pending='0' / approved='1')
+  - `return_money` ← `sheet_amt` (单据金额)
+  - `create_date` ← `oper_date` (制单时间)
+  - `branch_no` ← `branch_no` (门店编号)
+- 走 `business.Executor.SearchReturnsBySupplier` (e.query() 私有方法) → mapping 翻译 → cube 端
+- **没有 reason/item_no/item_name 字段** (cube 端 2026-09-04 确认无, 退货明细在 supplier_return_items cube 后续再加)
+
+### 状态值翻译 (ValueMap, mapping.yaml 写)
+- 业务侧 (LLM 用): `pending` / `approved` / `rejected`
+- 物理侧 (HBPoS approve_flag): `'0'` (未审核) / `'1'` (已审核) / **不存在**
+- mapping ValueMap 翻译: `pending → '0'`, `approved → '1'`, `rejected` 不在 HBPoS → 永远 0 行
+- LLM 永远只看业务值, 物理值藏在 mapping 层
 
 ### 必报条件
 - `query_return_order(supplier, status="pending", days=30)` 返 `count >= 1` AND `not_available=false`
@@ -311,7 +326,7 @@ if flash:
 - **`not_available=true` (任何原因) → 规则降级, 不报** (不报比误报好)
   - 触发场景: cube 数据源未接入 / mapping 缺失 / cube 端 schema 不对 / 查询超时
 - `count == 0` (该 supplier 近 30 天没有未审批退货单) → 不报
-- `status` 不是 `pending` (已审批 / 已驳回) → 不在本规则 scope, 业务上不需要提醒
+- `status` 不是 `pending` (已审批) → 不在本规则 scope, 业务上不需要提醒
 
 ### 判定
 ```python
@@ -324,6 +339,8 @@ if result.not_available:
 
 # 正常路径: count >= 1 → 报 1 条 session 级 warn (整 supplier 1 条, 不按 row 报)
 if result.count >= 1:
+    # 按 create_date 升序排序, 找最早一单
+    earliest = sorted(result.returns, key=lambda r: r.create_date)[0]
     alert = {
         "rule": "pending_return",
         "severity": "warn",            # 第二严重 (跟 no_return / high_stock warn 同级)
@@ -332,7 +349,7 @@ if result.count >= 1:
         "message": (
             f"供应商 [{supplier}] 近 30 天有 {result.count} 单未审批退货单"
             f"(总额 ¥{result.total_money:.0f}),请收货人确认退货已退出仓库后,再决定是否收货。"
-            f"最早一单: {result.returns[0].bill_no} ({result.returns[0].create_date}, 原因: {result.returns[0].reason or '未填'})"
+            f"最早一单: {earliest.bill_no} ({earliest.create_date})"
         )
     }
     emit(alert)  # 整 session 1 条 (不按 row 报, 即使 session 内多个 row 同 supplier)
@@ -347,15 +364,6 @@ if result.count >= 1:
 - 独立于规则 1-7, **不影响** high_stock / no_return / offseason 判定
 - 是 **session 级** alert (row_id=0), 跟 has_duitou / block_entry 汇总同级
 - 一个 session 内同一 supplier 无论多少 row, **只报 1 条** (合并去重)
-
-### 数据源接入后 (W4.4 落地步骤)
-1. cube-agent-server 端建 `t_rm_returnflow` cube + `plugins/t_rm_returnflow/plugin.yaml`
-2. `configs/mappings.yaml` 加 `entities.returns` 段 (业务字段名 → hbpos 物理字段)
-3. `cmd/server/main.go` 实现 `QueryReturnOrderFn`, 内部调 `gateway.RawQuery("t_rm_returnflow", ...)`
-4. `internal/agent/runner.go:127` `bizTools` 一次性把 6 个 purchase_alert tool 全注册进去 (当前未注册, 等数据齐一起 wire)
-5. `internal/business/executor.go` 加 `SearchReturnsBySupplier(supplier, status, days)` 方法, 走 `e.query()` 私有方法
-6. 跑 e2e: 拿一个真有 pending 退货单的 supplier + 假的 session, 验证 alert 落库
-7. SKILL.md version 升 1.2.0, 移除 `pending_data_source` 字段
 
 ### 性能预算
 - 一次 tool call: 500ms-2s (cube)

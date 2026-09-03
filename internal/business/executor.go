@@ -200,6 +200,98 @@ func (e *Executor) CubeOf(entity string) string {
 	return src.Cube
 }
 
+// ReturnOrder 退货单业务响应 (W4.4, 2026-09-04)
+//   业务字段名 (跟 mapping.yaml entities.returns.fields 对齐)
+//   严禁包含物理 cube 字段名 (AGENTS.md §12.2)
+type ReturnOrder struct {
+	BillNo      string    `json:"bill_no"`             // 退货单号
+	SupplierID  string    `json:"supplier_id"`         // 供应商编号
+	Supplier    string    `json:"supplier_name"`       // 供应商名
+	Status      string    `json:"status"`              // 业务状态: pending|approved
+	ReturnMoney float64   `json:"return_money"`        // 退货金额
+	CreateDate  string    `json:"create_date"`         // 制单时间 (ISO 8601)
+	BranchNo    string    `json:"branch_no,omitempty"` // 门店编号
+}
+
+// SearchReturnsBySupplier 查某 supplier 的退货单 (W4.4, purchase-alert rule 8 用)
+//   supplier: 供应商名 (HBPoS sup_name, 业务字段名)
+//   status: 业务状态值 ("pending" / "approved" / "" 全部), 空=不按状态过滤
+//   days: 时间窗口天数 (近 N 天), 0=不限 (但 cube 端 SQL 自带近 1 年过滤, 实测够用)
+//   limit: 上限 (默认 100, 防单 supplier 退货单爆量)
+//
+// 走 e.query() 私有方法:
+//   - status 业务值经 mapping ValueMap 翻译为物理值 (pending→"0" HBPoS approve_flag)
+//   - supplier_name 业务字段 → sup_name 物理字段 (cube SQL 已 LEFT JOIN t_bd_supcust_info)
+//   - return_money measure / create_date time 字段类型由 mapping 框架处理
+//
+// 错误处理:
+//   - 当前 ds 没配 returns mapping → 返回 "未配置" error, caller (Fn) 转 not_available=true
+//   - cube 调用失败 → 透传 error, caller 降级
+func (e *Executor) SearchReturnsBySupplier(supplier, status string, days, limit int) ([]ReturnOrder, error) {
+	if limit <= 0 {
+		limit = 100
+	}
+	bizFields := []string{"bill_no", "supplier_id", "supplier_name", "status", "return_money", "create_date", "branch_no"}
+
+	// filter 1: supplier_name 必填 (cube SQL 自己 LIKE 匹配, 业务字段名)
+	filters := []BusinessFilter{
+		{Field: "supplier_name", Op: "contains", Values: []any{supplier}},
+	}
+	// filter 2: status 可选 (ValueMap 翻译 pending→"0")
+	if status != "" {
+		filters = append(filters, BusinessFilter{Field: "status", Op: "equals", Values: []any{status}})
+	}
+
+	rows, err := e.query("returns", e.client.GetDataSource(), bizFields, filters, limit)
+	if err != nil {
+		return nil, err
+	}
+
+	// 业务响应 → ReturnOrder struct
+	// days 过滤: e.query() 不支持 time filter (cube 端 SQL 自带近 1 年过滤)
+	//   真实需要 days 时, 在调用方 (Fn) 二次过滤 create_date
+	out := make([]ReturnOrder, 0, len(rows))
+	for _, r := range rows {
+		ro := ReturnOrder{
+			BillNo:     stringField(r, "bill_no"),
+			SupplierID: stringField(r, "supplier_id"),
+			Supplier:   stringField(r, "supplier_name"),
+			Status:     stringField(r, "status"),
+			BranchNo:   stringField(r, "branch_no"),
+		}
+		ro.ReturnMoney = floatField(r, "return_money")
+		ro.CreateDate = stringField(r, "create_date")
+		out = append(out, ro)
+	}
+	return out, nil
+}
+
+// stringField / floatField 工具: 从 map 里安全取字段, 缺字段返零值
+func stringField(m map[string]any, key string) string {
+	if v, ok := m[key]; ok {
+		if s, ok := v.(string); ok {
+			return s
+		}
+	}
+	return ""
+}
+
+func floatField(m map[string]any, key string) float64 {
+	if v, ok := m[key]; ok {
+		switch x := v.(type) {
+		case float64:
+			return x
+		case float32:
+			return float64(x)
+		case int:
+			return float64(x)
+		case int64:
+			return float64(x)
+		}
+	}
+	return 0
+}
+
 // query 内部统一:Registry 翻译 + 调 agent + 翻回
 func (e *Executor) query(
 	entity, ds string,

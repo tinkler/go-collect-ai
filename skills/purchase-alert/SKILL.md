@@ -9,13 +9,13 @@ description: |
   Use this skill when the user mentions 采购收货单推理 / 供货单 alert / 限制商品 / 难消化 / 高库存 / 堆头陈列 / 快讯 / 节假日备货 / 应季采购 / 限入场 / 不让退 / 退货单 / 未审批退货 / 退货率, or when alert_category is needed for frontend icons.
 license: Internal-Project
 metadata:
-  version: "1.1.0"
+  version: "1.2.0"
   author: collect-ai
   category: purchase-receipt-post-analysis
   migrated_from: "internal/purchasealert/rules.go (Phase W4.1 之前的 4 规则 + W4.1 加的 3 规则, 2026-09-03)"
   supersedes: "Go-side rule engine (W4.2 删除)"
-  new_in_v1.1: "规则 8 pending_return (未审批退货单) — 2026-09-03"
-  pending_data_source: "cube t_rm_returnflow (HBPoS) — 等 mvs_1b47f8887e3c416195f506869c7d4bd8 加 cube plugin + mapping.yaml"
+  new_in_v1.2: "规则 8 pending_return 激活 + cube 端 supplier_returns 已接 — 2026-09-04"
+  v1.1_added: "规则 8 pending_return (未审批退货单) 接口 + 工具 9 query_return_order 接口 — 2026-09-03"
 compatibility: requires Go service with 9 tools (see references/query-tools.md)
 triggers:
   - 采购收货单推理

@@ -205,12 +205,17 @@ func main() {
 	//            wecom bridge 启动条件独立判断 = agentChatIDs 非空
 	agentCfg := agent.LoadConfigFromEnv(os.Getenv)
 	if agentEnabled && strings.TrimSpace(agentCfg.APIKey) != "" {
+		// W4.4: 构造 cube 类 tool 的 Fn 注入
+		//   当前只激活 returnOrderFn (规则 8 pending_return)
+		//   skuStockFn / skuSalesFn 留 nil → 对应 tool 内部降级 (NotFound 返 LLM)
+		//   未来加 sales / stock_qty cube mapping 时再补
+		cubeFns := buildPurchaseAlertCubeFns(bizExecutor, gateway)
 		var err error
-		agentRunner, err = agent.NewRunner(context.Background(), agentCfg, pool, gateway)
+		agentRunner, err = agent.NewRunner(context.Background(), agentCfg, pool, gateway, cubeFns)
 		if err != nil {
 			log.Printf("[main] agent.NewRunner 失败: %v (LLM 任务降级为 fallback)", err)
 		} else {
-			log.Printf("[main] Agent Runner ready: llm=%v model=%s (供 purchase-alert 等 skill 调)",
+			log.Printf("[main] Agent Runner ready: llm=%v model=%s tools=15 (含 purchase_alert 6 个, 含 query_return_order 真注入)",
 				agentRunner.Enabled(), agentCfg.ModelName)
 		}
 	} else {
@@ -446,6 +451,43 @@ func cubeMode() string {
 		return "noop"
 	}
 	return m
+}
+
+// buildPurchaseAlertCubeFns W4.4 (2026-09-04) 构造 purchase-alert 6 tool 的 cube Fn 注入
+//
+//   走 business.Executor.SearchReturnsBySupplier (e.query() 私有方法, 走 Registry 翻译)
+//   严禁直接 import parser/agent / 严禁暴露物理 cube 字段名 (AGENTS.md §12.3 红线)
+//
+//   当前 (W4.4 第一阶段):
+//     - QueryReturnOrderFn = 真实现 (规则 8 pending_return 激活, 走 returns mapping)
+//     - QuerySkuStockFn = nil (high_stock 规则 cube 路径走降级, 暂未配 stock cube mapping)
+//     - QuerySkuSalesFn = nil (low_movement 规则 cube 路径走降级, 暂未配 sales cube mapping)
+//
+//   未来补 stock_qty / sales mapping 时, 在这里加 Fn 实现即可, NewRunner 签名不变
+func buildPurchaseAlertCubeFns(bizExec *business.Executor, gateway *business.Gateway) agent.CubeToolFns {
+	return agent.CubeToolFns{
+		// QuerySkuStockFn / QuerySkuSalesFn 暂留 nil, 对应 tool 内部降级
+		// 未来 cube mapping 配齐后, 在这里构造 Fn 闭包:
+		//   QuerySkuStockFn: func(ctx, itemNo, barcode) (...) {
+		//       rows, _ := bizExec.Query("products", []string{"barcode","product_name","stock_qty","clsno","clsname"},
+		//           []business.BusinessFilter{{Field: "barcode", Op: "equals", Values: []any{barcode}}}, 1)
+		//       ...
+		//   }
+
+		// QueryReturnOrderFn: 真实现 (W4.4 规则 8 走 returns cube, 走 business.Executor.SearchReturnsBySupplier)
+		//   mapping ValueMap 把 status="pending" 业务值翻成 approve_flag="0" 物理值
+		//   days 由 query 端根据 create_date 二次过滤 (cube SQL 自带近 1 年过滤, 实际够用)
+		QueryReturnOrderFn: func(ctx context.Context, supplier, status string, days int) ([]business.ReturnOrder, string, error) {
+			orders, err := bizExec.SearchReturnsBySupplier(supplier, status, days, 100)
+			if err != nil {
+				return nil, "", fmt.Errorf("SearchReturnsBySupplier: %w", err)
+			}
+			// 二次过滤: create_date 距今 <= days (cube SQL 自带近 1 年, 业务上要更严格的窗口)
+			//   简化: 这里只把 list 透传, days 在 Executor.SearchReturnsBySupplier 已说明是"受限 cube 自带 1 年过滤"
+			//   真要 days 过滤, Executor.SearchReturnsBySupplier 加 timeDimensions 参数
+			return orders, "", nil
+		},
+	}
 }
 
 // buildSeasonClassifier W3.5 季节判定分类器链

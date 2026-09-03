@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/tinkler/collect-ai/internal/business"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"trpc.group/trpc-go/trpc-agent-go/tool/function"
 )
@@ -209,26 +210,16 @@ func querySkuSalesImpl(ctx context.Context, queryFn QuerySkuSalesFn, req QuerySk
 
 // ============================================================
 // 工具 3.5: query_return_order
-//   查供应商退货单 (W4.4 新增, 等 cube 数据源 t_rm_returnflow)
+//   查供应商退货单 (W4.4 新增, cube 端 supplier_returns 已建好)
 //   用途: purchase-alert skill 跑 "未审批退货单" 规则 (pending_return)
-//   数据源: cube 端 t_rm_returnflow (HBPoS) / 其它数据源 (mapping.yaml 配)
-//         业务字段名 (bill_no / supplier_name / item_no / item_name /
-//         qty / return_money / status / create_date / reason)
-//         严禁直接 import parser/agent; 必须经 business.Gateway.RawQuery
+//   数据源: cube 端 supplier_returns (HBPoS t_pm_sheet_master WHERE trans_no='RO')
+//         mapping 走 configs/mappings.yaml entities.returns 段 (业务字段名 → 物理字段)
+//         严禁直接 import parser/agent; 必须经 business.Executor.SearchReturnsBySupplier
+//
+//   ReturnOrder 类型: 复用 business.ReturnOrder (W4.4 统一, 避免重复类型)
+//   业务字段: bill_no / supplier_id / supplier_name / status / return_money / create_date / branch_no
+//   状态值业务: pending (未审核) / approved (已审核) / rejected (永不命中, HBPoS 无此状态)
 // ============================================================
-
-// ReturnOrder 退货单记录 (业务字段名, 不含物理 cube 字段名)
-type ReturnOrder struct {
-	BillNo      string  `json:"bill_no"`
-	Supplier    string  `json:"supplier_name"`
-	ItemNo      string  `json:"item_no"`
-	ItemName    string  `json:"item_name,omitempty"`
-	Qty         float64 `json:"qty"`
-	ReturnMoney float64 `json:"return_money"`
-	Status      string  `json:"status"` // pending / approved / rejected
-	CreateDate  string  `json:"create_date"`
-	Reason      string  `json:"reason,omitempty"`
-}
 
 // QueryReturnOrderReq 入参
 type QueryReturnOrderReq struct {
@@ -239,20 +230,20 @@ type QueryReturnOrderReq struct {
 
 // QueryReturnOrderResp 出参
 type QueryReturnOrderResp struct {
-	Supplier     string        `json:"supplier_name"`
-	Status       string        `json:"status,omitempty"`
-	Days         int           `json:"days"`
-	Count        int           `json:"count"`
-	TotalMoney   float64       `json:"total_money"`
-	Returns      []ReturnOrder `json:"returns"`
-	NotAvailable bool          `json:"not_available,omitempty"` // true = cube 数据源未配置, LLM 降级
-	Hint         string        `json:"hint,omitempty"`          // 提示(如"数据源未接入, 规则自动降级")
+	Supplier     string                  `json:"supplier_name"`
+	Status       string                  `json:"status,omitempty"`
+	Days         int                     `json:"days"`
+	Count        int                     `json:"count"`
+	TotalMoney   float64                 `json:"total_money"`
+	Returns      []business.ReturnOrder  `json:"returns"`
+	NotAvailable bool                    `json:"not_available,omitempty"` // true = cube 数据源未配置, LLM 降级
+	Hint         string                  `json:"hint,omitempty"`          // 提示(如"数据源未接入, 规则自动降级")
 }
 
-// QueryReturnOrderFn 查询函数 (caller 注入, 走 cube t_rm_returnflow via business.Gateway)
-//   返 (退货单 list, 错误)
-//   如果 cube 数据源未配置 / mapping 缺失, 返 ([], nil, "未配置提示")
-type QueryReturnOrderFn func(ctx context.Context, supplier, status string, days int) ([]ReturnOrder, string, error)
+// QueryReturnOrderFn 查询函数 (caller 注入, 走 cube supplier_returns via business.Executor)
+//   返 (退货单 list, hint, 错误)
+//   如果 cube 数据源未配置 / mapping 缺失, 返 ([], "未配置提示", nil) → queryReturnOrderImpl 走降级路径
+type QueryReturnOrderFn func(ctx context.Context, supplier, status string, days int) ([]business.ReturnOrder, string, error)
 
 // QueryReturnOrder 工具函数
 func QueryReturnOrder(queryFn QueryReturnOrderFn) *function.FunctionTool[QueryReturnOrderReq, QueryReturnOrderResp] {

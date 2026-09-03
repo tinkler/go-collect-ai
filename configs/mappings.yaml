@@ -134,3 +134,53 @@ entities:
           supplier_name: suppliers.sup_name
           contact: suppliers.sup_man
           phone: suppliers.sup_tel
+
+  # 2026-09-04 W4.4: 退货单(规则 8 pending_return 依赖)
+  # 物理表: hbpos t_pm_sheet_master WHERE trans_no='RO' AND sale_way='A' (供应商退货单)
+  # cube: cube-agent-server/plugins/supplier_returns/plugin.yaml (3484 行 / 2026-09-03 实测)
+  # 业务字段名严格隔离, 物理字段名只在本段 + mapping.go registerReturns() 出现 (AGENTS.md §12.3)
+  returns:
+    name: returns
+    description: 供应商退货单主表(W4.4 跨数据源业务统一)
+    fields:
+      bill_no:
+        type: dimension
+        description: 退货单号
+      supplier_id:
+        type: dimension
+        description: 供应商编号
+      supplier_name:
+        type: dimension
+        description: 供应商名
+      status:
+        type: dimension
+        description: 状态 (pending=未审核 / approved=已审核 / rejected=永不命中, HBPoS 无此状态)
+        # W4.4: ValueMap 翻译层, 业务值 → 物理值 (HBPoS approve_flag)
+        #   pending  → "0" (未审核)
+        #   approved → "1" (已审核)
+        #   rejected → 不在 HBPoS, 不写 (查 cube 会返 0 行)
+        value_map:
+          pending: "0"
+          approved: "1"
+      return_money:
+        type: measure
+        description: 单据金额
+      create_date:
+        type: time
+        description: 制单时间 (cube SQL 自带近 1 年过滤)
+      branch_no:
+        type: dimension
+        description: 门店编号
+    sources:
+      hbpos:
+        # cube SQL 已在 plugin.yaml 端 LEFT JOIN t_bd_supcust_info (cube 端数据治理层职责)
+        cube: supplier_returns
+        fields:
+          bill_no:       supplier_returns.sheet_no
+          supplier_id:   supplier_returns.supcust_no
+          supplier_name: supplier_returns.sup_name
+          status:        supplier_returns.approve_flag
+          return_money:  supplier_returns.sheet_amt
+          create_date:   supplier_returns.oper_date
+          branch_no:     supplier_returns.branch_no
+      # 未来加 erp 源: 暂未实现, 等业务需要再补

@@ -277,10 +277,11 @@ UPDATE `parse_session SET analysis_status, analysis_at, analysis_error`。
 
 ---
 
-## 工具 9: `query_return_order` (W4.4 新, 等 cube 数据源)
+## 工具 9: `query_return_order` (W4.4 已激活, 2026-09-04)
 
 **用途**: purchase-alert skill 跑 "未审批退货单" 规则 (规则 8, `pending_return`)。
-**数据源**: cube 端 `t_rm_returnflow` (HBPoS) 或其它数据源, **业务字段名** (bill_no / supplier_name / item_no / item_name / qty / return_money / status / create_date / reason)。**严禁直接 import parser/agent**, 必须经 `business.Gateway.RawQuery` 或 `BizExecutor.SearchReturnsBySupplier`。
+**数据源**: cube 端 `supplier_returns` (HBPoS `t_pm_sheet_master WHERE trans_no='RO' AND sale_way='A'`), 走 `business.Executor.SearchReturnsBySupplier` → mapping ValueMap 翻译 `status='pending' → approve_flag='0'` → cube 端。
+**业务字段名** (mapping.yaml `entities.returns` 段): bill_no / supplier_id / supplier_name / status / return_money / create_date / branch_no. **没有 reason / item_no / item_name** (2026-09-04 确认 cube 端无, 退货明细在 supplier_return_items cube 后续再加)。
 
 ### 入参
 
@@ -303,15 +304,13 @@ UPDATE `parse_session SET analysis_status, analysis_at, analysis_error`。
   "total_money": 856.50,
   "returns": [
     {
-      "bill_no": "TH202609030001",
+      "bill_no": "RO202609030001",
+      "supplier_id": "0001",
       "supplier_name": "汇一",
-      "item_no": "6901234567890",
-      "item_name": "可口可乐 330ml",
-      "qty": 12,
-      "return_money": 36.00,
       "status": "pending",
-      "create_date": "2026-09-01",
-      "reason": "近效期"
+      "return_money": 425.50,
+      "create_date": "2026-09-01T10:23:45Z",
+      "branch_no": "0001"
     }
   ],
   "not_available": false,
@@ -323,20 +322,22 @@ UPDATE `parse_session SET analysis_status, analysis_at, analysis_error`。
 
 - `not_available=true` + `hint` 字段有提示 → **cube 数据源未接入 / 未配置 / 调用失败**, LLM **必须降级, 不报 pending_return 规则** (避免误报)。
 - `not_available=true` 触发场景:
-  1. Go 端 Fn 注入为 nil (cube 数据源压根没接)
+  1. Go 端 Fn 注入为 nil (cube 数据源压根没接, W4.4 之前状态)
   2. `configs/mappings.yaml` 没配 `entities.returns` 段
-  3. cube 端 `t_rm_returnflow` cube 不存在
+  3. cube 端 `supplier_returns` cube 不存在
   4. cube 查询超时 / 物理表 schema 不对
 - 任何时候 LLM 看到 `not_available=true` → 跳过规则 8, 不报 alert, 继续跑规则 1-7。
-- (W4.4 真实接入后, `not_available=false` 才是常态)
 
-### Go 端实现
+### Go 端实现 (W4.4 已 wire)
 
 - 文件: `internal/agent/tools/purchase_alert.go` `QueryReturnOrder(QueryReturnOrderFn)`
-- 签名: `func(ctx, supplier, status, days) ([]ReturnOrder, string, error)`
-- 第二个 string 返回 = hint, 非空时 LLM 走降级路径
-- **未 wire** 阶段: runner.go 不注册此 tool (跟其他 5 个 purchase_alert tool 保持一致), **等 mvs_1b47f8887e3c416195f506869c7d4bd8 加完 cube + mapping.yaml 后一次性 wire 6 个 tool 进去**。
-- **wire 时**: 在 `cmd/server/main.go` 实现 `QueryReturnOrderFn`, 内部调 `gateway.RawQuery("t_rm_returnflow", ...)` 或 `executor.SearchReturnsBySupplier(...)`。**严禁直接 import parser/agent**。
+- 签名: `func(ctx, supplier, status, days) ([]business.ReturnOrder, string, error)`
+  - 第二个 string 返回 = hint, 非空时 LLM 走降级路径
+- 注入位置: `cmd/server/main.go` `buildPurchaseAlertCubeFns(bizExecutor, gateway)`
+  - 内部调 `bizExecutor.SearchReturnsBySupplier(supplier, status, days, 100)`
+  - 走 `e.query()` 私有方法 → mapping 翻译 → cube-agent-server
+- 状态值翻译: mapping ValueMap 把 `status="pending"` (业务) 翻成 `approve_flag='0'` (物理), `status="approved"` 翻成 `approve_flag='1'`, `rejected` 永不命中 (HBPoS 无此状态)
+- runner.go `bizTools` 已 wire (W4.4 一次性把 6 个 purchase_alert tool 全注册, 9 老 tool + 6 新 = 15 个)
 
 ---
 

@@ -113,18 +113,32 @@ type Runner struct {
 	invokeSkill tool.Tool // invoke_skill 暴露给 LLM
 }
 
+// CubeToolFns cube 类 tool 的 Fn 注入 (W4.4, 2026-09-04)
+//   任何字段 nil → 对应 tool 内部自动降级 (NotFound / NotAvailable 返 LLM, LLM 自纠跳过)
+//   main.go 决定哪些传真实现, 哪些留 nil
+//   例子: CubeToolFns{QueryReturnOrderFn: returnOrderFn} (只激活规则 8, 其他 cube 类暂留 nil)
+type CubeToolFns struct {
+	QuerySkuStockFn    tools.QuerySkuStockFn    // nil = 降级 (用于 high_stock 规则)
+	QuerySkuSalesFn    tools.QuerySkuSalesFn    // nil = 降级 (用于 low_movement 规则, W4.2 启用)
+	QueryReturnOrderFn tools.QueryReturnOrderFn // nil = 降级 (用于 pending_return 规则, W4.4 新)
+}
+
 // NewRunner 构造 Runner
 //   当 cfg.Enabled=true 且 cfg.APIKey 非空 → 注册 LLM Agent
 //   否则降级: tools 仍可用,但 LLM 调用会返回 ErrLLMNotConfigured
-//   gateway: 2026-09-02 预留,当前 6 个 tool 都是写 PG 表,不用 cube
-//            W2+ 加 cube 工具 (e.g. QueryProductsTool) 时直接用 r.gateway.Query()
-func NewRunner(ctx context.Context, cfg Config, pool *pgxpool.Pool, gateway *business.Gateway) (*Runner, error) {
+//   gateway: 2026-09-02 引入,所有 cube 调用统一收口 (AGENTS.md §12.1)
+//   cubeFns: W4.4 加, cube 类 tool 的 Fn 注入; 字段 nil = 走降级路径
+func NewRunner(ctx context.Context, cfg Config, pool *pgxpool.Pool, gateway *business.Gateway, cubeFns CubeToolFns) (*Runner, error) {
 	if pool == nil {
 		return nil, fmt.Errorf("agent: pg pool 必填")
 	}
 
 	// 1) 业务工具注册
+	//   9 个 policy/calendar/fee 老 tool + 6 个 purchase_alert tool (W4.2 写好但一直没注册, W4.4 一次性 wire)
+	//   cube 类 (QuerySkuStock / QuerySkuSales / QueryReturnOrder) 走 Fn 注入 (cubeFns 字段 nil = 降级)
+	//   PG 类 走 pool 直传
 	bizTools := []tool.Tool{
+		// --- 老 tool: policy / calendar / fee (W2-W4.2) ---
 		tools.RememberSupplierPolicy(pool),
 		tools.QuerySupplierPolicy(pool),
 		tools.DeleteSupplierPolicy(pool), // W4.2 decision-memory: 撤销单 key / 整条
@@ -134,6 +148,16 @@ func NewRunner(ctx context.Context, cfg Config, pool *pgxpool.Pool, gateway *bus
 		tools.RecordPromotionFee(pool),
 		tools.ListPromotionFee(pool),
 		tools.CancelPromotionFee(pool), // W4.2 promo-harvester: 撤销堆头/端架/快讯等
+
+		// --- 新 wire: purchase_alert (W4.4, 2026-09-04) ---
+		//   cube 类 3 个: 走 Fn 注入, 字段 nil → tool 内部返 not_available (LLM 自纠跳过)
+		//   PG 类 3 个: pool 直传
+		tools.QueryAppSettings(pool),                          // 读阈值/分类白名单
+		tools.QuerySkuStock(cubeFns.QuerySkuStockFn),          // Fn nil → NotFound 降级
+		tools.QuerySkuSales(cubeFns.QuerySkuSalesFn),          // Fn nil → NotFound 降级
+		tools.QueryReturnOrder(cubeFns.QueryReturnOrderFn),   // Fn nil → NotAvailable 降级 (W4.4 新)
+		tools.InsertPurchaseAlert(pool),                       // 落库 alert
+		tools.UpdateAnalysisStatus(pool),                      // 收尾写 parse_session.analysis_status
 	}
 
 	// 2) Skill 系统(Anthropic Agent Skills 规范)

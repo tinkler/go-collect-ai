@@ -34,10 +34,16 @@ const (
 
 // FieldDef 业务字段定义
 type FieldDef struct {
-	Name        string    // 业务字段名(对外,前端用)
-	Type        FieldType // dimension / measure / time
-	Required    bool      // 是否必填
+	Name        string            // 业务字段名(对外,前端用)
+	Type        FieldType         // dimension / measure / time
+	Required    bool              // 是否必填
 	Description string
+	// ValueMap 业务值 → 物理值 翻译表 (2026-09-04 W4.4)
+	//   例: status 业务值 "pending" → 物理值 "0" (HBPoS approve_flag)
+	//   filter 传 {field:"status", op:"equals", values:["pending"]}
+	//   自动翻成 {member:"approve_flag", op:"equals", values:["0"]}
+	//   nil/空 map = 不做值翻译(原样透传)
+	ValueMap map[string]string
 }
 
 // SourceMapping 单个数据源下,业务字段 → 物理 cube 字段的映射
@@ -71,13 +77,14 @@ type Registry struct {
 	entities map[string]*EntityMapping
 }
 
-// NewDefaultRegistry 默认注册 products + suppliers 两个业务实体
+// NewDefaultRegistry 默认注册 products + suppliers + returns 三个业务实体
 //
 //	hardcode 业务字段映射规则,后续可改用 config/field_mappings.yaml
 func NewDefaultRegistry() *Registry {
 	r := &Registry{entities: map[string]*EntityMapping{}}
 	r.registerProducts()
 	r.registerSuppliers()
+	r.registerReturns()
 	return r
 }
 
@@ -172,10 +179,25 @@ func (r *Registry) ToPhysicalQuery(
 			// 该 ds 没这个 filter 字段,跳过
 			continue
 		}
+		// 2026-09-04 W4.4: 业务值 → 物理值翻译 (ValueMap)
+		//   例: status="pending" (业务) → approve_flag="0" (物理)
+		values := bf.Values
+		if fd, fdOK := ent.Fields[bf.Field]; fdOK && len(fd.ValueMap) > 0 {
+			translated := make([]any, 0, len(bf.Values))
+			for _, v := range bf.Values {
+				if pv, hit := fd.ValueMap[fmt.Sprint(v)]; hit {
+					translated = append(translated, pv)
+				} else {
+					// ValueMap 没这值, 原样透传 (让 cube 端报"未知值"错误, 不静默吞)
+					translated = append(translated, v)
+				}
+			}
+			values = translated
+		}
 		q.Filters = append(q.Filters, PhysicalFilter{
 			Member: ref,
 			Op:     bf.Op,
-			Values: bf.Values,
+			Values: values,
 		})
 	}
 
@@ -417,4 +439,58 @@ func availableDS(ent *EntityMapping) []string {
 		out = append(out, k)
 	}
 	return out
+}
+
+// registerReturns 退货单(W4.4, 2026-09-04)
+//
+//	物理表: hbpos t_pm_sheet_master WHERE trans_no='RO' AND sale_way='A'
+//	cube 名: supplier_returns (cube-agent-server 已建, plugin.yaml 在 cube-agent-server 仓库)
+//	业务字段名 → 物理字段:
+//	  bill_no       ← sheet_no      (退货单号, 主表 PK)
+//	  supplier_id   ← supcust_no    (供应商编号)
+//	  supplier_name ← sup_name      (供应商名, cube SQL LEFT JOIN t_bd_supcust_info)
+//	  status        ← approve_flag  (0=未审核, 1=已审核; ValueMap 翻 pending/approved)
+//	  return_money  ← sheet_amt     (单据金额)
+//	  create_date   ← oper_date     (制单时间, cube SQL 自带近 1 年过滤)
+//	  branch_no     ← branch_no     (门店编号, 附加信息)
+//
+//	cube 端没有"reason"退货原因字段(2026-09-04 确认), 不暴露
+//	cube 端没有"item_no/item_name/qty"明细字段(明细在 supplier_return_items cube),
+//	  规则 8 用主表即可, 不需要明细 → 不暴露
+func (r *Registry) registerReturns() {
+	ent := &EntityMapping{
+		Name:        "returns",
+		Description: "供应商退货单主表(W4.4, 跨数据源业务统一)",
+		Fields: map[string]FieldDef{
+			"bill_no":       {Name: "bill_no", Type: FieldTypeDimension, Description: "退货单号"},
+			"supplier_id":   {Name: "supplier_id", Type: FieldTypeDimension, Description: "供应商编号"},
+			"supplier_name": {Name: "supplier_name", Type: FieldTypeDimension, Description: "供应商名"},
+			"status":        {Name: "status", Type: FieldTypeDimension, Description: "状态 (pending=未审核 / approved=已审核 / rejected=永不命中, HBPoS 无此状态)",
+				ValueMap: map[string]string{
+					"pending":  "0", // HBPoS approve_flag
+					"approved": "1",
+					// "rejected" 不在 HBPoS, 故意不加, 查 cube 会 0 行
+				}},
+			"return_money": {Name: "return_money", Type: FieldTypeMeasure, Description: "单据金额"},
+			"create_date":  {Name: "create_date", Type: FieldTypeTime, Description: "制单时间"},
+			"branch_no":    {Name: "branch_no", Type: FieldTypeDimension, Description: "门店编号"},
+		},
+		Sources: map[string]SourceMapping{
+			"hbpos": {
+				// cube SQL 已在 plugin.yaml 端 LEFT JOIN t_bd_supcust_info (cube 端数据治理层职责)
+				Cube: "supplier_returns",
+				FieldRefs: map[string]string{
+					"bill_no":       "supplier_returns.sheet_no",
+					"supplier_id":   "supplier_returns.supcust_no",
+					"supplier_name": "supplier_returns.sup_name",
+					"status":        "supplier_returns.approve_flag",
+					"return_money":  "supplier_returns.sheet_amt",
+					"create_date":   "supplier_returns.oper_date",
+					"branch_no":     "supplier_returns.branch_no",
+				},
+			},
+			// 未来加 erp 源: 暂未实现
+		},
+	}
+	r.entities["returns"] = ent
 }
