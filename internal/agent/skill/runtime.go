@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -211,10 +212,15 @@ func doRunScript(ctx context.Context, sk *Skill, r InvokeSkillReq) (InvokeSkillR
 	case err := <-doneCh:
 		out := stdout.String()
 		if err != nil {
+			// 脚本非 0 退出: 把 stderr 单独 log 一行, 方便运维 log 直接看到诊断信息
+			// trpc-agent-go 那一层只 log err 不 log output, 不写这一步 stderr 永远看不到
+			// maxScriptOutput = 20KB, 限长避免刷屏
+			dump := truncateStr(fmt.Sprintf("exit error: %v\nstdout:\n%s\nstderr:\n%s", err, out, stderr.String()), maxScriptOutput)
+			log.Printf("[invoke_skill] run_script %s 失败: %s", r.Path, dump)
 			return InvokeSkillResp{
 				Skill:  sk.Manifest.Name,
 				Action: "run_script",
-				Output: truncateStr(fmt.Sprintf("exit error: %v\nstdout:\n%s\nstderr:\n%s", err, out, stderr.String()), maxScriptOutput),
+				Output: dump,
 			}, err
 		}
 		return InvokeSkillResp{

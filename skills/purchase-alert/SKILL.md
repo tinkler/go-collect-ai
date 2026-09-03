@@ -66,6 +66,32 @@ triggers:
 
 ## How to use this skill (LLM 工作流)
 
+### 步骤 0: 调 `run_analysis.py` 拿预聚合数据 (可选但推荐)
+
+> **重要**: `run_script` 走的是**子进程 stdin**,必须用 `args` 字段传 JSON,不要用 `input`(那是给 `load` action 拼到 SKILL.md 末尾的)。
+
+调 `invoke_skill` action=`run_script` path=`scripts/run_analysis.py`:
+
+```json
+{
+  "skill_name": "purchase-alert",
+  "action": "run_script",
+  "path": "scripts/run_analysis.py",
+  "args": {
+    "session_id": "3051fc81-...",
+    "supplier_name": "汇一",
+    "rows": [{"row_id": 1, "matched_name": "...", "qty": 5, ...}]
+  }
+}
+```
+
+跑完会返回 4 类预查数据(supplier_policy / promotion_fee / calendar / app_settings)+ 空 candidate_alerts。
+LLM 拿这个结果跑步骤 3 判定。如果不调这步直接跑也行,只是要自己调 8 个 tool 查同样的数据。
+
+**注意**:
+- `args` 字段是 JSON 对象,不是字符串
+- 漏传 `args` 脚本收到空 stdin 会 `json.load` 异常 → exit 1 → 跑不动
+
 ### 输入
 
 LLM 接收一段 JSON,描述待分析的 session:
