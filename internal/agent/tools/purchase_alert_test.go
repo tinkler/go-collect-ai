@@ -379,6 +379,219 @@ func TestUpdateAnalysisStatus_InvalidStatus(t *testing.T) {
 }
 
 // ============================================================
+// QueryReturnOrder: W4.4 新增, 等 cube 数据源 (Fn=nil = 降级)
+// 覆盖: Fn=nil 自动降级 / Fn 返 hint / Fn 返 list / days 校验 / supplier 必填
+// ============================================================
+
+func TestQueryReturnOrder_FnNil_Downgrade(t *testing.T) {
+	// 没注入 Fn → cube 数据源未接入, 应返 not_available=true + hint
+	resp, err := queryReturnOrderImpl(context.Background(), nil, QueryReturnOrderReq{
+		Supplier: "汇一",
+		Status:   "pending",
+		Days:     30,
+	})
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	if !resp.NotAvailable {
+		t.Error("NotAvailable should be true when Fn is nil")
+	}
+	if resp.Count != 0 {
+		t.Errorf("Count = %d, want 0", resp.Count)
+	}
+	if resp.Hint == "" {
+		t.Error("Hint should be set for downgrade path")
+	}
+	if !contains(resp.Hint, "数据源未注入") {
+		t.Errorf("Hint 应含 '数据源未注入', got %q", resp.Hint)
+	}
+}
+
+func TestQueryReturnOrder_SupplierRequired(t *testing.T) {
+	fn := func(ctx context.Context, supplier, status string, days int) ([]ReturnOrder, string, error) {
+		t.Fatal("Fn should not be called when supplier empty")
+		return nil, "", nil
+	}
+	_, err := queryReturnOrderImpl(context.Background(), fn, QueryReturnOrderReq{
+		Supplier: "",
+		Days:     30,
+	})
+	if err == nil {
+		t.Error("应报错: supplier 必填")
+	}
+}
+
+func TestQueryReturnOrder_InvalidDays(t *testing.T) {
+	fn := func(ctx context.Context, supplier, status string, days int) ([]ReturnOrder, string, error) {
+		t.Fatal("Fn should not be called when days invalid")
+		return nil, "", nil
+	}
+	_, err := queryReturnOrderImpl(context.Background(), fn, QueryReturnOrderReq{
+		Supplier: "汇一",
+		Days:     45, // 不在 7/30/60/90
+	})
+	if err == nil {
+		t.Error("应报错: days 非法")
+	}
+	if !contains(err.Error(), "days 必须") {
+		t.Errorf("err 应含 'days 必须', got %q", err.Error())
+	}
+}
+
+func TestQueryReturnOrder_DefaultDays(t *testing.T) {
+	// days 留空 = 0, 应默认 30
+	var capturedDays int
+	fn := func(ctx context.Context, supplier, status string, days int) ([]ReturnOrder, string, error) {
+		capturedDays = days
+		return []ReturnOrder{}, "", nil
+	}
+	_, err := queryReturnOrderImpl(context.Background(), fn, QueryReturnOrderReq{
+		Supplier: "汇一",
+		// Days 留空
+	})
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	if capturedDays != 30 {
+		t.Errorf("default days = %d, want 30", capturedDays)
+	}
+}
+
+func TestQueryReturnOrder_FnReturnsHint_Downgrade(t *testing.T) {
+	// Fn 自己返 hint (e.g. "mapping 缺失") → 走降级路径
+	fn := func(ctx context.Context, supplier, status string, days int) ([]ReturnOrder, string, error) {
+		return nil, "entities.returns 未在 mapping.yaml 配", nil
+	}
+	resp, err := queryReturnOrderImpl(context.Background(), fn, QueryReturnOrderReq{
+		Supplier: "汇一",
+		Status:   "pending",
+		Days:     30,
+	})
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	if !resp.NotAvailable {
+		t.Error("NotAvailable should be true when Fn returns hint")
+	}
+	if !contains(resp.Hint, "mapping.yaml") {
+		t.Errorf("Hint 应透传 Fn 的提示, got %q", resp.Hint)
+	}
+}
+
+func TestQueryReturnOrder_FnReturnsError_Downgrade(t *testing.T) {
+	// Fn 返 error → 也走降级, 不阻断
+	fn := func(ctx context.Context, supplier, status string, days int) ([]ReturnOrder, string, error) {
+		return nil, "", errors.New("cube 连接超时")
+	}
+	resp, err := queryReturnOrderImpl(context.Background(), fn, QueryReturnOrderReq{
+		Supplier: "汇一",
+		Status:   "pending",
+		Days:     30,
+	})
+	if err != nil {
+		t.Fatalf("应降级不报错, got err: %v", err)
+	}
+	if !resp.NotAvailable {
+		t.Error("NotAvailable should be true when Fn errors")
+	}
+	if !contains(resp.Hint, "cube query 失败") {
+		t.Errorf("Hint 应说明失败原因, got %q", resp.Hint)
+	}
+}
+
+func TestQueryReturnOrder_FnReturnsList(t *testing.T) {
+	// 正常路径: Fn 返 list → 计数 + 金额汇总 + 透传
+	fn := func(ctx context.Context, supplier, status string, days int) ([]ReturnOrder, string, error) {
+		return []ReturnOrder{
+			{BillNo: "TH001", Supplier: "汇一", ItemNo: "6901234567890", ItemName: "可口可乐 330ml",
+				Qty: 12, ReturnMoney: 36.00, Status: "pending", CreateDate: "2026-09-01", Reason: "近效期"},
+			{BillNo: "TH002", Supplier: "汇一", ItemNo: "6909876543210", ItemName: "百事可乐 500ml",
+				Qty: 24, ReturnMoney: 84.50, Status: "pending", CreateDate: "2026-09-02", Reason: "破损"},
+		}, "", nil
+	}
+	resp, err := queryReturnOrderImpl(context.Background(), fn, QueryReturnOrderReq{
+		Supplier: "汇一",
+		Status:   "pending",
+		Days:     30,
+	})
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	if resp.NotAvailable {
+		t.Error("NotAvailable should be false on success path")
+	}
+	if resp.Count != 2 {
+		t.Errorf("Count = %d, want 2", resp.Count)
+	}
+	if resp.TotalMoney != 120.50 {
+		t.Errorf("TotalMoney = %f, want 120.50", resp.TotalMoney)
+	}
+	if len(resp.Returns) != 2 {
+		t.Errorf("Returns len = %d, want 2", len(resp.Returns))
+	}
+	if resp.Returns[0].BillNo != "TH001" {
+		t.Errorf("Returns[0].BillNo = %q", resp.Returns[0].BillNo)
+	}
+	if resp.Hint != "" {
+		t.Errorf("Hint should be empty on success, got %q", resp.Hint)
+	}
+}
+
+func TestQueryReturnOrder_FnReturnsEmpty(t *testing.T) {
+	// Fn 返空 list = 该 supplier 无未审批退货单 = 不报 (但 tool 调用成功)
+	fn := func(ctx context.Context, supplier, status string, days int) ([]ReturnOrder, string, error) {
+		return []ReturnOrder{}, "", nil
+	}
+	resp, err := queryReturnOrderImpl(context.Background(), fn, QueryReturnOrderReq{
+		Supplier: "汇一",
+		Status:   "pending",
+		Days:     30,
+	})
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	if resp.NotAvailable {
+		t.Error("NotAvailable should be false (有数据, 只是空)")
+	}
+	if resp.Count != 0 {
+		t.Errorf("Count = %d, want 0", resp.Count)
+	}
+	if resp.TotalMoney != 0 {
+		t.Errorf("TotalMoney = %f, want 0", resp.TotalMoney)
+	}
+}
+
+func TestQueryReturnOrder_AllDaysValid(t *testing.T) {
+	// 验证 4 个合法 days 都能通过
+	for _, d := range []int{7, 30, 60, 90} {
+		fn := func(ctx context.Context, supplier, status string, days int) ([]ReturnOrder, string, error) {
+			return nil, "", nil
+		}
+		_, err := queryReturnOrderImpl(context.Background(), fn, QueryReturnOrderReq{
+			Supplier: "汇一",
+			Days:     d,
+		})
+		if err != nil {
+			t.Errorf("days=%d 应合法, got err: %v", d, err)
+		}
+	}
+}
+
+// contains small helper
+func contains(s, sub string) bool {
+	return len(sub) == 0 || (len(s) >= len(sub) && (s == sub || indexOf(s, sub) >= 0))
+}
+
+func indexOf(s, sub string) int {
+	for i := 0; i+len(sub) <= len(s); i++ {
+		if s[i:i+len(sub)] == sub {
+			return i
+		}
+	}
+	return -1
+}
+
+// ============================================================
 // helpers
 // ============================================================
 

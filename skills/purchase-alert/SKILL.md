@@ -1,19 +1,22 @@
 ---
 name: purchase-alert
 description: |
-  采购收货单后续推理引擎——对刚 OCR 解析完的供货单,LLM 跑 7 类规则,产出 alerts (含 category 决定前端 icon 段位)。
-  7 规则: 限入场 / 不让退 / 反季 / 节假日 lead / 高库存 / 堆头陈列 / 快讯。
+  采购收货单后续推理引擎——对刚 OCR 解析完的供货单,LLM 跑 8 类规则,产出 alerts (含 category 决定前端 icon 段位)。
+  8 规则: 限入场 / 不让退 / 反季 / 节假日 lead / 高库存 / 堆头陈列 / 快讯 / 未审批退货单。
   规则是"活的"——比如供应商堆头费支持大 + 不催款,LLM 可判定"高库存"规则降级 (不报警)。
+  未审批退货单规则:查 supplier 是否有未审批退货单(走 cube t_rm_returnflow),有则提醒收货人将退货退出。
   Go 端零业务判断,仅提供 query/insert tool;LLM 决定跑哪些规则、怎么判定、降级不降级、总结栏怎么拼。
-  Use this skill when the user mentions 采购收货单推理 / 供货单 alert / 限制商品 / 难消化 / 高库存 / 堆头陈列 / 快讯 / 节假日备货 / 应季采购 / 限入场 / 不让退, or when alert_category is needed for frontend icons.
+  Use this skill when the user mentions 采购收货单推理 / 供货单 alert / 限制商品 / 难消化 / 高库存 / 堆头陈列 / 快讯 / 节假日备货 / 应季采购 / 限入场 / 不让退 / 退货单 / 未审批退货 / 退货率, or when alert_category is needed for frontend icons.
 license: Internal-Project
 metadata:
-  version: "1.0.0"
+  version: "1.1.0"
   author: collect-ai
   category: purchase-receipt-post-analysis
   migrated_from: "internal/purchasealert/rules.go (Phase W4.1 之前的 4 规则 + W4.1 加的 3 规则, 2026-09-03)"
   supersedes: "Go-side rule engine (W4.2 删除)"
-compatibility: requires Go service with 8 tools (see references/query-tools.md)
+  new_in_v1.1: "规则 8 pending_return (未审批退货单) — 2026-09-03"
+  pending_data_source: "cube t_rm_returnflow (HBPoS) — 等 mvs_1b47f8887e3c416195f506869c7d4bd8 加 cube plugin + mapping.yaml"
+compatibility: requires Go service with 9 tools (see references/query-tools.md)
 triggers:
   - 采购收货单推理
   - 供货单 alert
@@ -26,15 +29,19 @@ triggers:
   - 应季采购
   - 限入场
   - 不让退
+  - 退货单
+  - 未审批退货
+  - 退货率
   - 采购策略分析
   - purchase alert
   - supplier block entry
   - flash promo detection
+  - pending return
 ---
 
 # Purchase Alert(采购收货单后续推理)
 
-> **目标**:把"采购收货单解析后,跑 7 类规则产出 alert + 总结栏"这件事,从"Go 写死 if/else"升级为"LLM 调 query tool 跑规则, 可灵活降级/扩展"。
+> **目标**:把"采购收货单解析后,跑 8 类规则产出 alert + 总结栏"这件事,从"Go 写死 if/else"升级为"LLM 调 query tool 跑规则, 可灵活降级/扩展"。
 >
 > **之前**(W4.1,2026-09-02 之前):
 > - `internal/purchasealert/rules.go` 7 个 rule struct,每个写死 if/else
@@ -53,7 +60,7 @@ triggers:
 
 ## When to use this skill
 
-**适用**: OCR 解析完一张新的采购收货单 (parse_session) 后,异步跑 7 类规则,产出 alert + 总结栏。
+**适用**: OCR 解析完一张新的采购收货单 (parse_session) 后,异步跑 8 类规则,产出 alert + 总结栏。
 
 **不适用**:
 - OCR 解析本身 (走 ocr-purchase skill)
@@ -128,22 +135,23 @@ LLM 接收一段 JSON,描述待分析的 session:
 }
 ```
 
-### 步骤 1: 加载 7 规则判定文档
+### 步骤 1: 加载 8 规则判定文档
 
-读 `references/7-rules.md` 拿到 7 规则:
+读 `references/7-rules.md` 拿到 8 规则 (前 7 条 + 1 条 W4.4 新加的 pending_return):
 - 每条的"必报条件"、"降级条件"、"不报条件"
 - 每条的 severity / category 默认值
 - 每条跟供应商政策的联动(活的规则)
 
 ### 步骤 2: 加载可用 tool 列表
 
-读 `references/query-tools.md`,记 8 个 tool:
+读 `references/query-tools.md`,记 9 个 tool:
 - `query_supplier_policy(supplier, key?)` — 查 KV
 - `query_promotion_fee(supplier, now)` — 查 active promos
 - `query_special_calendar(now, lead_days)` — 查接下来 N 天节假日
 - `query_app_settings(key)` — 查阈值/分类配置
 - `query_sku_stock(item_no)` — 查 SKU 当前库存
 - `query_sku_sales(item_no, days)` — 查 SKU 30/60/90 天销量
+- `query_return_order(supplier, status?, days?)` — 查供应商退货单 (W4.4 新, 数据源未接入时返 not_available=true, 规则自动降级)
 - `insert_purchase_alert(session_id, row_id, rule, severity, category, message)`
 - `update_analysis_status(session_id, status, error?)`
 
@@ -190,6 +198,7 @@ row 进来
 - holiday_lead: 调 query_special_calendar(now, 90), 找 lead_days 窗口内的节假日, 报 info
 - has_duitou: 遍历 session 内所有 supplier, 命中 has_duitou=true AND 当前 promotion_fee 在期, 报 highlight_dui (合并多条为 1 条)
 - block_entry (session 级汇总): 任何 supplier 被 block_entry, 整单 1 条 info 提示
+- **pending_return (W4.4 新, 规则 8)**: 对 session 内每个 supplier 调 `query_return_order(supplier, status="pending", days=30)`,如果有 ≥1 单未审批退货,报 1 条 warn (整 supplier 1 条,不按 row 报)。`not_available=true` (cube 数据源未接入) → **规则降级, 不报**。详见 `references/7-rules.md` §pending_return
 
 ### 步骤 4: 输出 alerts 数组
 
@@ -235,7 +244,7 @@ Go 端会用 `insert_purchase_alert` tool 落库,然后用 `update_analysis_stat
 
 场景: 汇一当前签了堆头 ¥5000/月(10-15 到期),采购可口可乐 47 件,阈值 50。
 
-- 严格执行 7 规则 → 报 high_stock warn
+- 严格执行 8 规则 → 报 high_stock warn
 - **降级**: 查 promotion_fee has_duitou=true + 在期 → 改报 high_stock info (堆头期允许)
 - **message 备注**: "供应商 [汇一] 当前签了堆头 ¥5000/月(至 10-15),允许阶段性压库存,降为提示。"
 
@@ -243,7 +252,7 @@ Go 端会用 `insert_purchase_alert` tool 落库,然后用 `update_analysis_stat
 
 场景: 汇一近 3 月累计促销费 ¥30000,从不催款,采购可口可乐 100 件,阈值 50。
 
-- 严格执行 7 规则 → 报 high_stock warn
+- 严格执行 8 规则 → 报 high_stock warn
 - **降级**: 调 query_supplier_payment / query_promotion_fee 累计 + 不催款判定 → 完全不报
 - **记录但不显示**: 仍然记 1 条 internal note (severity=info,category=info) 给运营看
 
@@ -251,7 +260,7 @@ Go 端会用 `insert_purchase_alert` tool 落库,然后用 `update_analysis_stat
 
 场景: 同时采购可口可乐 5 件 (汇一) + 5 件 (康师傅直采),汇一 ¥2.5,康师傅 ¥2.3。
 
-- 不在 7 规则内 → **不报**(超 scope)
+- 不在 8 规则内 → **不报**(超 scope)
 - 但是这是反回扣信号 → 触发 supplier-policy skill 的反回扣判定(另一路径)
 - 本 skill **只**负责采购单内的 alert, 不做反回扣
 
@@ -259,7 +268,7 @@ Go 端会用 `insert_purchase_alert` tool 落库,然后用 `update_analysis_stat
 
 ## 性能预算
 
-- 一次 session 跑 7 规则: ~8-15 tool calls (查一次 supplier_policy 可复用给所有 row)
+- 一次 session 跑 8 规则: ~8-15 tool calls (查一次 supplier_policy 可复用给所有 row)
 - 单次 tool 调用: 100-500ms (PG) / 1-2s (cube)
 - LLM 推理: ~5-10s
 - **总预算**: < 30s,跟 W4.1 异步超时一致
@@ -281,7 +290,7 @@ Go 端会用 `insert_purchase_alert` tool 落库,然后用 `update_analysis_stat
 ## 不要做
 
 - ❌ 在 Go 端写业务判断 (AGENTS.md §4 红线)
-- ❌ 把 7 规则写死成 enum (用 references 文档,LLM 读)
+- ❌ 把 8 规则写死成 enum (用 references 文档,LLM 读)
 - ❌ 在 SKILL.md 里写具体供应商名 (汇一/榄菊 → 用 {supplier} 占位)
 - ❌ 在 SKILL.md 里写具体商品名 (可口可乐 → 用 {item_name} 占位)
 - ❌ 跨 session 复用 alert 决策 (每个 session 独立跑,即使同一 supplier)
@@ -290,8 +299,8 @@ Go 端会用 `insert_purchase_alert` tool 落库,然后用 `update_analysis_stat
 
 ## 相关文档
 
-- `references/7-rules.md` — 7 规则的判定 + 决策表 + 活的规则
-- `references/query-tools.md` — 8 个 tool 的调用格式
+- `references/7-rules.md` — 8 规则的判定 + 决策表 + 活的规则
+- `references/query-tools.md` — 9 个 tool 的调用格式
 - `references/app-settings.md` — 阈值/分类配置 (LLM 也读 PG 表)
 - `references/icon-mapping.md` — category → 前端 icon 段位
 - `references/examples.md` — 真实案例 (汇一/榄菊/...)

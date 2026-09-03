@@ -277,12 +277,79 @@ UPDATE `parse_session SET analysis_status, analysis_at, analysis_error`。
 
 ---
 
+## 工具 9: `query_return_order` (W4.4 新, 等 cube 数据源)
+
+**用途**: purchase-alert skill 跑 "未审批退货单" 规则 (规则 8, `pending_return`)。
+**数据源**: cube 端 `t_rm_returnflow` (HBPoS) 或其它数据源, **业务字段名** (bill_no / supplier_name / item_no / item_name / qty / return_money / status / create_date / reason)。**严禁直接 import parser/agent**, 必须经 `business.Gateway.RawQuery` 或 `BizExecutor.SearchReturnsBySupplier`。
+
+### 入参
+
+```json
+{
+  "supplier": "汇一",      // 必填, 过滤供应商
+  "status": "pending",    // 可选, 过滤状态: pending|approved|rejected, 留空查所有
+  "days": 30              // 可选, 窗口天数, 默认 30, 取值 7/30/60/90
+}
+```
+
+### 出参
+
+```json
+{
+  "supplier_name": "汇一",
+  "status": "pending",
+  "days": 30,
+  "count": 2,
+  "total_money": 856.50,
+  "returns": [
+    {
+      "bill_no": "TH202609030001",
+      "supplier_name": "汇一",
+      "item_no": "6901234567890",
+      "item_name": "可口可乐 330ml",
+      "qty": 12,
+      "return_money": 36.00,
+      "status": "pending",
+      "create_date": "2026-09-01",
+      "reason": "近效期"
+    }
+  ],
+  "not_available": false,
+  "hint": ""
+}
+```
+
+### 降级语义 (重要!)
+
+- `not_available=true` + `hint` 字段有提示 → **cube 数据源未接入 / 未配置 / 调用失败**, LLM **必须降级, 不报 pending_return 规则** (避免误报)。
+- `not_available=true` 触发场景:
+  1. Go 端 Fn 注入为 nil (cube 数据源压根没接)
+  2. `configs/mappings.yaml` 没配 `entities.returns` 段
+  3. cube 端 `t_rm_returnflow` cube 不存在
+  4. cube 查询超时 / 物理表 schema 不对
+- 任何时候 LLM 看到 `not_available=true` → 跳过规则 8, 不报 alert, 继续跑规则 1-7。
+- (W4.4 真实接入后, `not_available=false` 才是常态)
+
+### Go 端实现
+
+- 文件: `internal/agent/tools/purchase_alert.go` `QueryReturnOrder(QueryReturnOrderFn)`
+- 签名: `func(ctx, supplier, status, days) ([]ReturnOrder, string, error)`
+- 第二个 string 返回 = hint, 非空时 LLM 走降级路径
+- **未 wire** 阶段: runner.go 不注册此 tool (跟其他 5 个 purchase_alert tool 保持一致), **等 mvs_1b47f8887e3c416195f506869c7d4bd8 加完 cube + mapping.yaml 后一次性 wire 6 个 tool 进去**。
+- **wire 时**: 在 `cmd/server/main.go` 实现 `QueryReturnOrderFn`, 内部调 `gateway.RawQuery("t_rm_returnflow", ...)` 或 `executor.SearchReturnsBySupplier(...)`。**严禁直接 import parser/agent**。
+
+---
+
 ## 工具调用建议顺序
 
-LLM 跑一个 session 的 7 规则:
+LLM 跑一个 session 的 8 规则:
 1. **批量前置查询(并行)**: `query_supplier_policy(supplier)` (拿全 keys) + `query_promotion_fee(supplier, now)` + `query_special_calendar(now, 90)` + `query_app_settings("high_stock_threshold")` + `query_app_settings("duitou_kinds")` + `query_app_settings("others_kinds")`
 2. **逐行循环**: 命中规则时,只调必要的补充查询(比如 high_stock 降级 B 才查 `query_sku_sales`)
-3. **批量落库**: 把 alerts 收齐,`insert_purchase_alert` 多次调用
-4. **收尾**: `update_analysis_status(session_id, "done")`
+3. **总结栏 (session 级, row_id=0)**:
+   - holiday_lead: `query_special_calendar` (复用步骤 1 结果)
+   - has_duitou: 复用 promotion_fee
+   - **pending_return (W4.4 新)**: 对 session 内每个 supplier 调 `query_return_order(supplier, status="pending", days=30)`, 命中 → 1 条 warn, **不报 row**。
+4. **批量落库**: 把 alerts 收齐,`insert_purchase_alert` 多次调用
+5. **收尾**: `update_analysis_status(session_id, "done")`
 
-总 tool calls: ~10-15 次(前置 6 + 5-7 次 insert + 1 次 update),**所有 query 互不依赖,可并发**。
+总 tool calls: ~12-18 次(前置 6 + 5-7 次 insert + 0-2 次 pending_return + 1 次 update),**所有 query 互不依赖,可并发**。

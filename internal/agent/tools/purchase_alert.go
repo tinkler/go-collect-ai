@@ -4,6 +4,7 @@
 //   - query_app_settings       : 读阈值/分类白名单 (K-V JSONB)
 //   - query_sku_stock          : 查 SKU 当前库存 (走 cube t_im_branch_stock)
 //   - query_sku_sales          : 查 SKU N 天销量 (走 cube siss_saleflow, W4.2 启用)
+//   - query_return_order       : 查供应商退货单 (W4.4 新增, 走 cube t_rm_returnflow, 等 cube 数据源)
 //   - insert_purchase_alert    : LLM 决定报 alert 后落库
 //   - update_analysis_status   : 收尾写 parse_session.analysis_status
 //
@@ -204,6 +205,127 @@ func querySkuSalesImpl(ctx context.Context, queryFn QuerySkuSalesFn, req QuerySk
 		TotalMoney: money,
 		DailyAvg:   qty / float64(days),
 	}, nil
+}
+
+// ============================================================
+// 工具 3.5: query_return_order
+//   查供应商退货单 (W4.4 新增, 等 cube 数据源 t_rm_returnflow)
+//   用途: purchase-alert skill 跑 "未审批退货单" 规则 (pending_return)
+//   数据源: cube 端 t_rm_returnflow (HBPoS) / 其它数据源 (mapping.yaml 配)
+//         业务字段名 (bill_no / supplier_name / item_no / item_name /
+//         qty / return_money / status / create_date / reason)
+//         严禁直接 import parser/agent; 必须经 business.Gateway.RawQuery
+// ============================================================
+
+// ReturnOrder 退货单记录 (业务字段名, 不含物理 cube 字段名)
+type ReturnOrder struct {
+	BillNo      string  `json:"bill_no"`
+	Supplier    string  `json:"supplier_name"`
+	ItemNo      string  `json:"item_no"`
+	ItemName    string  `json:"item_name,omitempty"`
+	Qty         float64 `json:"qty"`
+	ReturnMoney float64 `json:"return_money"`
+	Status      string  `json:"status"` // pending / approved / rejected
+	CreateDate  string  `json:"create_date"`
+	Reason      string  `json:"reason,omitempty"`
+}
+
+// QueryReturnOrderReq 入参
+type QueryReturnOrderReq struct {
+	Supplier string `json:"supplier" jsonschema:"description=供应商名 (用于过滤), 必填,required"`
+	Status   string `json:"status,omitempty" jsonschema:"description=过滤状态: pending|approved|rejected, 留空返所有状态,enum=pending,enum=approved,enum=rejected"`
+	Days     int    `json:"days,omitempty" jsonschema:"description=窗口天数, 默认 30, LLM 可传 60/90"`
+}
+
+// QueryReturnOrderResp 出参
+type QueryReturnOrderResp struct {
+	Supplier     string        `json:"supplier_name"`
+	Status       string        `json:"status,omitempty"`
+	Days         int           `json:"days"`
+	Count        int           `json:"count"`
+	TotalMoney   float64       `json:"total_money"`
+	Returns      []ReturnOrder `json:"returns"`
+	NotAvailable bool          `json:"not_available,omitempty"` // true = cube 数据源未配置, LLM 降级
+	Hint         string        `json:"hint,omitempty"`          // 提示(如"数据源未接入, 规则自动降级")
+}
+
+// QueryReturnOrderFn 查询函数 (caller 注入, 走 cube t_rm_returnflow via business.Gateway)
+//   返 (退货单 list, 错误)
+//   如果 cube 数据源未配置 / mapping 缺失, 返 ([], nil, "未配置提示")
+type QueryReturnOrderFn func(ctx context.Context, supplier, status string, days int) ([]ReturnOrder, string, error)
+
+// QueryReturnOrder 工具函数
+func QueryReturnOrder(queryFn QueryReturnOrderFn) *function.FunctionTool[QueryReturnOrderReq, QueryReturnOrderResp] {
+	fn := func(ctx context.Context, req QueryReturnOrderReq) (QueryReturnOrderResp, error) {
+		return queryReturnOrderImpl(ctx, queryFn, req)
+	}
+	return function.NewFunctionTool(fn,
+		function.WithName("query_return_order"),
+		function.WithDescription("查供应商退货单, 走 cube 端 t_rm_returnflow (via business.Gateway, W4.4). 用途: purchase-alert skill 跑 pending_return (未审批退货单) 规则. 必填 supplier, status 留空查所有, days 默认 30. 数据源未配置返 not_available=true + hint, LLM 应降级(不报 pending_return). 严禁直接 import parser/agent."),
+	)
+}
+
+// queryReturnOrderImpl 抽出实现,方便单测
+func queryReturnOrderImpl(ctx context.Context, queryFn QueryReturnOrderFn, req QueryReturnOrderReq) (QueryReturnOrderResp, error) {
+	if queryFn == nil {
+		// 没注入 Fn = cube 数据源未接入, LLM 降级
+		return QueryReturnOrderResp{
+			Supplier:     trimSpace(req.Supplier),
+			Status:       trimSpace(req.Status),
+			Days:         defaultDays(req.Days, 30),
+			NotAvailable: true,
+			Hint:         "query_return_order: cube 数据源未注入, pending_return 规则自动降级 (不报)",
+		}, nil
+	}
+	supplier := trimSpace(req.Supplier)
+	if supplier == "" {
+		return QueryReturnOrderResp{}, fmt.Errorf("supplier 必填")
+	}
+	status := trimSpace(req.Status)
+	days := defaultDays(req.Days, 30)
+	if days != 7 && days != 30 && days != 60 && days != 90 {
+		return QueryReturnOrderResp{}, fmt.Errorf("days 必须 7/30/60/90, 收到 %d", days)
+	}
+	orders, hint, err := queryFn(ctx, supplier, status, days)
+	if err != nil {
+		return QueryReturnOrderResp{
+			Supplier:     supplier,
+			Status:       status,
+			Days:         days,
+			NotAvailable: true,
+			Hint:         fmt.Sprintf("cube query 失败: %v (规则降级)", err),
+		}, nil
+	}
+	if hint != "" {
+		// Fn 主动报告"未配置"等提示
+		return QueryReturnOrderResp{
+			Supplier:     supplier,
+			Status:       status,
+			Days:         days,
+			NotAvailable: true,
+			Hint:         hint,
+		}, nil
+	}
+	total := 0.0
+	for _, o := range orders {
+		total += o.ReturnMoney
+	}
+	return QueryReturnOrderResp{
+		Supplier:   supplier,
+		Status:     status,
+		Days:       days,
+		Count:      len(orders),
+		TotalMoney: total,
+		Returns:    orders,
+	}, nil
+}
+
+// defaultDays 工具: d<=0 用 fallback
+func defaultDays(d, fallback int) int {
+	if d <= 0 {
+		return fallback
+	}
+	return d
 }
 
 // ============================================================
