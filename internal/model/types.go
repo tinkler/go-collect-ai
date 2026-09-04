@@ -76,6 +76,9 @@ type ParsedOcrRow struct {
 	Name    string `json:"name,omitempty"`
 	QtyRaw  string `json:"qty_raw,omitempty"`
 	Qty     *int   `json:"qty,omitempty"`
+	// Price 单价 (2026-09-04 双引擎: DeepSeek 视觉输出 items[].price)
+	//   nil = 未识别到; 0 是合法单价 (赠品)
+	Price *float64 `json:"price,omitempty"`
 }
 
 // ============== 匹配 ==============

@@ -1,86 +1,95 @@
-// Package parser - Orchestrator 协调 VLM + Strategy + SkuMatcher (Phase B+ 2026-09-03)
+// Package parser - Orchestrator 双引擎联合解析 (2026-09-04 重构, 对齐 tin-nova)
 //
-//	旧版 (2026-09-02 之前): OCR (hand_write) → GLM-4-flash 文本 → SkuMatcher
-//	  问题: OCR 严重误读 (笔→延, 宝→裁), LLM 全判 skip → 0 rows
+//	旧版 (2026-09-04 之前): GLM-4V 多模态直读图 → JSON → SkuMatcher L1/L2/L3 匹配回填
+//	  问题: 1) buildGenericHints 塞 800 name + 200 barcode 进 prompt, 高消耗 token
+//	       2) SkuMatcher L1/L2/L3 需加载 5000 SKU 全库匹配
+//	       3) VLM 单引擎, 复杂表格误读无兜底
 //
-//	新版 (2026-09-03 之后): GLM-4V 多模态直读图 → JSON → SkuMatcher
-//	  优势: 跳过 OCR 中间环节, 13位 barcode 100% 正确, qty 100% 正确
-//	  代价: 慢 2x + 贵 5-10x
+//	新版 (2026-09-04 之后, 对齐 F:\go\src\github.com\tinkler\tin-nova):
+//	  引擎1: 智谱 prime-sync 文件解析 (印刷体/表格 OCR) → 纯文本
+//	  引擎2: DeepSeek 视觉模型 (deepseek-v4-flash-vision-exp) 收图 + OCR 文本参考
+//	         → 结构化 JSON {supplier_name, items:[{barcode,name,qty,price}]}
+//	  不做: SKU hints 注入 (数据库增强识别) / SkuMatcher L1~L3 匹配
+//	  语义: 所有行直接当新 SKU, matched_* 属性一律置空 (IsNew=true, status=新品)
 //
 // 关键合规点 (AGENTS.md §1/§4):
-//   - 0 个业务判断在 Go 里 (选 generic/specific 走查表)
-//   - 0 个 prompt 模板在 Go 里 (在 SKILL.md)
-//   - 0 个启发式在 Go 里 (heuristic 也在 SKILL.md, 这里只是兜底)
+//   - 0 个业务判断在 Go 里
+//   - 0 个 prompt 模板在 Go 里 (在 skills/ocr-purchase/SKILL.md)
 package parser
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"log"
-	"regexp"
+	"strings"
 
 	"github.com/tinkler/collect-ai/internal/agent/skill"
 	"github.com/tinkler/collect-ai/internal/model"
 	"github.com/tinkler/collect-ai/internal/parser/bigmodel"
-	"github.com/tinkler/collect-ai/internal/parser/matcher"
-	"github.com/tinkler/collect-ai/internal/store"
+	"github.com/tinkler/collect-ai/internal/parser/glmocr"
+
+	tmodel "trpc.group/trpc-go/trpc-agent-go/model"
+	"trpc.group/trpc-go/trpc-agent-go/model/openai"
 )
 
-// barcode13Re 13 位 barcode 校验(未来 buildGenericHints 可用)
-var barcode13Re = regexp.MustCompile(`\b\d{13}\b`)
+// ocrTextMaxLen 智谱 OCR 文本注入 prompt 的长度上限 (对齐 tin-nova 6000 截断)
+const ocrTextMaxLen = 6000
 
-// SkuLoader 加载供应商 SKU 库
-type SkuLoader interface {
-	LoadBySupplier(ctx context.Context, supplier string, limit int) ([]model.SkuRecord, error)
-}
-
-// Orchestrator 协调 VLM + Strategy + SkuMatcher
-//   - ocr 完全跳过 (GLM-4V 自带视觉能力, 不需要中间 OCR 链路)
-//   - llm 现在是多模态 VLM (glm-4v), 直接 image → JSON
+// Orchestrator 双引擎协调: 智谱 prime-sync OCR + DeepSeek 视觉
 type Orchestrator struct {
-	vlm    *bigmodel.VlmClient
-	skus   SkuLoader
-	strat  *store.StrategyRepo
+	// ocr 引擎1: 智谱 prime-sync 文件解析 (印刷体/表格 → 纯文本)
+	ocr *glmocr.Client
+	// vision 引擎2: DeepSeek 视觉模型 (图 + OCR 文本 → 结构化 JSON)
+	vision tmodel.Model
+	// skills: 读 skills/ocr-purchase/SKILL.md 当 prompt 模板 (AGENTS.md §1)
 	skills *skill.Store
-	// vlmModel: 默认 "glm-4v" (便宜), 可调成 "glm-4v-plus" (强)
-	vlmModel string
 }
 
 func NewOrchestrator(
-	vlm *bigmodel.VlmClient,
-	skus SkuLoader,
-	strat *store.StrategyRepo,
+	ocr *glmocr.Client,
+	dsAPIKey, dsBaseURL, dsModel string,
 	skills *skill.Store,
-	vlmModel string,
 ) (*Orchestrator, error) {
-	if vlm == nil {
-		return nil, fmt.Errorf("orchestrator: vlm client 必填")
+	if ocr == nil {
+		return nil, fmt.Errorf("orchestrator: glmocr client 必填")
 	}
-	if skus == nil {
-		return nil, fmt.Errorf("orchestrator: sku loader 必填")
-	}
-	if strat == nil {
-		return nil, fmt.Errorf("orchestrator: strategy repo 必填")
+	if strings.TrimSpace(dsAPIKey) == "" {
+		return nil, fmt.Errorf("orchestrator: DEEPSEEK_API_KEY 必填 (双引擎引擎2)")
 	}
 	if skills == nil {
 		return nil, fmt.Errorf("orchestrator: skill store 必填")
 	}
-	return &Orchestrator{vlm: vlm, skus: skus, strat: strat, skills: skills, vlmModel: vlmModel}, nil
+	opts := []openai.Option{
+		openai.WithAPIKey(dsAPIKey),
+		openai.WithVariant(openai.VariantDeepSeek),
+		openai.WithTextOnlyMessageContent(false), // 允许 image content part
+	}
+	if strings.TrimSpace(dsBaseURL) != "" {
+		opts = append(opts, openai.WithBaseURL(dsBaseURL))
+	}
+	if dsModel == "" {
+		dsModel = "deepseek-v4-flash-vision-exp" // 对齐 tin-nova 默认
+	}
+	return &Orchestrator{
+		ocr:    ocr,
+		vision: openai.New(dsModel, opts...),
+		skills: skills,
+	}, nil
 }
 
 // ParseResult 解析结果
+//
+//	2026-09-04 双引擎重构: strategy / handwrite / generic 路径全部移除,
+//	StrategyVersion 恒为 0 (字段保留兼容 handler, 不再查 strategy 表)
 type ParseResult struct {
 	Rows            []model.SkuRow
 	StrategyVersion int
-	IsHandwrite     bool
-	IsGeneric       bool
 }
 
-// Parse 收图 bytes → 解析为 SkuRow
+// Parse 收图 bytes → 双引擎解析为 SkuRow (全部按新 SKU 返回)
 //
 //	supplier: 必填
-//	fileName: 推断 mime (jpg/png/webp)
+//	fileName: 推断 mime / file_type
 func (o *Orchestrator) Parse(ctx context.Context, imgBytes []byte, fileName, supplier string) (*ParseResult, error) {
 	if len(imgBytes) == 0 {
 		return nil, fmt.Errorf("imgBytes 不能为空")
@@ -89,180 +98,105 @@ func (o *Orchestrator) Parse(ctx context.Context, imgBytes []byte, fileName, sup
 		return nil, fmt.Errorf("supplier 必填")
 	}
 
-	log.Printf("[orch] VLM 启动 (supplier=%s, img=%d bytes)", supplier, len(imgBytes))
-	res := &ParseResult{}
+	log.Printf("[orch] 双引擎启动 (supplier=%s, img=%d bytes)", supplier, len(imgBytes))
 
-	// 1) 查 strategy
-	s, _ := o.strat.GetBySupplier(ctx, supplier)
-
-	// 2) 走手写 / 特定 / 通用
-	var strategyBody, promptOverlay string
-	var skuHints map[string]any
-	if s != nil && s.IsHandwrite {
-		// 手写 → 纯启发式(也跳过 VLM, 跟 Phase A 一致)
-		log.Printf("[orch] supplier=%s is_handwrite=true, 走纯启发式", supplier)
-		res.IsHandwrite = true
-		res.Rows = o.heuristicMatch(ctx, imgBytes, fileName, supplier)
-		return res, nil
-	}
-	if s != nil && s.Enabled && s.Body != "" {
-		log.Printf("[orch] supplier=%s 命中 strategy v%d, 走特定路径", supplier, s.StrategyVersion)
-		strategyBody = s.Body
-		promptOverlay = s.LlmPromptOverlay
-		skuHints = s.SkuHints
-		res.StrategyVersion = s.StrategyVersion
-		go func(name string) {
-			if err := o.strat.TouchApplied(context.Background(), name); err != nil {
-				log.Printf("[orch] TouchApplied(%s) err: %v", name, err)
-			}
-		}(supplier)
+	// 1) 引擎1: 智谱 prime-sync 文件解析 (印刷体/表格 → 纯文本)
+	//    失败不阻断: 引擎2 纯视觉照样能跑, 只是少了参考文本
+	ocrText := ""
+	ocrRes, err := o.ocr.FileParserSync(ctx, &glmocr.FileParserSyncRequest{
+		FileData: imgBytes,
+		FileName: fileName,
+	})
+	if err != nil {
+		log.Printf("[orch] ⚠️ 引擎1 FileParserSync 失败, 引擎2 纯视觉跑: %v", err)
 	} else {
-		log.Printf("[orch] supplier=%s 无 strategy, 走通用路径", supplier)
-		skuHints = o.buildGenericHints(ctx, supplier)
-		res.IsGeneric = true
-		go func(name string) {
-			if err := o.strat.IncrGenericCount(context.Background(), name); err != nil {
-				log.Printf("[orch] IncrGenericCount(%s) err: %v", name, err)
-			}
-		}(supplier)
+		ocrText = strings.TrimSpace(ocrRes.Content)
+		log.Printf("[orch] 引擎1 prime-sync OK: content_len=%d status=%s", len(ocrText), ocrRes.Status)
+	}
+	if len(ocrText) > ocrTextMaxLen {
+		ocrText = ocrText[:ocrTextMaxLen] + "...(truncated)"
+	}
+	if ocrText == "" {
+		ocrText = "(引擎1无输出,以你的视觉识别为准)"
 	}
 
-	// 3) 读 ocr-purchase skill body 当 prompt 模板
+	// 2) 读 ocr-purchase skill body 当 prompt 模板 ({supplier} / {ocr_text} 注入)
 	sk, ok := o.skills.Get("ocr-purchase")
 	if !ok {
 		return nil, fmt.Errorf("skill 'ocr-purchase' 未加载,检查 skills/ 目录")
 	}
-	sysPrompt, err := renderPrompt(sk.Body, PromptVars{
-		Supplier:      supplier,
-		SkuHints:      skuHints,
-		StrategyBody:  strategyBody,
-		PromptOverlay: promptOverlay,
-	})
+	prompt, err := renderPrompt(sk.Body, PromptVars{Supplier: supplier, OcrText: ocrText})
 	if err != nil {
 		return nil, fmt.Errorf("render prompt 失败: %w", err)
 	}
 
-	// 4) 调 VLM 多模态
-	//
-	// 2026-09-04 用户决策: ctx timeout 跟任务剥离 (从 handler 透传过来已是 detached bg ctx)
-	//   旧: 25s detached ctx timeout (避免 VLM 慢导致客户端 60s 早断)
-	//   新: 跟客户端断连完全解耦, 用 context.Background() 让 VLM 跑完为止
-	//   配合 handler 的"先 CreateSession(空 rows) 再 goroutine 跑 VLM"模式:
-	//     - 客户端 60s 断后, session 已在 DB, 用户列表刷新就能看到
-	//     - VLM 后台继续跑, 完成后 Update session.rows + status='done'
-	//   风险: VLM 排队 5 分钟, session 一直 pending. 用户能接受
-	vlmRes, err := o.vlm.ChatWithImageCtx(ctx, sysPrompt, "", o.vlmModel, imgBytes, fileName)
+	// 3) 引擎2: DeepSeek 视觉模型 (图 + prompt → 结构化 JSON)
+	content, err := o.visionChat(ctx, prompt, imgBytes, fileName)
 	if err != nil {
-		log.Printf("[orch] VLM 失败, fallback 启发式: %v", err)
-		res.Rows = o.heuristicMatch(ctx, imgBytes, fileName, supplier)
-		return res, nil
+		return nil, fmt.Errorf("引擎2 DeepSeek 视觉失败: %w", err)
 	}
-	content := vlmRes.Content
-	// 2026-09-04: VLM 截断检测 (finish_reason=length 已被 VlmClient retry 过一次,
-	//   仍截断则到这步也是 truncated=true,内容是部分 JSON)
-	if vlmRes.Truncated {
-		log.Printf("[orch] ⚠️ VLM 响应被截断 (max_tokens=已达 BigModel 上限 2048, content_len=%d)", len(content))
-	}
-	// debug
 	preview := content
 	if len(preview) > 500 {
 		preview = preview[:500] + "..."
 	}
-	log.Printf("[orch] VLM 响应 (前 500, truncated=%v, finish_reason=%s): %s", vlmRes.Truncated, vlmRes.FinishReason, preview)
+	log.Printf("[orch] 引擎2 响应 (前 500): %s", preview)
 
-	// 5) 解析 JSON
+	// 4) 解析 JSON (复用 ParseLlmJson: 截断挽救 + header/subtitle 过滤)
 	parsed, err := bigmodel.ParseLlmJson(content)
 	if err != nil {
-		log.Printf("[orch] VLM JSON 解析失败, fallback 启发式: %v (truncated=%v)", err, vlmRes.Truncated)
-		res.Rows = o.heuristicMatch(ctx, imgBytes, fileName, supplier)
-		return res, nil
+		return nil, fmt.Errorf("引擎2 JSON 解析失败: %w", err)
 	}
-	log.Printf("[orch] VLM 解析 → %d 条 (supplier=%s, strategy_v=%d)", len(parsed), supplier, res.StrategyVersion)
+	log.Printf("[orch] 双引擎解析 → %d 条 (supplier=%s)", len(parsed), supplier)
 
-	// 6) SkuMatcher 匹配
-	skus, _ := o.skus.LoadBySupplier(ctx, supplier, 5000)
-	m := matcher.New(skus, 0)
-	rows := make([]model.SkuRow, 0, len(parsed))
-	for i, ocr := range parsed {
-		rows = append(rows, m.Match(ocr, i+1))
+	// 5) 转 SkuRow: 不做任何 SKU 匹配, 全部按新 SKU
+	//    matched_* 属性一律置空 (用户 2026-09-04 决策)
+	res := &ParseResult{Rows: make([]model.SkuRow, 0, len(parsed))}
+	for i, p := range parsed {
+		res.Rows = append(res.Rows, model.SkuRow{
+			Seq:        i + 1, // handler 会按多图累加覆盖
+			RawBarcode: p.Barcode,
+			RawName:    p.Name,
+			RawQty:     p.QtyRaw,
+			Qty:        p.Qty,
+			UnitPrice:  p.Price,
+			Status:     "新品",
+			IsNew:      true,
+		})
 	}
-	res.Rows = rows
 	return res, nil
 }
 
-// heuristicMatch 纯启发式(手写 / VLM 失败兜底)
-//   - 跟 Phase A 一致: 用 ocr_service.ParseOcrResponse + heuristicParse
-//   - 但 Phase A 用 OCR 链路, 现在 VLM 链路下 OCR 已经废弃
-//   - 兜底 = VLM 失败时返回 0 rows
-func (o *Orchestrator) heuristicMatch(ctx context.Context, imgBytes []byte, fileName, supplier string) []model.SkuRow {
-	// VLM 链路下 heuristic 仅在 VLM 失败时跑, 跑不动时直接返空
-	log.Printf("[orch] heuristic 兜底 (VLM 失败): img=%d bytes, supplier=%s", len(imgBytes), supplier)
-	// 这里不调 OCR (Phase A 老路径), 避免回退
-	// 真要手写解析请用 supplier_parse_strategy.is_handwrite=true 路径
-	return nil
-}
+// visionChat 调 DeepSeek 视觉模型, 聚合流式/非流式响应为完整文本
+func (o *Orchestrator) visionChat(ctx context.Context, prompt string, imgBytes []byte, fileName string) (string, error) {
+	msg := tmodel.NewUserMessage(prompt)
+	msg.AddImageData(imgBytes, "auto", "jpeg")
 
-// buildGenericHints 通用 hints 生成
-//
-// 2026-09-04 修复: 之前硬塞所有 SKU 的 barcode + name,大供应商(5000+ SKU)
-//   会让 sku_hints_json 超过 300KB, 触发 BigModel GLM-4V 1261 (Prompt exceeds max length) 错误
-//   解决方案:
-//     - 限额 800 SKU (经验值: name 平均 30 字符 × 800 ≈ 24KB hints,远低于 8K token 限制)
-//     - 优先 name (LLM 主要靠 name 校验 OCR 错字 / 别名),barcode 留 200 个做兜底
-//     - hints JSON 序列化后硬限 32KB,超过则按比例再截
-func (o *Orchestrator) buildGenericHints(ctx context.Context, supplier string) map[string]any {
-	skus, err := o.skus.LoadBySupplier(ctx, supplier, 5000)
+	events, err := o.vision.GenerateContent(ctx, &tmodel.Request{
+		Messages: []tmodel.Message{msg},
+	})
 	if err != nil {
-		log.Printf("[orch] buildGenericHints(%s) LoadBySupplier err: %v", supplier, err)
-		return map[string]any{}
+		return "", fmt.Errorf("GenerateContent: %w", err)
 	}
 
-	// 优先 name(LLM 校验 OCR 错字和别名最有用),barcode 仅做兜底
-	const maxNames = 800
-	const maxBarcodes = 200
-	barcodes := make([]string, 0, maxBarcodes)
-	names := make([]string, 0, maxNames)
-
-	for i, s := range skus {
-		if s.Barcode != "" && len(s.Barcode) >= 6 && len(s.Barcode) <= 14 && len(barcodes) < maxBarcodes {
-			barcodes = append(barcodes, s.Barcode)
+	var sb strings.Builder
+	for ev := range events {
+		if ev == nil {
+			continue
 		}
-		if s.Name != "" && len(names) < maxNames {
-			names = append(names, s.Name)
+		if ev.Error != nil {
+			return "", fmt.Errorf("vision response error: %s", ev.Error.Message)
 		}
-		// 两个限额都满了可以提前退出
-		if len(barcodes) >= maxBarcodes && len(names) >= maxNames {
-			break
-		}
-		_ = i
-	}
-	hints := map[string]any{
-		"supplier": supplier,
-		"barcodes": barcodes,
-		"names":    names,
-		"_note":    "由 buildGenericHints 程序生成,辅助 VLM 校验 OCR",
-	}
-	_ = barcode13Re
-
-	// 2026-09-04 安全网: 即使限额后 JSON 仍 > 32KB (e.g. 800 个超长 name),
-	//   按比例截 names。barcodes 体积小不动。
-	if raw, err := json.Marshal(hints); err == nil {
-		const maxHintsBytes = 32 * 1024
-		if len(raw) > maxHintsBytes && len(names) > 100 {
-			// 按比例反算: 保留 (maxHintsBytes / len(raw)) * len(names) 个
-			// 保守一点用 0.7 系数,留点余量给 JSON 序列化
-			keep := int(float64(len(names)) * 0.7 * float64(maxHintsBytes) / float64(len(raw)))
-			if keep < 50 {
-				keep = 50
+		for _, ch := range ev.Choices {
+			if ch.Delta.Content != "" {
+				sb.WriteString(ch.Delta.Content)
+			} else if ch.Message.Content != "" {
+				sb.WriteString(ch.Message.Content)
 			}
-			if keep > len(names) {
-				keep = len(names)
-			}
-			names = names[:keep]
-			hints["names"] = names
-			log.Printf("[orch] buildGenericHints(%s) hints 超 32KB (%d bytes), 截 names → %d",
-				supplier, len(raw), keep)
 		}
 	}
-	return hints
+	out := strings.TrimSpace(sb.String())
+	if out == "" {
+		return "", fmt.Errorf("vision 模型返回空内容")
+	}
+	return out, nil
 }

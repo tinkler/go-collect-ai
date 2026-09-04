@@ -110,3 +110,34 @@ func TestParseLlmJson_HeaderFiltered(t *testing.T) {
 		t.Errorf("剩余应是有效行, got barcode=%q", rows[0].Barcode)
 	}
 }
+
+// 2026-09-04 双引擎: DeepSeek 视觉输出 {"supplier_name":..., "items":[{barcode,name,qty,price}]}
+func TestParseLlmJson_ItemsWrapper_WithPrice(t *testing.T) {
+	msg := `{"supplier_name": "汇一", "items": [
+		{"barcode": "6977222020243", "name": "220ml吾尚AD钙", "qty": 3, "price": 2.5},
+		{"barcode": null, "name": "散装糖", "qty": 1, "price": "¥12.50"},
+		{"barcode": "6901234567890", "name": "赠品可乐", "qty": 1, "price": 0},
+		{"barcode": "6901234567891", "name": "无价商品", "qty": 2, "price": null}
+	]}`
+	rows, err := ParseLlmJson(msg)
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	if len(rows) != 4 {
+		t.Fatalf("rows = %d, want 4", len(rows))
+	}
+	if rows[0].Price == nil || *rows[0].Price != 2.5 {
+		t.Errorf("rows[0].Price = %v, want 2.5", rows[0].Price)
+	}
+	if rows[1].Price == nil || *rows[1].Price != 12.5 {
+		t.Errorf("rows[1].Price (字符串带¥) = %v, want 12.5", rows[1].Price)
+	}
+	// 0 是合法单价 (赠品), 不能丢
+	if rows[2].Price == nil || *rows[2].Price != 0 {
+		t.Errorf("rows[2].Price = %v, want 0 (赠品合法)", rows[2].Price)
+	}
+	// null → nil
+	if rows[3].Price != nil {
+		t.Errorf("rows[3].Price = %v, want nil", rows[3].Price)
+	}
+}

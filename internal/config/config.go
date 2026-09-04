@@ -43,6 +43,11 @@ type Config struct {
 	OCRModel       string `mapstructure:"OCR_MODEL"` // hand_write / layout_parsing
 	LLMModel       string `mapstructure:"LLM_MODEL"` // glm-4-flash
 
+	// DeepSeek (2026-09-04 双引擎: 引擎2 视觉模型解析供货单)
+	DeepseekAPIKey     string `mapstructure:"DEEPSEEK_API_KEY"`
+	DeepseekBase       string `mapstructure:"DEEPSEEK_BASE"`
+	DeepseekVisionModel string `mapstructure:"DEEPSEEK_VISION_MODEL"`
+
 	// cube-agent-server
 	AgentURL   string `mapstructure:"AGENT_URL"`
 	AgentToken string `mapstructure:"AGENT_TOKEN"` // 可选
@@ -191,6 +196,11 @@ func Load() (*Config, error) {
 	v.SetDefault("BIGMODEL_BASE", "https://open.bigmodel.cn/api/paas/v4")
 	v.SetDefault("OCR_MODEL", "hand_write")
 	v.SetDefault("LLM_MODEL", "glm-4-flash")
+
+	// DeepSeek (2026-09-04 双引擎)
+	v.SetDefault("DEEPSEEK_API_KEY", "")
+	v.SetDefault("DEEPSEEK_BASE", "https://api.deepseek.com")
+	v.SetDefault("DEEPSEEK_VISION_MODEL", "deepseek-v4-flash-vision-exp")
 
 	v.SetDefault("AGENT_URL", "http://127.0.0.1:8088")
 	v.SetDefault("AGENT_TOKEN", "")

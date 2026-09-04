@@ -24,7 +24,6 @@ import (
 	"github.com/tinkler/collect-ai/internal/model"
 	"github.com/tinkler/collect-ai/internal/parser"
 	parseragent "github.com/tinkler/collect-ai/internal/parser/agent"
-	"github.com/tinkler/collect-ai/internal/parser/matcher"
 	"github.com/tinkler/collect-ai/internal/purchasealert"
 	"github.com/tinkler/collect-ai/internal/restock"
 	"github.com/tinkler/collect-ai/internal/store"
@@ -36,22 +35,22 @@ import (
 //   - 取代原半硬编码 + template 覆盖老路
 //   - 详见 docs/ocr-purchase-skill-architecture.md
 type Handler struct {
-	UploadDir  string
-	PublicBase string
-	MaxUpload  int64 // bytes
+	UploadDir    string
+	PublicBase   string
+	MaxUpload    int64                // bytes
 	Orchestrator *parser.Orchestrator // Phase A: 新增, OCR + Strategy + LLM 编排
-	Agent       *parseragent.Client   // 仅用于 Ping / GetDataSource (2026-09-02: cube 调用已收编到 BizExecutor)
-	BizExecutor *business.Executor    // 2026-09-02: cube 业务字段调用入口
-	BusinessReg *business.Registry    // 业务字段映射(products / suppliers 跨数据源)
-	Pool        *pgxpool.Pool         // W4.1: GetAnalysisStatus 轻量查询
-	Sessions    *store.SessionRepo
-	Strategies  *store.StrategyRepo   // Phase A: 新增, per-supplier 特定解析策略
-	SkillStore  *skill.Store          // Phase A: 新增, 读 skills/ocr-purchase/SKILL.md
-	CashRepo    *store.CashBalanceRepo
-	PayRepo     *store.SupplierPaymentRepo
-	RestockSvc  *restock.Service
-	AlertSvc    *purchasealert.Service
-	AgentRunner *agent.Runner
+	Agent        *parseragent.Client  // 仅用于 Ping / GetDataSource (2026-09-02: cube 调用已收编到 BizExecutor)
+	BizExecutor  *business.Executor   // 2026-09-02: cube 业务字段调用入口
+	BusinessReg  *business.Registry   // 业务字段映射(products / suppliers 跨数据源)
+	Pool         *pgxpool.Pool        // W4.1: GetAnalysisStatus 轻量查询
+	Sessions     *store.SessionRepo
+	Strategies   *store.StrategyRepo // Phase A: 新增, per-supplier 特定解析策略
+	SkillStore   *skill.Store        // Phase A: 新增, 读 skills/ocr-purchase/SKILL.md
+	CashRepo     *store.CashBalanceRepo
+	PayRepo      *store.SupplierPaymentRepo
+	RestockSvc   *restock.Service
+	AlertSvc     *purchasealert.Service
+	AgentRunner  *agent.Runner
 	// Phase B+ (2026-09-03): 删 DefaultOcrModel/DefaultLlmModel 字段 (VLM 内部固定 glm-4v)
 }
 
@@ -72,8 +71,9 @@ func (h *Handler) Health(c *gin.Context) {
 // ============== Suppliers ==============
 
 // ListSuppliers 拉所有 distinct 供应商(业务字段名)
-//   ?datasource=erp|hbpos  不传则用当前 agent client 的数据源
-//   返回:{"suppliers": [...], "count": N, "datasource": "..."}
+//
+//	?datasource=erp|hbpos  不传则用当前 agent client 的数据源
+//	返回:{"suppliers": [...], "count": N, "datasource": "..."}
 func (h *Handler) ListSuppliers(c *gin.Context) {
 	if err := h.Agent.Ping(); err != nil {
 		c.JSON(503, gin.H{"error": "agent 不可达: " + err.Error()})
@@ -111,15 +111,16 @@ func sortStrings(s []string) {
 }
 
 // ListSuppliersByBrand GET /api/v1/suppliers/by-brand?brand=xxx&datasource=xxx&limit=N
-//   按品牌(产品名 contains brand)反查供应商, 按 product_count 降序
-//   业务字段名 → 物理字段名由 business registry 翻译
-//   返回:
-//     {
-//       "brand": "蒙牛",
-//       "datasource": "erp",
-//       "suppliers": [{"supplier_name": "汇一", "product_count": 47}, ...],
-//       "count": 2
-//     }
+//
+//	按品牌(产品名 contains brand)反查供应商, 按 product_count 降序
+//	业务字段名 → 物理字段名由 business registry 翻译
+//	返回:
+//	  {
+//	    "brand": "蒙牛",
+//	    "datasource": "erp",
+//	    "suppliers": [{"supplier_name": "汇一", "product_count": 47}, ...],
+//	    "count": 2
+//	  }
 func (h *Handler) ListSuppliersByBrand(c *gin.Context) {
 	brand := strings.TrimSpace(c.Query("brand"))
 	if brand == "" {
@@ -229,16 +230,15 @@ func (h *Handler) Parse(c *gin.Context) {
 	c.JSON(200, gin.H{
 		"supplier":         supplier,
 		"strategy_version": res.StrategyVersion,
-		"is_handwrite":     res.IsHandwrite,
-		"is_generic":       res.IsGeneric,
 		"rows":             res.Rows,
 	})
 }
 
-// Rematch 用现有 rows (来自 OCR 解析/历史) + 新 supplier 重新跑 SkuMatcher
-// 不调 OCR / LLM, 只换 SKU 库重新匹配
-// body: { "rows": [{ "row_id": 1, "raw_barcode": "...", "raw_name": "...", "raw_qty": "..." }], "mode": "purchase" }
-// query: ?supplier=xxx (必填)
+// Rematch 用现有 rows 重新整理 (2026-09-04 双引擎重构后不再有 SkuMatcher)
+// 语义: 无法匹配回填的属性值一律置空 (当新 sku) — matched_* 清空,
+// IsNew=true, status=新品; raw_* / qty / row_id / UnitPrice 保留
+// body: { "rows": [{ "row_id": 1, "raw_barcode": "...", "raw_name": "...", "raw_qty": "..." }] }
+// query: ?supplier=xxx (保留参数兼容前端, 仅回显不查库)
 func (h *Handler) Rematch(c *gin.Context) {
 	supplier := c.Query("supplier")
 	if supplier == "" {
@@ -260,64 +260,48 @@ func (h *Handler) Rematch(c *gin.Context) {
 		return
 	}
 
-	// 加载新 supplier 的 SKU(走业务层,business mapping 翻译)
-	skus, err := h.loadSupplierSkusBiz(supplier, 5000)
-	if err != nil {
-		c.JSON(500, gin.H{"error": "加载 SKU 失败: " + err.Error()})
-		return
-	}
-
-	// 重新匹配 (Phase A: FuzzyDistance 字段已删, 用 0 兜底)
-	m := matcher.New(skus, 0)
 	out := make([]model.SkuRow, 0, len(req.Rows))
-	for i, r := range req.Rows {
-		// 转成 ParsedOcrRow
-		parsed := model.ParsedOcrRow{
-			Barcode: r.RawBarcode,
-			Name:    r.RawName,
-			QtyRaw:  r.RawQty,
-			Qty:     r.Qty,
-		}
-		matched := m.Match(parsed, i+1)
-		// 保留原 row_id, 防止前端索引错位
-		matched.RowID = r.RowID
-		matched.IsDeleted = r.IsDeleted
-		matched.UnitPrice = r.UnitPrice
-		// 用户已改 matched_* 字段: 如果新 supplier 下应该重置, 但保留 UnitPrice
-		// (只重置 matched_*, 用户的 qty 修改保留)
-		// 这里直接用 m.Match 的结果 (覆盖), 用户的 qty 改通过 PUT 后续保存
-		if matched.Qty == nil {
-			matched.Qty = r.Qty
-		}
-		out = append(out, matched)
+	for _, r := range req.Rows {
+		out = append(out, model.SkuRow{
+			RowID:      r.RowID,
+			Seq:        r.Seq,
+			ImageIndex: r.ImageIndex,
+			RawBarcode: r.RawBarcode,
+			RawName:    r.RawName,
+			RawQty:     r.RawQty,
+			Qty:        r.Qty,
+			UnitPrice:  r.UnitPrice,
+			IsDeleted:  r.IsDeleted,
+			Status:     "新品",
+			IsNew:      true,
+			// matched_* / StockQty 一律置空 (无匹配逻辑)
+		})
 	}
-
-	// Phase A (2026-09-02): 盘点模式已下线, 不再重算 StockDiff
-	// 参见 docs/ocr-purchase-skill-architecture.md §三
 
 	c.JSON(200, gin.H{
-		"supplier":      supplier,
-		"sku_count":     len(skus),
-		"rows":          out,
-		"rematched":     len(out),
-		"skipped":       0,
+		"supplier":  supplier,
+		"sku_count": 0,
+		"rows":      out,
+		"rematched": len(out),
+		"skipped":   0,
 	})
 }
 
 // ============== Sessions ==============
 
 // AppendImages 追加图片到已有 session (W4.1 重复图去重)
-//   流程:
-//     1) 收图 (files[] / files / file) — 跟 CreateSession 一样
-//     2) 算每张图 sha256, 调 Sessions.AppendImages (内部判重)
-//     3) 重复的 hash → 跳过, 不解析, 不入 rows
-//     4) 新的 → 调 Orchestrator.Parse, 续接 seq + image_index
-//     5) 触发异步策略分析 (analysis_status 重置 pending → running → done)
-//   前端调用: 已经有一个 session, 用户点"添加图片"+"提交识别" → POST /sessions/:id/images
-//   Response 包含:
-//     - added_rows: 新加的行 (含新 row_id)
-//     - skipped_hashes: 已存在的 hash (UI 可提示"该图已识别过, 已跳过")
-//     - analysis_status: 当前状态 (前端轮询)
+//
+//	流程:
+//	  1) 收图 (files[] / files / file) — 跟 CreateSession 一样
+//	  2) 算每张图 sha256, 调 Sessions.AppendImages (内部判重)
+//	  3) 重复的 hash → 跳过, 不解析, 不入 rows
+//	  4) 新的 → 调 Orchestrator.Parse, 续接 seq + image_index
+//	  5) 触发异步策略分析 (analysis_status 重置 pending → running → done)
+//	前端调用: 已经有一个 session, 用户点"添加图片"+"提交识别" → POST /sessions/:id/images
+//	Response 包含:
+//	  - added_rows: 新加的行 (含新 row_id)
+//	  - skipped_hashes: 已存在的 hash (UI 可提示"该图已识别过, 已跳过")
+//	  - analysis_status: 当前状态 (前端轮询)
 func (h *Handler) AppendImages(c *gin.Context) {
 	id := c.Param("id")
 	if id == "" {
@@ -480,8 +464,9 @@ func (h *Handler) AppendImages(c *gin.Context) {
 }
 
 // GetAnalysisStatus 轻量状态查询 (W4.1 轮询用)
-//   替代方案: 也可直接用 GET /sessions/:id 拿 analysis_status
-//   但轮询时不需要拉全部 rows, 这个端点更轻
+//
+//	替代方案: 也可直接用 GET /sessions/:id 拿 analysis_status
+//	但轮询时不需要拉全部 rows, 这个端点更轻
 func (h *Handler) GetAnalysisStatus(c *gin.Context) {
 	id := c.Param("id")
 	var status, errMsg string
@@ -512,12 +497,13 @@ func (h *Handler) GetAnalysisStatus(c *gin.Context) {
 }
 
 // TriggerAnalysis (2026-09-03) 重新触发 LLM/purchase-alert 策略分析
-//   场景: 用户在收货单详情页手动按"重新分析"按钮
-//   - 不重跑 OCR/解析 (rows 已经是用户编辑过的最终结果)
-//   - 复用 StartAnalysisAsync: 内部 cancel 旧 run + 启新 run, 并发安全
-//   - body: { "force": true } → 即使 status='running' 也允许重跑 (默认拒重入, 10s 节流)
-//   权限: session:update (跟 EditRow 同级, 不要给 read 用户)
-//   注意: 不进限流中间件, 跟 analysis-status 同级 (后台 goroutine 自己跑)
+//
+//	场景: 用户在收货单详情页手动按"重新分析"按钮
+//	- 不重跑 OCR/解析 (rows 已经是用户编辑过的最终结果)
+//	- 复用 StartAnalysisAsync: 内部 cancel 旧 run + 启新 run, 并发安全
+//	- body: { "force": true } → 即使 status='running' 也允许重跑 (默认拒重入, 10s 节流)
+//	权限: session:update (跟 EditRow 同级, 不要给 read 用户)
+//	注意: 不进限流中间件, 跟 analysis-status 同级 (后台 goroutine 自己跑)
 func (h *Handler) TriggerAnalysis(c *gin.Context) {
 	id := c.Param("id")
 	if id == "" {
@@ -581,12 +567,11 @@ func (h *Handler) TriggerAnalysis(c *gin.Context) {
 	})
 }
 
-
-
 // CreateSession multipart 收图(支持 1 张或多张) + 存库
-//   多图: form-data 用 files[] 重复提交, 或 files (单字段多文件)
-//   单图兼容: 仍可用 file 字段(向后兼容飞书 H5)
-//   2026-08-28 加入多图支持
+//
+//	多图: form-data 用 files[] 重复提交, 或 files (单字段多文件)
+//	单图兼容: 仍可用 file 字段(向后兼容飞书 H5)
+//	2026-08-28 加入多图支持
 //
 // Phase A (2026-09-02): 删 template_id / template_name / prompt 参数, 改用 Orchestrator.Parse
 //   - 内部根据 supplier 查 supplier_parse_strategy 自动选 generic / specific / handwrite 路径
@@ -769,12 +754,12 @@ func (h *Handler) CreateSession(c *gin.Context) {
 
 // runVLMAsync 2026-09-04 新增: detached goroutine 跑 VLM
 //
-//	- 跟客户端 ctx 100% 解耦 (用 context.Background())
-//	- 每张图依次跑 VLM + 匹配, 累加 rows
-//	- 跑完调用 h.Sessions.UpdateSessionRows 一次性写入 DB
-//	- 失败: 写 status='failed', rows=空 (用户列表能看到 session 状态)
-//	- enrichRowsWithItemNo 移到 VLM 完成后 (rows 已有)
-//	- StartAnalysisAsync 移到 VLM 完成后 (alert 需要 rows)
+//   - 跟客户端 ctx 100% 解耦 (用 context.Background())
+//   - 每张图依次跑 VLM + 匹配, 累加 rows
+//   - 跑完调用 h.Sessions.UpdateSessionRows 一次性写入 DB
+//   - 失败: 写 status='failed', rows=空 (用户列表能看到 session 状态)
+//   - enrichRowsWithItemNo 移到 VLM 完成后 (rows 已有)
+//   - StartAnalysisAsync 移到 VLM 完成后 (alert 需要 rows)
 func (h *Handler) runVLMAsync(sessionID string, uploads []uploaded, supplier string, imageHashes []string) {
 	// detached ctx: VLM 跑多久都行, 不受客户端影响
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
@@ -899,8 +884,9 @@ func (h *Handler) GetSession(c *gin.Context) {
 }
 
 // splitAlertsByScope 拆分 row-specific vs session-level alerts (W4.1)
-//   row_id > 0 → row-specific (表格行内 icon)
-//   row_id = 0 → session-level (总结栏)
+//
+//	row_id > 0 → row-specific (表格行内 icon)
+//	row_id = 0 → session-level (总结栏)
 func splitAlertsByScope(in []purchasealert.Alert) (rowAlerts []purchasealert.Alert, summary []purchasealert.Alert) {
 	for _, a := range in {
 		if a.RowID == 0 {
@@ -987,9 +973,10 @@ func (h *Handler) GetCashBalance(c *gin.Context) {
 }
 
 // W2.5: H5 端触发 Agent 跑一轮 (复用 Runner.Run)
-//   Body: { "user_id": "u1", "session_id": "s1", "message": "汇一是自采" }
-//   Response: { "reply": "...", "tool_calls": [...] }
-//   LLM 不可用时返降级提示 (200 OK, 不报错)
+//
+//	Body: { "user_id": "u1", "session_id": "s1", "message": "汇一是自采" }
+//	Response: { "reply": "...", "tool_calls": [...] }
+//	LLM 不可用时返降级提示 (200 OK, 不报错)
 func (h *Handler) AgentChat(c *gin.Context) {
 	if h.AgentRunner == nil {
 		c.JSON(503, gin.H{"error": "agent runner 未配置"})
@@ -1106,12 +1093,12 @@ func convertAlertsToModel(in []purchasealert.Alert) []model.AlertItem {
 	out := make([]model.AlertItem, 0, len(in))
 	for _, a := range in {
 		it := model.AlertItem{
-			AlertID:  a.AlertID,
-			RowID:    a.RowID,
-			Rule:     a.Rule,
-			Severity: a.Severity,
-			Message:  a.Message,
-			AckedBy:  a.AckedBy,
+			AlertID:   a.AlertID,
+			RowID:     a.RowID,
+			Rule:      a.Rule,
+			Severity:  a.Severity,
+			Message:   a.Message,
+			AckedBy:   a.AckedBy,
 			CreatedAt: a.CreatedAt,
 		}
 		if !a.AckedAt.IsZero() {
@@ -1140,7 +1127,8 @@ func (h *Handler) DeleteSession(c *gin.Context) {
 //     - POST /suppliers/:name/strategy/optimize 触发 LLM 优化 (Phase A: 占位,Phase B 实现)
 
 // GetStrategy 查某 supplier 的 strategy
-//   不存在 → 404 + {"exists": false} (前端可据此显示"未建"提示)
+//
+//	不存在 → 404 + {"exists": false} (前端可据此显示"未建"提示)
 func (h *Handler) GetStrategy(c *gin.Context) {
 	name := c.Param("name")
 	if name == "" {
@@ -1160,9 +1148,10 @@ func (h *Handler) GetStrategy(c *gin.Context) {
 }
 
 // UpsertStrategy 覆盖式改 strategy (运营手动纠错用)
-//   body: 完整 model.Strategy JSON (含 supplier_name 必填)
-//   行为: Upsert,version 由调用方管理 (建议 +1)
-//   注意: 不并发安全(Phase A 单调用方),Phase B 改乐观锁
+//
+//	body: 完整 model.Strategy JSON (含 supplier_name 必填)
+//	行为: Upsert,version 由调用方管理 (建议 +1)
+//	注意: 不并发安全(Phase A 单调用方),Phase B 改乐观锁
 func (h *Handler) UpsertStrategy(c *gin.Context) {
 	name := c.Param("name")
 	var s model.Strategy
@@ -1185,10 +1174,11 @@ func (h *Handler) UpsertStrategy(c *gin.Context) {
 }
 
 // OptimizeStrategy 触发 LLM 优化 (Phase A: 占位,Phase B 接入 optimize-parse-strategy skill)
-//   行为:
-//     - 现在: 立即触发通用流程 + 记 last_auto_optimized_at
-//     - Phase B: 调 runner.Run 让 LLM 读 diff + 调 invoke_skill("optimize-parse-strategy")
-//   前端可手动触发或等自动阈值 (edit_count >= 3)
+//
+//	行为:
+//	  - 现在: 立即触发通用流程 + 记 last_auto_optimized_at
+//	  - Phase B: 调 runner.Run 让 LLM 读 diff + 调 invoke_skill("optimize-parse-strategy")
+//	前端可手动触发或等自动阈值 (edit_count >= 3)
 func (h *Handler) OptimizeStrategy(c *gin.Context) {
 	name := c.Param("name")
 	if name == "" {
@@ -1202,10 +1192,10 @@ func (h *Handler) OptimizeStrategy(c *gin.Context) {
 		return
 	}
 	c.JSON(200, gin.H{
-		"optimized":    false,
-		"phase":        "A",
-		"note":         "Phase A 仅重置 edit_count,Phase B 接入完整 LLM 优化",
-		"supplier":     name,
+		"optimized": false,
+		"phase":     "A",
+		"note":      "Phase A 仅重置 edit_count,Phase B 接入完整 LLM 优化",
+		"supplier":  name,
 	})
 }
 
@@ -1327,66 +1317,6 @@ func (s *stringBuilder) String() string { return string(s.buf) }
 
 // ============== 业务层(业务字段 ↔ 物理字段 翻译) ==============
 
-// loadSupplierSkusBiz 用 business mapping 翻译
-//   前端/parser 给业务字段名(supplier_name, barcode, ...)
-//   内部翻译为物理字段,调 agent,响应再翻回业务字段名
-//   返回 []model.SkuRecord 业务字段模型(供 SkuMatcher 用)
-//
-// 2026-09-02 重构: 翻译/调用/翻回全部收编到 Executor.SearchProducts
-//   handler 只剩"业务字段 map → model.SkuRecord"和"按 keyword 去重"2 步
-func (h *Handler) loadSupplierSkusBiz(supplierKeyword string, limit int) ([]model.SkuRecord, error) {
-	if h.BizExecutor == nil {
-		return nil, fmt.Errorf("business executor not configured")
-	}
-	// 多关键词去重 → 拆多次调
-	keywords := splitAndTrim(supplierKeyword, ";,\n\r\t ")
-	if len(keywords) == 0 {
-		return nil, fmt.Errorf("supplier keyword empty")
-	}
-	seen := make(map[string]struct{})
-	var merged []model.SkuRecord
-	for _, kw := range keywords {
-		// 2026-09-02: 用 Executor.SearchProducts 走 Registry 翻译
-		//   注意: 原代码每个 keyword 单独 limit,合并去重
-		//   简化: 用每个 keyword 调一次,跟原行为一致
-		bizRows, err := h.BizExecutor.SearchProducts(kw, limit)
-		if err != nil {
-			return nil, err
-		}
-		for _, br := range bizRows {
-			r := mapToSkuRecord(br)
-			if r.Barcode == "" && r.Name == "" {
-				continue
-			}
-			key := ""
-			if r.Barcode != "" {
-				key = "bc:" + r.Barcode
-			} else {
-				key = "sn:" + r.MainSuppName + "|" + r.Name
-			}
-			if _, ok := seen[key]; !ok {
-				seen[key] = struct{}{}
-				merged = append(merged, r)
-			}
-		}
-	}
-	return merged, nil
-}
-
-// mapToSkuRecord 业务字段 map → model.SkuRecord
-func mapToSkuRecord(br map[string]any) model.SkuRecord {
-	r := model.SkuRecord{
-		Barcode:      asAnyString(br["barcode"]),
-		Name:         asAnyString(br["product_name"]),
-		MainSuppId:   asAnyString(br["supplier_id"]),
-		MainSuppName: asAnyString(br["supplier_name"]),
-		// SrcSheet 暂存 category(原有 model 字段复用)
-		SrcSheet: asAnyString(br["category"]),
-		StockQty: asAnyFloat(br["stock_qty"]),
-	}
-	return r
-}
-
 func asAnyString(v any) string {
 	if v == nil {
 		return ""
@@ -1397,64 +1327,13 @@ func asAnyString(v any) string {
 	return fmt.Sprintf("%v", v)
 }
 
-func asAnyFloat(v any) *float64 {
-	if v == nil {
-		return nil
-	}
-	var f float64
-	switch x := v.(type) {
-	case float64:
-		f = x
-	case float32:
-		f = float64(x)
-	case int:
-		f = float64(x)
-	case int64:
-		f = float64(x)
-	case string:
-		if _, err := fmt.Sscanf(x, "%f", &f); err != nil {
-			return nil
-		}
-	default:
-		if _, err := fmt.Sscanf(fmt.Sprintf("%v", v), "%f", &f); err != nil {
-			return nil
-		}
-	}
-	return &f
-}
-
-// splitAndTrim 按多个分隔符切字符串并去重 trim
-func splitAndTrim(s string, seps string) []string {
-	parts := strings.FieldsFunc(s, func(r rune) bool {
-		for _, s := range seps {
-			if r == s {
-				return true
-			}
-		}
-		return false
-	})
-	seen := make(map[string]struct{})
-	out := make([]string, 0, len(parts))
-	for _, p := range parts {
-		p = strings.TrimSpace(p)
-		if p == "" {
-			continue
-		}
-		if _, ok := seen[p]; ok {
-			continue
-		}
-		seen[p] = struct{}{}
-		out = append(out, p)
-	}
-	return out
-}
-
 // ============== 业务 API(供前端直接调用) ==============
 
 // SearchProducts GET /api/v1/products/search?supplier=xxx&limit=100
-//   数据源启动后即固定(2026-08-31),不再接受 ?datasource= 覆盖
-//   业务字段:barcode/product_name/supplier_id/supplier_name/category/brand/stock_qty/unit
-//   业务字段查询(前端直接调)
+//
+//	数据源启动后即固定(2026-08-31),不再接受 ?datasource= 覆盖
+//	业务字段:barcode/product_name/supplier_id/supplier_name/category/brand/stock_qty/unit
+//	业务字段查询(前端直接调)
 //
 // 权限隔离 (2026-09-01 库存 + 2026-09-03 供应商 + 单位):
 //   - stock_qty       需 inventory:view perm (无 → 不查不返回)
@@ -1475,7 +1354,7 @@ func (h *Handler) SearchProducts(c *gin.Context) {
 	ds := h.Agent.GetDataSource()
 	supplier := c.Query("supplier")
 	barcode := strings.TrimSpace(c.Query("barcode")) // 2026-08-31: 扫码查商品
-	itemNo  := strings.TrimSpace(c.Query("item_no"))  // 别名, 跟 barcode 等价 (HBPoS 用 item_no 当 barcode)
+	itemNo := strings.TrimSpace(c.Query("item_no"))  // 别名, 跟 barcode 等价 (HBPoS 用 item_no 当 barcode)
 	limit, _ := strconv.Atoi(c.Query("limit"))
 	if limit == 0 {
 		limit = 100

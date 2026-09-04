@@ -373,6 +373,14 @@ func parseRowsArray(arr []map[string]any) []model.ParsedOcrRow {
 				qty = &v
 			}
 		}
+		// 2026-09-04 双引擎: price 单价 (DeepSeek 视觉 items[].price)
+		//   兼容 price / unit_price 两种 key; 0 是合法单价 (赠品)
+		var price *float64
+		if v, ok := parsePrice(o["price"]); ok {
+			price = &v
+		} else if v, ok := parsePrice(o["unit_price"]); ok {
+			price = &v
+		}
 		// 客户端硬过滤(同 ParseLlmJson)
 		if looksLikeHeader(name) {
 			continue
@@ -392,9 +400,36 @@ func parseRowsArray(arr []map[string]any) []model.ParsedOcrRow {
 		if name == "" && barcode == "" && qty == nil {
 			continue
 		}
-		out = append(out, model.ParsedOcrRow{Barcode: barcode, Name: name, QtyRaw: qtyRaw, Qty: qty})
+		out = append(out, model.ParsedOcrRow{Barcode: barcode, Name: name, QtyRaw: qtyRaw, Qty: qty, Price: price})
 	}
 	return out
+}
+
+// parsePrice 解析单价字段: 12.5 (float) / "12.5" / "¥12.5" / "12.50元"
+//
+//	双引擎 2026-09-04: DeepSeek 视觉输出 items[].price, 数值或字符串都可能
+//	非数字(含 "null" 字符串等)返 false
+func parsePrice(v any) (float64, bool) {
+	switch t := v.(type) {
+	case float64:
+		return t, true
+	case string:
+		s := strings.TrimSpace(t)
+		s = strings.TrimPrefix(s, "¥")
+		s = strings.TrimPrefix(s, "￥")
+		s = strings.TrimPrefix(s, "$")
+		s = strings.TrimSuffix(s, "元")
+		s = strings.TrimSpace(s)
+		if s == "" {
+			return 0, false
+		}
+		f, err := strconv.ParseFloat(s, 64)
+		if err != nil {
+			return 0, false
+		}
+		return f, true
+	}
+	return 0, false
 }
 
 // formatFloatQty 把 float64 格式化为最短合理字符串

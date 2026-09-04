@@ -18,20 +18,20 @@ import (
 	"github.com/tinkler/collect-ai/internal/auth"
 	"github.com/tinkler/collect-ai/internal/business"
 	"github.com/tinkler/collect-ai/internal/config"
-	"github.com/tinkler/collect-ai/internal/model"
 
+	"github.com/gin-gonic/gin"
 	"github.com/tinkler/collect-ai/internal/parser"
 	parseragent "github.com/tinkler/collect-ai/internal/parser/agent"
 	"github.com/tinkler/collect-ai/internal/parser/bigmodel"
+	"github.com/tinkler/collect-ai/internal/parser/glmocr"
 	"github.com/tinkler/collect-ai/internal/promotionalert"
 	"github.com/tinkler/collect-ai/internal/purchasealert"
 	"github.com/tinkler/collect-ai/internal/rbac"
-	"github.com/tinkler/collect-ai/internal/supplierpayment"
 	"github.com/tinkler/collect-ai/internal/restock"
+	"github.com/tinkler/collect-ai/internal/store"
+	"github.com/tinkler/collect-ai/internal/supplierpayment"
 	"github.com/tinkler/collect-ai/internal/wecom"
 	"github.com/tinkler/collect-ai/internal/wxsign"
-	"github.com/tinkler/collect-ai/internal/store"
-	"github.com/gin-gonic/gin"
 )
 
 func main() {
@@ -69,11 +69,9 @@ func main() {
 	strategyRepo := store.NewStrategyRepo(pool) // Phase A (2026-09-02)
 
 	// Phase B+ (2026-09-03): VLM-only 模式, 不再需要 OCR client
-	//   老: ocrClient (hand_write) + llmClient (glm-4-flash) → 0 rows (OCR 严重误读)
-	//   新: vlmClient (glm-4v 多模态) → 13位 barcode 100% 正确, qty 100% 正确
+	//   2026-09-04 双引擎重构: VLM client 删除, 引擎1 改 glmocr (prime-sync), 引擎2 DeepSeek 视觉
 	//   llmClient 保留给 seasonClassifier 等用
 	llmClient := bigmodel.NewLlmClient(cfg.BigModelAPIKey, cfg.BigModelBase, cfg.LlmTimeoutSec)
-	vlmClient := bigmodel.NewVlmClient(cfg.BigModelAPIKey, cfg.BigModelBase, cfg.LlmTimeoutSec+30)
 	// 数据源: 启动后即固定,只走 .env / cfg 配置 (2026-08-31 简化,移除 dsstate 持久化 + 切换 API)
 	initialDS := cfg.DataSource
 	log.Printf("[main] datasource: %s (from env/cfg, 启动后即固定)", initialDS)
@@ -103,17 +101,17 @@ func main() {
 
 	// ============== restock 模块启动 (2026-09-02 重构精简) ==============
 	restockCfg := &restock.RestockConfig{
-		BranchNo:    cfg.RestockBranchNo,
-		CronEve:     cfg.DisplayRestockCronEve,
-		CronMorn:    cfg.DisplayRestockCronMorn,
-		CronAft:     cfg.DisplayRestockCronAft,
-		CubeName:    cfg.DisplayRestockCubeName,
-		RetryMax:    cfg.DisplayRestockRetryMax,
-		MaxPerTick:  cfg.DisplayRestockMaxPush,
-		WeComBotID:  cfg.WeComBotID,
+		BranchNo:       cfg.RestockBranchNo,
+		CronEve:        cfg.DisplayRestockCronEve,
+		CronMorn:       cfg.DisplayRestockCronMorn,
+		CronAft:        cfg.DisplayRestockCronAft,
+		CubeName:       cfg.DisplayRestockCubeName,
+		RetryMax:       cfg.DisplayRestockRetryMax,
+		MaxPerTick:     cfg.DisplayRestockMaxPush,
+		WeComBotID:     cfg.WeComBotID,
 		WeComBotSecret: cfg.WeComBotSecret,
-		WeComWSURL:  cfg.WeComWSURL,
-		WeComBindFile: cfg.WeComBindFile,
+		WeComWSURL:     cfg.WeComWSURL,
+		WeComBindFile:  cfg.WeComBindFile,
 	}
 	restockCube := restock.NewCubeQuerier(gateway, restockCfg)
 	// 2026-09-02: 企微长连接从 restock 抽到 internal/wecom/ 通用包
@@ -126,17 +124,17 @@ func main() {
 	restockSvc := restock.NewService(restockCfg, pool, restockCube)
 	// W3.5: 季节判定分类器 (关键词快速 + LLM 慢路径 + 6h 缓存)
 	seasonClassifier := buildSeasonClassifier(llmClient)
-	alertSvc := purchasealert.NewServiceWithClassifier(pool, seasonClassifier) // W3.2+W3.5
+	alertSvc := purchasealert.NewServiceWithClassifier(pool, seasonClassifier)                                // W3.2+W3.5
 	promoAlertSvc := promotionalert.NewService(pool, strings.TrimSpace(os.Getenv("PROMOTION_ALERT_CHAT_ID"))) // W3.3: 堆头费到期预警 (空=禁用)
-	supplierPaySvc := supplierpayment.NewService(pool, strings.TrimSpace(os.Getenv("OWNER_CHAT_ID")))          // W4.3: 供应商结算 cron
+	supplierPaySvc := supplierpayment.NewService(pool, strings.TrimSpace(os.Getenv("OWNER_CHAT_ID")))         // W4.3: 供应商结算 cron
 	// W5: cube 数据源注入 (默认 Noop, 设 COLLECTAI_CUBE_QUERIER=real 接真实 cube)
 	//   2026-09-02: 传 gateway.Client() (CubeClient interface),统一 client
 	if cq := buildCubeQuerier(gateway.Client()); cq != nil {
 		supplierPaySvc.SetCubeQuerier(cq)
 		log.Printf("[main] W5 cube 接入: 模式=%s", cubeMode())
 	}
-	cashRepo := store.NewCashBalanceRepo(pool)        // W4
-	payRepo := store.NewSupplierPaymentRepo(pool)     // W4
+	cashRepo := store.NewCashBalanceRepo(pool)    // W4
+	payRepo := store.NewSupplierPaymentRepo(pool) // W4
 
 	// Phase A (2026-09-02): BizExecutor 业务字段执行器
 	//   Orchestrator 的 SkuLoader 用它从 cube 拉该 supplier 的 SKU 库
@@ -166,24 +164,24 @@ func main() {
 	authSvc := auth.NewService(authStore, authSign, authWeCom)
 
 	h := &handler.Handler{
-		UploadDir:       cfg.UploadDir,
-		PublicBase:      cfg.PublicBaseURL,
-		MaxUpload:       int64(cfg.MaxUploadMB) * 1024 * 1024,
+		UploadDir:  cfg.UploadDir,
+		PublicBase: cfg.PublicBaseURL,
+		MaxUpload:  int64(cfg.MaxUploadMB) * 1024 * 1024,
 		// Phase A (2026-09-02): Orchestrator 字段在 agentRunner 初始化后填(下方)
-		Orchestrator:    nil,
-		Agent:           agentClient,
-		BizExecutor:     bizExecutor, // 2026-09-02 新增
-		BusinessReg:     businessReg,
-		Pool:            pool,        // W4.1: GetAnalysisStatus 轻量查询
-		Sessions:        sessionRepo,
-		Strategies:      strategyRepo, // Phase A 新增
+		Orchestrator: nil,
+		Agent:        agentClient,
+		BizExecutor:  bizExecutor, // 2026-09-02 新增
+		BusinessReg:  businessReg,
+		Pool:         pool, // W4.1: GetAnalysisStatus 轻量查询
+		Sessions:     sessionRepo,
+		Strategies:   strategyRepo, // Phase A 新增
 		// SkillStore + Orchestrator 在 agentRunner 初始化后注入
-		SkillStore:      nil,
-		CashRepo:        cashRepo,    // W4
-		PayRepo:         payRepo,     // W4
-		RestockSvc:      restockSvc, // 2026-08-28: 采购收货单附加 plan_qty
-		AlertSvc:        alertSvc,   // 2026-09-01 W3.2: 采购订单智能提醒
-		AgentRunner:     agentRunner, // W2.5: H5 端 Agent chat
+		SkillStore:  nil,
+		CashRepo:    cashRepo,    // W4
+		PayRepo:     payRepo,     // W4
+		RestockSvc:  restockSvc,  // 2026-08-28: 采购收货单附加 plan_qty
+		AlertSvc:    alertSvc,    // 2026-09-01 W3.2: 采购订单智能提醒
+		AgentRunner: agentRunner, // W2.5: H5 端 Agent chat
 		// Phase B+ (2026-09-03): 删 DefaultOcrModel/DefaultLlmModel 字段 (VLM 内部固定)
 	}
 
@@ -268,18 +266,22 @@ func main() {
 			agentRunner != nil, skillStore != nil)
 	}
 	if skillStore != nil {
-		skuLoader := bizSkuLoaderAdapter{exec: bizExecutor}
-		// Phase B+ (2026-09-03): VLM-only, vlmModel 走 env VLM_MODEL (默认 glm-4v)
-		vlmModel := strings.TrimSpace(os.Getenv("VLM_MODEL"))
-		if vlmModel == "" {
-			vlmModel = "glm-4v"
-		}
-		orch, err := parser.NewOrchestrator(vlmClient, skuLoader, strategyRepo, skillStore, vlmModel)
+		// 2026-09-04 双引擎重构 (对齐 tin-nova):
+		//   引擎1 = 智谱 prime-sync 文件解析 (复用 BIGMODEL_API_KEY, 印刷体/表格 OCR)
+		//   引擎2 = DeepSeek 视觉模型 (图 + OCR 文本参考 → 结构化 JSON)
+		//   不再: SKU hints 注入 / SkuMatcher L1~L3 匹配 (全部行当新 SKU)
+		glmocrClient := glmocr.New(cfg.BigModelAPIKey, cfg.LlmTimeoutSec+60)
+		orch, err := parser.NewOrchestrator(
+			glmocrClient,
+			cfg.DeepseekAPIKey, cfg.DeepseekBase, cfg.DeepseekVisionModel,
+			skillStore,
+		)
 		if err != nil {
 			log.Printf("[main] Orchestrator 构造失败: %v (CreateSession 将不可用)", err)
 		} else {
 			h.Orchestrator = orch
-			log.Printf("[main] Orchestrator ready (skill count=%d)", skillStore.Count())
+			log.Printf("[main] Orchestrator ready 双引擎 (glmocr+deepseek-vision=%s, skill count=%d)",
+				cfg.DeepseekVisionModel, skillStore.Count())
 		}
 	} else {
 		log.Printf("[main] SkillStore 不可用,Orchestrator 暂不可用(创建 session 会报 skill 缺失)")
@@ -435,11 +437,12 @@ func splitIDs(s string) []string {
 }
 
 // buildCubeQuerier W5 cube 数据源
-//   env COLLECTAI_CUBE_QUERIER:
-//     "" / "noop" (默认) → NoopCubeQuerier (返回固定占位值, devMode 友好)
-//     "real"            → RealCubeQuerier 包装 business.CubeClient (Gateway 内部用同一个 client)
-//   真实接入需在 cube-agent-server 端有 siss_saleflow / v_prom_saleflow cube 定义
-//   字段名见 internal/supplierpayment/cube.go RealCubeQuerier 默认值
+//
+//	env COLLECTAI_CUBE_QUERIER:
+//	  "" / "noop" (默认) → NoopCubeQuerier (返回固定占位值, devMode 友好)
+//	  "real"            → RealCubeQuerier 包装 business.CubeClient (Gateway 内部用同一个 client)
+//	真实接入需在 cube-agent-server 端有 siss_saleflow / v_prom_saleflow cube 定义
+//	字段名见 internal/supplierpayment/cube.go RealCubeQuerier 默认值
 //
 // 2026-09-02 重构: agentClient → gateway.Client() (统一 CubeClient interface)
 func buildCubeQuerier(client business.CubeClient) supplierpayment.CubeQuerier {
@@ -466,15 +469,15 @@ func cubeMode() string {
 
 // buildPurchaseAlertCubeFns W4.4 (2026-09-04) 构造 purchase-alert 6 tool 的 cube Fn 注入
 //
-//   走 business.Executor.SearchReturnsBySupplier (e.query() 私有方法, 走 Registry 翻译)
-//   严禁直接 import parser/agent / 严禁暴露物理 cube 字段名 (AGENTS.md §12.3 红线)
+//	走 business.Executor.SearchReturnsBySupplier (e.query() 私有方法, 走 Registry 翻译)
+//	严禁直接 import parser/agent / 严禁暴露物理 cube 字段名 (AGENTS.md §12.3 红线)
 //
-//   当前 (W4.4 第一阶段):
-//     - QueryReturnOrderFn = 真实现 (规则 8 pending_return 激活, 走 returns mapping)
-//     - QuerySkuStockFn = nil (high_stock 规则 cube 路径走降级, 暂未配 stock cube mapping)
-//     - QuerySkuSalesFn = nil (low_movement 规则 cube 路径走降级, 暂未配 sales cube mapping)
+//	当前 (W4.4 第一阶段):
+//	  - QueryReturnOrderFn = 真实现 (规则 8 pending_return 激活, 走 returns mapping)
+//	  - QuerySkuStockFn = nil (high_stock 规则 cube 路径走降级, 暂未配 stock cube mapping)
+//	  - QuerySkuSalesFn = nil (low_movement 规则 cube 路径走降级, 暂未配 sales cube mapping)
 //
-//   未来补 stock_qty / sales mapping 时, 在这里加 Fn 实现即可, NewRunner 签名不变
+//	未来补 stock_qty / sales mapping 时, 在这里加 Fn 实现即可, NewRunner 签名不变
 func buildPurchaseAlertCubeFns(bizExec *business.Executor, gateway *business.Gateway) agent.CubeToolFns {
 	return agent.CubeToolFns{
 		// QuerySkuStockFn / QuerySkuSalesFn 暂留 nil, 对应 tool 内部降级
@@ -502,8 +505,9 @@ func buildPurchaseAlertCubeFns(bizExec *business.Executor, gateway *business.Gat
 }
 
 // buildSeasonClassifier W3.5 季节判定分类器链
-//   关键词 (W3.2 OffseasonRule 已有表) → LLM (GLM-4-flash) → 6h 缓存
-//   LLM 不可用 / 没 key → 返回 nil, Service 跳过 LLMSeasonRule,等同 W3.2
+//
+//	关键词 (W3.2 OffseasonRule 已有表) → LLM (GLM-4-flash) → 6h 缓存
+//	LLM 不可用 / 没 key → 返回 nil, Service 跳过 LLMSeasonRule,等同 W3.2
 func buildSeasonClassifier(llmClient *bigmodel.LlmClient) purchasealert.SeasonClassifier {
 	keyword := purchasealert.NewKeywordSeasonClassifier(nil)
 	if llmClient == nil {
@@ -518,11 +522,12 @@ func buildSeasonClassifier(llmClient *bigmodel.LlmClient) purchasealert.SeasonCl
 }
 
 // runSupplierPayCron W4.3 启动 4 个 cron 任务
-//   启动时立即跑 forecast + weekly
-//   每日 21:00 跑 forecast
-//   每周一 09:00 跑 weekly
-//   每月 1 号 02:00 跑 monthly share
-//   每日 22:00 跑 cash check
+//
+//	启动时立即跑 forecast + weekly
+//	每日 21:00 跑 forecast
+//	每周一 09:00 跑 weekly
+//	每月 1 号 02:00 跑 monthly share
+//	每日 22:00 跑 cash check
 func runSupplierPayCron(ctx context.Context, svc *supplierpayment.Service, _ *wecom.Client, sender agent.Sender) {
 	// 启动立即跑
 	if _, err := svc.RunDailyForecast(ctx); err != nil {
@@ -671,7 +676,8 @@ func runMonthly(ctx context.Context, fn func(context.Context), day, hour, minute
 }
 
 // skillStoreAdapter 把 *skill.Store 适配成 purchasealert.SkillLoader
-//   purchasealert 不直接 import skill 包 (避免循环), 通过 interface 注入
+//
+//	purchasealert 不直接 import skill 包 (避免循环), 通过 interface 注入
 type skillStoreAdapter struct {
 	store *skill.Store
 }
@@ -682,48 +688,6 @@ func (a *skillStoreAdapter) GetBody(name string) (string, bool) {
 		return "", false
 	}
 	return sk.Body, true
-}
-
-// bizSkuLoaderAdapter Phase A (2026-09-02): 把 business.Executor 适配成 parser.SkuLoader
-//   - 调 bizExecutor.SearchProducts(supplier, limit) 拿业务字段 map
-//   - 转 []model.SkuRow 给 SkuMatcher
-type bizSkuLoaderAdapter struct {
-	exec *business.Executor
-}
-
-func (a bizSkuLoaderAdapter) LoadBySupplier(ctx context.Context, supplier string, limit int) ([]model.SkuRecord, error) {
-	bizRows, err := a.exec.SearchProducts(supplier, limit)
-	if err != nil {
-		return nil, err
-	}
-	out := make([]model.SkuRecord, 0, len(bizRows))
-	for _, br := range bizRows {
-		rec := model.SkuRecord{
-			Barcode:      asAnyString(br["barcode"]),
-			Name:         asAnyString(br["product_name"]),
-			MainSuppId:   asAnyString(br["supplier_id"]),
-			MainSuppName: asAnyString(br["supplier_name"]),
-			SrcSheet:     asAnyString(br["category"]),
-		}
-		if v, ok := br["stock_qty"]; ok && v != nil {
-			if f, ok := v.(float64); ok {
-				f2 := f
-				rec.StockQty = &f2
-			}
-		}
-		out = append(out, rec)
-	}
-	return out, nil
-}
-
-func asAnyString(v any) string {
-	if v == nil {
-		return ""
-	}
-	if s, ok := v.(string); ok {
-		return s
-	}
-	return fmt.Sprintf("%v", v)
 }
 
 // maskAPIKey 脱敏输出 API key (用于日志, 只显示前后 4 字符)
