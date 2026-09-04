@@ -278,12 +278,13 @@ func main() {
 			glmocrClient,
 			cfg.DeepseekAPIKey, cfg.DeepseekBase, cfg.DeepseekVisionModel,
 			skillStore,
+			bizExecutor, // L1 barcode 精确对应供应商商品库 (不做 L2~L5 name/修正匹配)
 		)
 		if err != nil {
 			log.Printf("[main] Orchestrator 构造失败: %v (CreateSession 将不可用)", err)
 		} else {
 			h.Orchestrator = orch
-			log.Printf("[main] Orchestrator ready 双引擎 (glmocr+deepseek-vision=%s, skill count=%d)",
+			log.Printf("[main] Orchestrator ready 双引擎+L1 (glmocr+deepseek-vision=%s, skill=%d, ProductSearcher=bizExecutor)",
 				cfg.DeepseekVisionModel, skillStore.Count())
 		}
 	} else {

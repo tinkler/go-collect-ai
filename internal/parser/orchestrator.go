@@ -1,19 +1,21 @@
 // Package parser - Orchestrator 双引擎联合解析 (2026-09-04 重构, 对齐 tin-nova)
 //
-//	旧版 (2026-09-04 之前): GLM-4V 多模态直读图 → JSON → SkuMatcher L1/L2/L3 匹配回填
+//	旧版 (2026-09-04 之前): GLM-4V 多模态直读图 → JSON → SkuMatcher L1~L5 匹配回填
 //	  问题: 1) buildGenericHints 塞 800 name + 200 barcode 进 prompt, 高消耗 token
-//	       2) SkuMatcher L1/L2/L3 需加载 5000 SKU 全库匹配
+//	       2) SkuMatcher L3~L5 模糊/启发式 "修正匹配" (OCR 误读强行挽回), 误报高
 //	       3) VLM 单引擎, 复杂表格误读无兜底
 //
 //	新版 (2026-09-04 之后, 对齐 F:\go\src\github.com\tinkler\tin-nova):
 //	  引擎1: 智谱 prime-sync 文件解析 (印刷体/表格 OCR) → 纯文本
 //	  引擎2: DeepSeek 视觉模型 (deepseek-v4-flash-vision-exp) 收图 + OCR 文本参考
 //	         → 结构化 JSON {supplier_name, items:[{barcode,name,qty,price}]}
-//	  不做: SKU hints 注入 (数据库增强识别) / SkuMatcher L1~L3 匹配
-//	  语义: 所有行直接当新 SKU, matched_* 属性一律置空 (IsNew=true, status=新品)
+//	  不做:  SKU hints 注入 (数据库增强识别) / SkuMatcher L2~L5 修正/模糊匹配
+//	  仍做:  L1 barcode 全等 (trim 后精确匹配) 对应回填
+//	    → barcode 能对应上供应商商品库, 就填 matched_* + stock_qty + unit (IsNew=false, 已匹配)
+//	    → barcode 对应不上才是新品 (IsNew=true, matched_* 置空, status=新品)
 //
 // 关键合规点 (AGENTS.md §1/§4):
-//   - 0 个业务判断在 Go 里
+//   - 0 个业务判断在 Go 里 (L1 是纯字典查找, 属于 §1.1 纯算法例外, 非业务判定)
 //   - 0 个 prompt 模板在 Go 里 (在 skills/ocr-purchase/SKILL.md)
 package parser
 
@@ -33,6 +35,13 @@ import (
 	"trpc.group/trpc-go/trpc-agent-go/model/openai"
 )
 
+// ProductSearcher 查询供应商商品库 (解耦 business.Executor, 便于单测 mock)
+//
+//	返回值字段 (业务名): barcode / product_name / supplier_id / supplier_name / stock_qty / unit
+type ProductSearcher interface {
+	SearchProducts(supplierKeyword string, limit int) ([]map[string]any, error)
+}
+
 // ocrTextMaxLen 智谱 OCR 文本注入 prompt 的长度上限 (对齐 tin-nova 6000 截断)
 const ocrTextMaxLen = 6000
 
@@ -44,12 +53,15 @@ type Orchestrator struct {
 	vision tmodel.Model
 	// skills: 读 skills/ocr-purchase/SKILL.md 当 prompt 模板 (AGENTS.md §1)
 	skills *skill.Store
+	// products: L1/L2 直接对应回填用的供应商商品库查询 (不做 L3~L5 修正匹配)
+	products ProductSearcher
 }
 
 func NewOrchestrator(
 	ocr *glmocr.Client,
 	dsAPIKey, dsBaseURL, dsModel string,
 	skills *skill.Store,
+	products ProductSearcher,
 ) (*Orchestrator, error) {
 	if ocr == nil {
 		return nil, fmt.Errorf("orchestrator: glmocr client 必填")
@@ -59,6 +71,9 @@ func NewOrchestrator(
 	}
 	if skills == nil {
 		return nil, fmt.Errorf("orchestrator: skill store 必填")
+	}
+	if products == nil {
+		return nil, fmt.Errorf("orchestrator: ProductSearcher 必填 (L1/L2 对应回填用)")
 	}
 	opts := []openai.Option{
 		openai.WithAPIKey(dsAPIKey),
@@ -72,9 +87,10 @@ func NewOrchestrator(
 		dsModel = "deepseek-v4-flash-vision-exp" // 对齐 tin-nova 默认
 	}
 	return &Orchestrator{
-		ocr:    ocr,
-		vision: openai.New(dsModel, opts...),
-		skills: skills,
+		ocr:      ocr,
+		vision:   openai.New(dsModel, opts...),
+		skills:   skills,
+		products: products,
 	}, nil
 }
 
@@ -87,7 +103,11 @@ type ParseResult struct {
 	StrategyVersion int
 }
 
-// Parse 收图 bytes → 双引擎解析为 SkuRow (全部按新 SKU 返回)
+// Parse 收图 bytes → 双引擎解析为 SkuRow (L1 barcode 全等对应回填, 否则新品)
+//
+//	不做: L2~L5 (name 匹配/模糊/后缀/相似度, 用户 2026-09-04 决策明确删除)
+//	仍做: L1 barcode 全等 (trim 后精确) → 对应填 matched_* + stock_qty + unit (已匹配)
+//	      barcode 无法对应 → IsNew=true, status=新品, matched_* 置空
 //
 //	supplier: 必填
 //	fileName: 推断 mime / file_type
@@ -154,11 +174,24 @@ func (o *Orchestrator) Parse(ctx context.Context, imgBytes []byte, fileName, sup
 	}
 	log.Printf("[orch] 双引擎解析 → %d 条 (supplier=%s)", len(parsed), supplier)
 
-	// 5) 转 SkuRow: 不做任何 SKU 匹配, 全部按新 SKU
-	//    matched_* 属性一律置空 (用户 2026-09-04 决策)
+	// 5) 查供应商商品库 → L1 (barcode trim 后全等) 对应回填
+	//    不做 L2~L5 (name 匹配/修正匹配, 用户 2026-09-04 决策); 查询失败不阻断, 降级全当新品
+	byBarcode := map[string]map[string]any{}
+	if skuList, sErr := o.products.SearchProducts(supplier, 5000); sErr != nil {
+		log.Printf("[orch] ⚠️ 供应商商品库查询失败 (L1 跳过, 全当新品): %v", sErr)
+	} else {
+		log.Printf("[orch] 供应商商品库 → %d 条 (L1 barcode 对应, supplier=%s)", len(skuList), supplier)
+		for _, sk := range skuList {
+			if bc, _ := sk["barcode"].(string); strings.TrimSpace(bc) != "" {
+				byBarcode[strings.TrimSpace(bc)] = sk
+			}
+		}
+	}
+
 	res := &ParseResult{Rows: make([]model.SkuRow, 0, len(parsed))}
+	newCnt, l1Cnt := 0, 0
 	for i, p := range parsed {
-		res.Rows = append(res.Rows, model.SkuRow{
+		row := model.SkuRow{
 			Seq:        i + 1, // handler 会按多图累加覆盖
 			RawBarcode: p.Barcode,
 			RawName:    p.Name,
@@ -167,8 +200,21 @@ func (o *Orchestrator) Parse(ctx context.Context, imgBytes []byte, fileName, sup
 			UnitPrice:  p.Price,
 			Status:     "新品",
 			IsNew:      true,
-		})
+		}
+		// L1: barcode 全等 (trim 后精确)
+		if rawBc := strings.TrimSpace(p.Barcode); rawBc != "" {
+			if sk, ok := byBarcode[rawBc]; ok {
+				fillMatched(&row, sk)
+				l1Cnt++
+			}
+		}
+		if row.IsNew {
+			newCnt++
+		}
+		res.Rows = append(res.Rows, row)
 	}
+	log.Printf("[orch] 对应回填完成 (total=%d, L1=%d, 新品=%d, supplier=%s)",
+		len(res.Rows), l1Cnt, newCnt, supplier)
 	return res, nil
 }
 
@@ -205,4 +251,73 @@ func (o *Orchestrator) visionChat(ctx context.Context, prompt string, imgBytes [
 		return "", fmt.Errorf("vision 模型返回空内容")
 	}
 	return out, nil
+}
+
+// MatchSupplierRows 用 L1 对已有 rows 重新匹配 (供 handler.Rematch 复用)
+//
+//	保留: RowID / Seq / ImageIndex / Raw* / Qty / UnitPrice / IsDeleted
+//	重填: matched_* / StockQty / Unit / Status / IsNew
+//	语义: 不做 L2~L5 (name/模糊/后缀/相似度), 仅 barcode 全等直接对应
+func (o *Orchestrator) MatchSupplierRows(ctx context.Context, supplier string, rows []model.SkuRow) []model.SkuRow {
+	byBarcode := map[string]map[string]any{}
+	if skuList, sErr := o.products.SearchProducts(supplier, 5000); sErr != nil {
+		log.Printf("[orch] ⚠️ Rematch 供应商商品库查询失败 (降级全当新品): %v", sErr)
+	} else {
+		log.Printf("[orch] Rematch 商品库 → %d 条 (L1 barcode, supplier=%s)", len(skuList), supplier)
+		for _, sk := range skuList {
+			if bc, _ := sk["barcode"].(string); strings.TrimSpace(bc) != "" {
+				byBarcode[strings.TrimSpace(bc)] = sk
+			}
+		}
+	}
+	out := make([]model.SkuRow, 0, len(rows))
+	for _, r := range rows {
+		row := model.SkuRow{
+			RowID:      r.RowID,
+			Seq:        r.Seq,
+			ImageIndex: r.ImageIndex,
+			RawBarcode: r.RawBarcode,
+			RawName:    r.RawName,
+			RawQty:     r.RawQty,
+			Qty:        r.Qty,
+			UnitPrice:  r.UnitPrice,
+			IsDeleted:  r.IsDeleted,
+			Status:     "新品",
+			IsNew:      true,
+		}
+		if rawBc := strings.TrimSpace(r.RawBarcode); rawBc != "" {
+			if sk, ok := byBarcode[rawBc]; ok {
+				fillMatched(&row, sk)
+			}
+		}
+		out = append(out, row)
+	}
+	return out
+}
+
+// fillMatched 把 SearchProducts 返回的 sku map 字段填进 SkuRow 的 matched_* / 库存 / 单位
+//
+//	副作用: row.IsNew=false, row.Status="已匹配", 以及各 matched 字段/StockQty/Unit 回填
+func fillMatched(row *model.SkuRow, sk map[string]any) {
+	if bc, _ := sk["barcode"].(string); bc != "" {
+		row.MatchedBarcode = bc
+	}
+	if pn, _ := sk["product_name"].(string); pn != "" {
+		row.MatchedName = pn
+	}
+	if sn, _ := sk["supplier_name"].(string); sn != "" {
+		row.MatchedSupp = sn
+	}
+	if sid, _ := sk["supplier_id"].(string); sid != "" {
+		row.MatchedSrc = sid
+	}
+	if sq, ok := sk["stock_qty"].(float64); ok {
+		sq2 := sq
+		row.StockQty = &sq2
+	}
+	if u, _ := sk["unit"].(string); u != "" {
+		row.Unit = u
+	}
+	row.Status = "已匹配"
+	row.IsNew = false
 }

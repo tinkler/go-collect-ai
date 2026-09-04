@@ -238,11 +238,15 @@ func (h *Handler) Parse(c *gin.Context) {
 	})
 }
 
-// Rematch 用现有 rows 重新整理 (2026-09-04 双引擎重构后不再有 SkuMatcher)
-// 语义: 无法匹配回填的属性值一律置空 (当新 sku) — matched_* 清空,
-// IsNew=true, status=新品; raw_* / qty / row_id / UnitPrice 保留
-// body: { "rows": [{ "row_id": 1, "raw_barcode": "...", "raw_name": "...", "raw_qty": "..." }] }
-// query: ?supplier=xxx (保留参数兼容前端, 仅回显不查库)
+// Rematch 用现有 rows 重新整理 (2026-09-04 双引擎重构: 走 Orchestrator L1 barcode 对应回填)
+//
+//	语义: 不做 L2~L5 (name 匹配/模糊/后缀/相似度), 仅做 L1 barcode 全等 (trim 后精确)
+//	 → 命中: 填 matched_* + stock_qty + unit, Status=已匹配, IsNew=false
+//	 → 未命中: matched_* 置空, Status=新品, IsNew=true
+//	 保留: row_id / seq / image_index / raw_* / qty / unit_price / is_deleted
+//
+//	body:  { "rows": [{ "row_id": 1, "raw_barcode": "...", "raw_name": "..." }] }
+//	query: ?supplier=xxx (必填, 用于查该供应商商品库)
 func (h *Handler) Rematch(c *gin.Context) {
 	supplier := c.Query("supplier")
 	if supplier == "" {
@@ -264,22 +268,27 @@ func (h *Handler) Rematch(c *gin.Context) {
 		return
 	}
 
-	out := make([]model.SkuRow, 0, len(req.Rows))
-	for _, r := range req.Rows {
-		out = append(out, model.SkuRow{
-			RowID:      r.RowID,
-			Seq:        r.Seq,
-			ImageIndex: r.ImageIndex,
-			RawBarcode: r.RawBarcode,
-			RawName:    r.RawName,
-			RawQty:     r.RawQty,
-			Qty:        r.Qty,
-			UnitPrice:  r.UnitPrice,
-			IsDeleted:  r.IsDeleted,
-			Status:     "新品",
-			IsNew:      true,
-			// matched_* / StockQty 一律置空 (无匹配逻辑)
-		})
+	var out []model.SkuRow
+	if h.Orchestrator != nil {
+		out = h.Orchestrator.MatchSupplierRows(c.Request.Context(), supplier, req.Rows)
+	} else {
+		// Orchestrator 不可用时的降级: 统一当新品 (不匹配, matched_* 置空)
+		out = make([]model.SkuRow, 0, len(req.Rows))
+		for _, r := range req.Rows {
+			out = append(out, model.SkuRow{
+				RowID:      r.RowID,
+				Seq:        r.Seq,
+				ImageIndex: r.ImageIndex,
+				RawBarcode: r.RawBarcode,
+				RawName:    r.RawName,
+				RawQty:     r.RawQty,
+				Qty:        r.Qty,
+				UnitPrice:  r.UnitPrice,
+				IsDeleted:  r.IsDeleted,
+				Status:     "新品",
+				IsNew:      true,
+			})
+		}
 	}
 
 	c.JSON(200, gin.H{
