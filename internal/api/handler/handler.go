@@ -36,9 +36,9 @@ import (
 //   - 取代原半硬编码 + template 覆盖老路
 //   - 详见 docs/ocr-purchase-skill-architecture.md
 type Handler struct {
-	UploadDir   string
-	PublicBase  string
-	MaxUpload   int64 // bytes
+	UploadDir  string
+	PublicBase string
+	MaxUpload  int64 // bytes
 	Orchestrator *parser.Orchestrator // Phase A: 新增, OCR + Strategy + LLM 编排
 	Agent       *parseragent.Client   // 仅用于 Ping / GetDataSource (2026-09-02: cube 调用已收编到 BizExecutor)
 	BizExecutor *business.Executor    // 2026-09-02: cube 业务字段调用入口
@@ -53,6 +53,14 @@ type Handler struct {
 	AlertSvc    *purchasealert.Service
 	AgentRunner *agent.Runner
 	// Phase B+ (2026-09-03): 删 DefaultOcrModel/DefaultLlmModel 字段 (VLM 内部固定 glm-4v)
+}
+
+// uploaded 2026-09-04 提升到顶层 (供 runVLMAsync 接收)
+//   - multipart 上传文件的 bytes + header
+//   - 保留在 handler 内存, 异步 goroutine 跑 VLM 用
+type uploaded struct {
+	header *multipart.FileHeader
+	bytes  []byte
 }
 
 // ============== Health ==============
@@ -594,10 +602,6 @@ func (h *Handler) CreateSession(c *gin.Context) {
 	}
 
 	// 收集所有文件(多图): 优先 files[] 数组, 其次 files 多文件, 最后单图 file
-	type uploaded struct {
-		header *multipart.FileHeader
-		bytes  []byte
-	}
 	var uploads []uploaded
 
 	// 强制 parse multipart(不调的话, MultipartForm 为 nil, 拿不到 files map)
@@ -670,13 +674,12 @@ func (h *Handler) CreateSession(c *gin.Context) {
 		return
 	}
 
-	// 逐张图 OCR + 匹配, 合并 rows
+	// 逐张图写盘 + 立即建空 session (W4.1+2026-09-04 异步模式)
 	s := &model.Session{
 		ID:           id,
 		SupplierName: supplier,
 		Mode:         model.ModePurchase, // Phase A: 固定 purchase
 	}
-	var allRows []model.SkuRow
 	var imagePaths, imageURLs, imageHashes []string
 	for idx, u := range uploads {
 		ext := filepath.Ext(u.header.Filename)
@@ -697,51 +700,7 @@ func (h *Handler) CreateSession(c *gin.Context) {
 		} else {
 			imageURLs = append(imageURLs, fmt.Sprintf("/uploads/%s/%s", bucket, fileName))
 		}
-		// W4.1: 算每张图 hash, 用于后续 append 去重
 		imageHashes = append(imageHashes, store.HashImageBytes(u.bytes))
-
-		// 2026-09-04 修复: 客户端(企微浏览器/中间代理)ReadTimeout 60s 断开后,
-		//   c.Request.Context() 立即 canceled,但 VLM 调用用的是独立 http.Client
-		//   timeout 不会被 cancel 影响。如果不先看 ctx,客户端断了还继续调 BigModel
-		//   = 浪费 12-25s + ¥0.5-1 + 12 条数据落库失败。
-		//   先看 ctx: 已 cancel → 返 499 (No Content) 不浪费 VLM token。
-		if err := c.Request.Context().Err(); err != nil {
-			log.Printf("[CreateSession] 客户端提前断开 (idx=%d/%d supplier=%s ctx_err=%v), 跳过 VLM",
-				idx+1, len(uploads), supplier, err)
-			c.JSON(499, gin.H{"error": "client canceled before VLM: " + err.Error()})
-			return
-		}
-
-		// Phase A: 改用 Orchestrator (template_id / customPrompt 都不再需要, 走 strategy.body)
-		// Phase B+ (2026-09-03): VLM-only 模式
-		res, err := h.Orchestrator.Parse(c.Request.Context(), u.bytes, u.header.Filename,
-			supplier)
-		if err != nil {
-			// 2026-09-04 增强日志: 2026-09-04 线上事故发现 500 真正原因不是这里,但
-			//   当时没有 idx+supplier+img_size+err 完整上下文很难追
-			log.Printf("[CreateSession] Orchestrator.Parse 失败: idx=%d/%d supplier=%s img_size=%d err=%v",
-				idx+1, len(uploads), supplier, len(u.bytes), err)
-			c.JSON(500, gin.H{"error": fmt.Sprintf("VLM 第 %d 张失败: %s", idx+1, err.Error())})
-			return
-		}
-		// VLM 兜底后 rows=nil,记录一行让用户知道本次有几张图没解析出来
-		if len(res.Rows) == 0 {
-			log.Printf("[CreateSession] ⚠️ VLM 解析 0 条 (idx=%d/%d supplier=%s img_size=%d)",
-				idx+1, len(uploads), supplier, len(u.bytes))
-		}
-		// 续接 seq (从已有 max 续)
-		baseSeq := len(allRows)
-		rows := res.Rows
-		for i := range rows {
-			rows[i].Seq = baseSeq + i + 1
-			// W4.1: 标记本行属于第几张图 (0-based)
-			rows[i].ImageIndex = idx
-		}
-		allRows = append(allRows, rows...)
-		// 记录本次解析的 strategy_version (多图时取第一张的版本号)
-		if idx == 0 {
-			s.StrategyVersion = res.StrategyVersion
-		}
 	}
 
 	// 单图兼容字段(取第一张)
@@ -754,7 +713,7 @@ func (h *Handler) CreateSession(c *gin.Context) {
 		imageURL = imageURLs[0]
 	}
 
-	// 填充 s 剩余字段
+	// 填充 s 剩余字段 (rows=空, status=pending, VLM 后台跑完后 UpdateSessionRows 写入)
 	s.ImagePath = imagePath
 	s.ImageURL = imageURL
 	s.ImagePaths = imagePaths
@@ -762,55 +721,128 @@ func (h *Handler) CreateSession(c *gin.Context) {
 	s.ImageHashes = imageHashes
 	s.Source = source
 	s.Note = note
-	s.Rows = allRows
-	s.AnalysisStatus = "pending" // W4.1: 立即 pending, 后台跑分析
+	s.AnalysisStatus = "pending"
 
-	// 2026-09-04 修复: 客户端断开(企微 60s ReadTimeout)会让 c.Request.Context()
-	//   立即 canceled,但 VLM 12 条已经成功解析,数据不能丢。
-	//   关键路径 (Create / Get / enrich / AttachPlanQty) 必须 detach 客户端 ctx,
-	//   否则刚解析出的数据因为客户端早断而落库失败 = 重大事故。
-	//   保留 trace values,只去掉 cancel 链。
+	// 2026-09-04 关键改造: ctx timeout 跟 VLM 任务剥离
+	//   1) 立即 CreateSession(空 rows, status='pending') - detached ctx + 10s timeout
+	//      即使客户端 60s 断, 这一步也在 10s 内完成, session 立即进 DB
+	//   2) 启动 detached goroutine 跑 VLM, 用 context.Background() (不绑客户端 ctx)
+	//      客户端断不影响 VLM, VLM 跑完才 Update session.rows
+	//   3) 立即返 200 给客户端(可能已断, 走 ctx 检查跳过写响应)
 	writeCtx, writeCancel := context.WithTimeout(
-		context.WithoutCancel(c.Request.Context()), 15*time.Second)
+		context.WithoutCancel(c.Request.Context()), 10*time.Second)
 	defer writeCancel()
 
 	if err := h.Sessions.Create(writeCtx, s); err != nil {
-		// 2026-09-04 增强日志: 线上事故未确定 500 真因, 显式记 session_id + rows 数量 + err
-		log.Printf("[CreateSession] Sessions.Create 失败: session_id=%s supplier=%s rows=%d note=%q err=%v",
-			s.ID, s.SupplierName, len(s.Rows), s.Note, err)
+		log.Printf("[CreateSession] Sessions.Create 失败: session_id=%s supplier=%s err=%v",
+			s.ID, s.SupplierName, err)
 		c.JSON(500, gin.H{"error": "存库失败: " + err.Error()})
 		return
 	}
-	// 回填 row_id
-	if saved, err := h.Sessions.Get(writeCtx, id); err == nil && saved != nil {
-		s.Rows = saved.Rows
+	log.Printf("[CreateSession] session 已建库 (session_id=%s supplier=%s images=%d, VLM 后台跑)",
+		s.ID, s.SupplierName, len(uploads))
+
+	// 2026-09-04 启动 detached goroutine 跑 VLM (异步填充 rows)
+	//   关键: 用 context.Background() 而非 c.Request.Context(), 客户端断不影响 VLM
+	//   VLM 跑完 → UpdateSessionRows(rows, status='done')
+	//   失败 → UpdateSessionRows(rows=nil, status='failed')
+	if h.Orchestrator != nil {
+		go h.runVLMAsync(id, uploads, supplier, s.ImageHashes)
 	}
-	// 采购模式 + 有 restock 服务: 附加 plan_qty
-	if s.Mode == model.ModePurchase && h.RestockSvc != nil {
-		_ = h.RestockSvc.AttachPlanQtyToRows(writeCtx, s.SupplierName, s.Rows)
-	}
-	// 2026-09-03: 反查 hbpos t_bd_item_info, 把 barcode → item_no 写到 row.ItemNo
-	//   企业微信"复制"按钮要的就是 item_no, 不是条码; cube 失败也不阻塞
-	//
-	// 2026-09-04 改 fire-and-forget: cube 反查 14 条 ≈ 1s,但会阻塞响应 1s;
-	//   现在 detached ctx + 5s timeout 跑 goroutine, 主流程立即返 200。
-	//   失败/超时也不影响响应(下次 GET /sessions/{id} 会再 enrich 一次)。
-	h.enrichRowsWithItemNoAsync(id, s.Rows)
-	// W4.1: 异步触发策略分析 (立即返回, 不等 LLM)
-	if s.Mode == model.ModePurchase && h.AlertSvc != nil {
-		h.AlertSvc.StartAnalysisAsync(id, h.Sessions.Get)
-	}
-	// 2026-09-04 修复: 写响应前检测 ctx,客户端(企微浏览器 60s / 中间代理 30-40s)
-	//   已断时不再写 HTTP 200,避免出现 "write tcp ... i/o timeout" 错误日志。
-	//   关键:数据已落库 + 写响应时客户端 RST,会触发难看的错误日志但实际无害。
-	//   检测到 ctx canceled 直接 return, 客户端下次 H5 列表 GET /sessions/{id}
-	//   仍能拿到完整数据。
+
+	// enrichRowsWithItemNo 异步 (1s 内完成, 不阻塞响应)
+	// 注意: 此时 s.Rows 还是空, enrich 完会改 rows 但 UpdateSessionRows 跑完后才持久化
+	// 这里仅做 warm-up, 不写 DB
+	// 实际上 s.Rows=nil 走 enrich 是空操作, 跳过
+
+	// 异步触发策略分析 (现在还没 rows, 等 VLM 跑完再触发)
+	// 移到 runVLMAsync 里: VLM 跑完后 StartAnalysisAsync
+
+	// 写响应前检测 ctx
 	if err := c.Request.Context().Err(); err != nil {
-		log.Printf("[CreateSession] 客户端在写响应前已断开 (session_id=%s, rows=%d, ctx_err=%v), 数据已落库, 跳过写响应",
-			s.ID, len(s.Rows), err)
+		log.Printf("[CreateSession] 客户端在写响应前已断开 (session_id=%s, ctx_err=%v), session 已建库, 跳过写响应",
+			s.ID, err)
 		return
 	}
 	c.JSON(200, s)
+}
+
+// runVLMAsync 2026-09-04 新增: detached goroutine 跑 VLM
+//
+//	- 跟客户端 ctx 100% 解耦 (用 context.Background())
+//	- 每张图依次跑 VLM + 匹配, 累加 rows
+//	- 跑完调用 h.Sessions.UpdateSessionRows 一次性写入 DB
+//	- 失败: 写 status='failed', rows=空 (用户列表能看到 session 状态)
+//	- enrichRowsWithItemNo 移到 VLM 完成后 (rows 已有)
+//	- StartAnalysisAsync 移到 VLM 完成后 (alert 需要 rows)
+func (h *Handler) runVLMAsync(sessionID string, uploads []uploaded, supplier string, imageHashes []string) {
+	// detached ctx: VLM 跑多久都行, 不受客户端影响
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+
+	var allRows []model.SkuRow
+	var strategyVersion int
+	for idx, u := range uploads {
+		log.Printf("[runVLMAsync] 跑 VLM idx=%d/%d (session_id=%s supplier=%s img_size=%d)",
+			idx+1, len(uploads), sessionID, supplier, len(u.bytes))
+		res, err := h.Orchestrator.Parse(ctx, u.bytes, u.header.Filename, supplier)
+		if err != nil {
+			log.Printf("[runVLMAsync] Orchestrator.Parse 失败: idx=%d session_id=%s err=%v",
+				idx+1, sessionID, err)
+			// 不立即失败,继续跑后面 idx; 最后统一 Update 失败状态
+			continue
+		}
+		if len(res.Rows) == 0 {
+			log.Printf("[runVLMAsync] ⚠️ VLM 解析 0 条 (idx=%d session_id=%s)",
+				idx+1, sessionID)
+		}
+		baseSeq := len(allRows)
+		rows := res.Rows
+		for i := range rows {
+			rows[i].Seq = baseSeq + i + 1
+			rows[i].ImageIndex = idx
+		}
+		allRows = append(allRows, rows...)
+		if idx == 0 {
+			strategyVersion = res.StrategyVersion
+		}
+	}
+
+	// 构造完整 session 准备 Update
+	s, err := h.Sessions.Get(ctx, sessionID)
+	if err != nil || s == nil {
+		log.Printf("[runVLMAsync] 拉 session 失败: session_id=%s err=%v", sessionID, err)
+		return
+	}
+	s.Rows = allRows
+	s.StrategyVersion = strategyVersion
+
+	// Update 到 DB
+	status := "done"
+	if len(allRows) == 0 {
+		status = "failed" // 失败: VLM 全 0 rows
+	}
+	if err := h.Sessions.UpdateSessionRows(ctx, sessionID, s, status); err != nil {
+		log.Printf("[runVLMAsync] UpdateSessionRows 失败: session_id=%s err=%v", sessionID, err)
+		return
+	}
+	log.Printf("[runVLMAsync] session 已更新 (session_id=%s rows=%d status=%s)",
+		sessionID, len(allRows), status)
+
+	// enrichRowsWithItemNo 异步 (rows 已有, 这次真能 enrich 成功)
+	// 用 detached 5s ctx 跑, 失败/超时不影响
+	rowsCopy := make([]model.SkuRow, len(s.Rows))
+	copy(rowsCopy, s.Rows)
+	go func() {
+		bgCtx, c2 := context.WithTimeout(context.Background(), 5*time.Second)
+		defer c2()
+		h.enrichRowsWithItemNo(bgCtx, rowsCopy)
+	}()
+
+	// alert 异步分析
+	if s.Mode == model.ModePurchase && h.AlertSvc != nil {
+		h.AlertSvc.StartAnalysisAsync(sessionID, h.Sessions.Get)
+	}
 }
 
 func (h *Handler) ListSessions(c *gin.Context) {

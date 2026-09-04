@@ -19,7 +19,6 @@ import (
 	"fmt"
 	"log"
 	"regexp"
-	"time"
 
 	"github.com/tinkler/collect-ai/internal/agent/skill"
 	"github.com/tinkler/collect-ai/internal/model"
@@ -145,17 +144,14 @@ func (o *Orchestrator) Parse(ctx context.Context, imgBytes []byte, fileName, sup
 
 	// 4) 调 VLM 多模态
 	//
-	// 2026-09-04 修复: 给 VLM 套 25s detached ctx (WithoutCancel + WithTimeout),
-	//   避免 BigModel 排队 30-60s 把整体响应拖到 40s+, 客户端 60s timeout 早断。
-	//   关键: detached = 客户端断/取消不影响 VLM, 只看 25s 硬上限。
-	//   25s 超时 → 返回 ctx.DeadlineExceeded, 走 fallback rows=nil,
-	//     handler 那边检测到后返 "pending" status + 写库空 rows,
-	//     后台 goroutine 拿回结果再 Update session.analysis_status + rows
-	//   注: fallback 路径(VLM 报错/JSON 解析失败)返回 res+nil 是当前行为,
-	//     超时是新增的 err 路径(单独走 4b 分支),跟普通 err 一致兜底
-	vlmCtx, vlmCancel := context.WithTimeout(context.WithoutCancel(ctx), 25*time.Second)
-	defer vlmCancel()
-	vlmRes, err := o.vlm.ChatWithImageCtx(vlmCtx, sysPrompt, "", o.vlmModel, imgBytes, fileName)
+	// 2026-09-04 用户决策: ctx timeout 跟任务剥离 (从 handler 透传过来已是 detached bg ctx)
+	//   旧: 25s detached ctx timeout (避免 VLM 慢导致客户端 60s 早断)
+	//   新: 跟客户端断连完全解耦, 用 context.Background() 让 VLM 跑完为止
+	//   配合 handler 的"先 CreateSession(空 rows) 再 goroutine 跑 VLM"模式:
+	//     - 客户端 60s 断后, session 已在 DB, 用户列表刷新就能看到
+	//     - VLM 后台继续跑, 完成后 Update session.rows + status='done'
+	//   风险: VLM 排队 5 分钟, session 一直 pending. 用户能接受
+	vlmRes, err := o.vlm.ChatWithImageCtx(ctx, sysPrompt, "", o.vlmModel, imgBytes, fileName)
 	if err != nil {
 		log.Printf("[orch] VLM 失败, fallback 启发式: %v", err)
 		res.Rows = o.heuristicMatch(ctx, imgBytes, fileName, supplier)

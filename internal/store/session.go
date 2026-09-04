@@ -182,6 +182,59 @@ func (r *SessionRepo) ListSummaries(ctx context.Context, supplier string, from t
 	return out, rows.Err()
 }
 
+// UpdateSessionRows 2026-09-04 异步 VLM 模式 (新):
+//   - 删 session 关联的所有 parse_row
+//   - 插新的 parse_row
+//   - 更新 parse_session 的 analysis_status, raw_ocr_json, updated_at
+//   整体在一个事务里, 失败时回滚
+//
+// 用法: handler 立即 CreateSession(空 rows, status='pending'),
+//   后台 goroutine 跑 VLM, 完成后调本方法一次性写入 rows + 改 status='done'
+func (r *SessionRepo) UpdateSessionRows(ctx context.Context, sessionID string, s *model.Session, status string) error {
+	if s == nil || s.ID != sessionID {
+		return fmt.Errorf("sessionID 不匹配")
+	}
+
+	rawOCR, _ := json.Marshal(s.Rows)
+
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+
+	// 1) 删旧 rows
+	if _, err := tx.Exec(ctx, "DELETE FROM parse_row WHERE session_id = $1", sessionID); err != nil {
+		return fmt.Errorf("delete old rows: %w", err)
+	}
+
+	// 2) 插新 rows
+	for _, row := range s.Rows {
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO parse_row
+			(session_id, seq, image_index, raw_barcode, raw_name, raw_qty, matched_barcode, matched_name, matched_supp, matched_src, qty, unit_price, status, is_new, stock_qty, stock_diff, stock_mismatch, is_deleted)
+			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)
+		`,
+			sessionID, row.Seq, row.ImageIndex,
+			nullStr(row.RawBarcode), nullStr(row.RawName), nullStr(row.RawQty),
+			nullStr(row.MatchedBarcode), nullStr(row.MatchedName), nullStr(row.MatchedSupp), nullStr(row.MatchedSrc),
+			row.Qty, row.UnitPrice, nullStr(row.Status), row.IsNew, row.StockQty, row.StockDiff, row.StockMismatch, row.IsDeleted); err != nil {
+			return fmt.Errorf("insert row %d: %w", row.Seq, err)
+		}
+	}
+
+	// 3) 更新 session 状态 + raw_ocr_json + updated_at
+	if _, err := tx.Exec(ctx, `
+		UPDATE parse_session
+		SET analysis_status = $2, raw_ocr_json = $3, updated_at = NOW()
+		WHERE id = $1
+	`, sessionID, status, rawOCR); err != nil {
+		return fmt.Errorf("update session: %w", err)
+	}
+
+	return tx.Commit(ctx)
+}
+
 // UpdateRow 改某行 (Patch)
 func (r *SessionRepo) UpdateRow(ctx context.Context, sessionID string, rowID int64, patch map[string]any) error {
 	if len(patch) == 0 {

@@ -1,21 +1,19 @@
 // Package bigmodel - VlmClient 多模态直读图 (Phase B+ 2026-09-03)
 //
-// 取代 OCR + 文本 LLM 链路:
+//	取代 OCR + 文本 LLM 链路:
 //
 //	旧: image → BigModel OCR (hand_write) → text → GLM-4-flash → JSON
 //	新: image → GLM-4V (多模态) → JSON 直接出
 //
-// 设计:
-//   - 同 endpoint (chat/completions), 只是 content 用 image_url 多模态
-//   - 支持任意模型 (glm-4v / glm-4v-plus), 默认 glm-4v
-//   - 直接返 string (JSON 内容), 解析由调用方用 ParseLlmJson
-//   - 接口跟 LlmClient 保持风格一致 (model 每次传, 客户端无状态)
+//	设计:
+//	  - 同 endpoint (chat/completions), 只是 content 用 image_url 多模态
+//	  - 支持任意模型 (glm-4v / glm-4v-plus), 默认 glm-4v
+//	  - 直接返 string (JSON 内容), 解析由调用方用 ParseLlmJson
+//	  - 接口跟 LlmClient 保持风格一致 (model 每次传, 客户端无状态)
 //
-// 性能参考 (e2e 2026-09-03 验证):
-//   - prompt tokens: 3399 (固定)
-//   - completion: 500-800 / 图
-//   - 耗时: 12-25s / 图
-//   - 准确性: 13 位 EAN-13 barcode 100%, qty 100%
+//	2026-09-04 改造:
+//	  - 去掉图片压缩 (shrinkForVLM / nearestNeighborScale 已删除, 改回原图直传)
+//	  - 加 ctx 透传 (ChatWithImageCtx), 让 caller 用 detached bg ctx 跟客户端断连解耦
 package bigmodel
 
 import (
@@ -24,8 +22,6 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
-	"image"
-	"image/jpeg"
 	"io"
 	"log"
 	"net/http"
@@ -36,69 +32,33 @@ import (
 
 // VlmClient BigModel GLM-4V 多模态
 type VlmClient struct {
-	apiKey   string
-	baseURL  string
-	timeout  time.Duration
-	language string // 默认 "CHN_ENG" (GLM-4V 自动处理)
-	// maxTokens 单次响应 token 上限。
-	// BigModel GLM-4V 限制 [1, 2048],2026-09-04 线上事故发现 1024 不足以覆盖
-	// 多行(>15 行)供货单,响应会被截断 → finish_reason="length" → JSON 解析失败。
-	// 默认提到 2048 = BigModel 硬上限,无法再 retry 提升;只能让 orchestrator
-	// 检测到 length 后用启发式兜底,或换 glm-4v-plus(更贵但更准)。
+	baseURL   string
+	apiKey    string
 	maxTokens int
+	timeout   time.Duration // http.Client.Timeout 兜底
 }
 
+// NewVlmClient 工厂
+//   - timeoutSec: http.Client 硬上限 (60s) 兜底,ctx 可由 caller 自行加 timeout
+//   - maxTokens: 2026-09-04 起固定 2048 (BigModel GLM-4V 硬上限)
 func NewVlmClient(apiKey, baseURL string, timeoutSec int) *VlmClient {
 	if baseURL == "" {
 		baseURL = "https://open.bigmodel.cn/api/paas/v4"
 	}
+	if timeoutSec <= 0 {
+		timeoutSec = 60
+	}
 	return &VlmClient{
-		apiKey:    apiKey,
 		baseURL:   baseURL,
+		apiKey:    apiKey,
+		maxTokens: 2048,
 		timeout:   time.Duration(timeoutSec) * time.Second,
-		maxTokens: 2048, // GLM-4V 硬上限
 	}
 }
 
-const vlmDefaultModel = "glm-4v"
-
-// SetMaxTokens 覆盖默认 max_tokens(只用于测试/特殊场景,生产建议保持 2048)
-func (c *VlmClient) SetMaxTokens(n int) {
-	if n > 0 && n <= 2048 {
-		c.maxTokens = n
-	}
-}
-
-// vlmMessage 多模态 chat 消息
-type vlmMessage struct {
-	Role    string       `json:"role"`
-	Content []vlmContent `json:"content"`
-}
-
-type vlmContent struct {
-	Type     string       `json:"type"`
-	Text     string       `json:"text,omitempty"`
-	ImageURL *vlmImageURL `json:"image_url,omitempty"`
-}
-
-type vlmImageURL struct {
-	URL string `json:"url"`
-}
-
-// vlmRequest 多模态 chat 请求
-type vlmRequest struct {
-	Model       string       `json:"model"`
-	Messages    []vlmMessage `json:"messages"`
-	Temperature float64      `json:"temperature,omitempty"`
-	TopP        float64      `json:"top_p,omitempty"`
-	MaxTokens   int          `json:"max_tokens,omitempty"`
-}
-
-// VlmResult VLM 响应结果
-//   - Content: LLM 文本响应(期望 JSON 字符串)
-//   - FinishReason: "stop"=正常结束, "length"=max_tokens 截断(响应不全),
-//     "content_filter"=被安全过滤, "tool_calls"=调用工具(不应该出现)
-//   - Truncated: FinishReason=="length" 的便捷字段
+// VlmResult 单次调用的结果
+//
+//	- Truncated: FinishReason=="length" 的便捷字段
 type VlmResult struct {
 	Content      string
 	FinishReason string
@@ -116,7 +76,7 @@ type VlmResult struct {
 //   - 由于 GLM-4V max_tokens 上限 2048,retry 仍可能截断
 //   - 重试后仍截断则返回最后一次结果(让 caller 决定如何降级)
 //
-// 2026-09-04 第二次修复: ctx 透传。旧实现 http.NewRequest 不传 ctx, 导致
+// 2026-09-04 改造: ctx 透传。旧实现 http.NewRequest 不传 ctx, 导致
 //   Orchestrator 设的 25s timeout 无法生效,BigModel 排队 30-60s 也得等。
 //   新增 ChatWithImageCtx,http.NewRequestWithContext 把 ctx 串进去,客户端断/超时
 //   能立即中断请求不再空等。
@@ -127,8 +87,8 @@ func (c *VlmClient) ChatWithImage(sysPrompt, userPrompt, model string, imageByte
 // ChatWithImageCtx 带 ctx 版本的 ChatWithImage。
 //   - ctx 透传到 http.NewRequestWithContext + httpClient.Do,客户端断开/超时
 //     能立即中断 BigModel 调用,不再空等 30-60s
-//   - ctx 仍然由调用方控制(典型用法: context.WithoutCancel(reqCtx) + 25s timeout,
-//     detach 客户端断连但加服务端兜底)
+//   - ctx 仍然由调用方控制(典型用法: context.Background() 让 VLM 跟客户端断连完全解耦,
+//     或 context.WithTimeout 加服务端兜底上限)
 func (c *VlmClient) ChatWithImageCtx(ctx context.Context, sysPrompt, userPrompt, model string, imageBytes []byte, imageName string) (VlmResult, error) {
 	if c == nil {
 		return VlmResult{}, fmt.Errorf("vlm client 未初始化")
@@ -152,21 +112,10 @@ func (c *VlmClient) ChatWithImageCtx(ctx context.Context, sysPrompt, userPrompt,
 		mime = "image/bmp"
 	}
 
-	// 2026-09-04 优化: 上传大图(2.5MB / 900KB 实测)会让 BigModel GLM-4V 慢到 43s
-	//   第一次响应还 max_tokens=2048 触顶截断(12 条),retry 又 18s,整链 61s
-	//   踩爆企微浏览器 60s ReadTimeout → 客户端断开 → ctx canceled 落库失败。
-	//   优化:jpg/png > 1MB 或长边 > 1600px 时,先 resize 到长边 1280px JPEG q=80。
-	//     - 2.5MB → 150-250KB,base64 体积小 12x
-	//     - BigModel 解码快 10x,LLM 推理快 2-3x (e2e 实测)
-	//     - 12 条不再截断,无需 retry
-	//     - 近邻采样对印刷体供货单够清晰,不破坏 OCR 文字
-	vlmBytes, vlmMime := shrinkForVLM(imageBytes, mime)
-	if shrunk := len(imageBytes) - len(vlmBytes); shrunk > 0 {
-		log.Printf("[vlm] 图片已压缩: %d → %d bytes (省 %d KB, mime=%s)",
-			len(imageBytes), len(vlmBytes), shrunk/1024, vlmMime)
-	}
-	imageBytes = vlmBytes
-	mime = vlmMime
+	// 2026-09-04 用户决策: 去掉图片压缩, 改回原图直传
+	//   之前压缩(2.5MB -> 200KB)虽能加速 BigModel,但供货单 12->17 虚增问题在压缩前后一样
+	//   说明 VLM 的虚增不是压缩导致,而是 VLM 自身误识(可能跟"清晰度"无关,跟"特征"有关)
+	//   改回原图:保留全部信息,后续再调优 VLM/换模型
 
 	// base64 data URL
 	b64 := base64.StdEncoding.EncodeToString(imageBytes)
@@ -181,12 +130,10 @@ func (c *VlmClient) ChatWithImageCtx(ctx context.Context, sysPrompt, userPrompt,
 	}
 
 	// messages: [system, user(image + text)]
-	// 跟 OpenAI 多模态一致, system prompt 单独一条
 	msgs := []vlmMessage{
 		{Role: "user", Content: contents},
 	}
 	if sysPrompt != "" {
-		// 插到 user 前面
 		msgs = []vlmMessage{
 			{Role: "system", Content: []vlmContent{{Type: "text", Text: sysPrompt}}},
 			{Role: "user", Content: contents},
@@ -198,14 +145,10 @@ func (c *VlmClient) ChatWithImageCtx(ctx context.Context, sysPrompt, userPrompt,
 		Messages:    msgs,
 		Temperature: 0.1,
 		TopP:        0.7,
-		// 2026-09-04: 1024→2048(BigModel GLM-4V 硬上限)
-		// 单图供货单 >15 行时会触顶 1024,导致响应被截断 → JSON 解析失败
-		MaxTokens: c.maxTokens,
+		MaxTokens:   c.maxTokens,
 	}
 	body, _ := json.Marshal(req)
 
-	// 2026-09-04: 截断时自动 retry 一次
-	// 偶发场景:同样的 prompt+image 重跑一次,可能不再截断(LLM 采样波动)
 	var lastResult VlmResult
 	for attempt := 1; attempt <= 2; attempt++ {
 		result, err := c.doChat(ctx, body, attempt)
@@ -217,11 +160,9 @@ func (c *VlmClient) ChatWithImageCtx(ctx context.Context, sysPrompt, userPrompt,
 			return result, nil
 		}
 		if attempt == 1 {
-			// 第一次截断 → 重试一次(同 max_tokens,只是 LLM 重新采样)
 			log.Printf("[vlm] 响应被截断 (finish_reason=length), retry 一次 (max_tokens=%d)", c.maxTokens)
 		}
 	}
-	// 两次都截断,返回最后一次结果(由 caller 决定如何降级)
 	log.Printf("[vlm] 重试后仍截断, 返最后结果 (max_tokens=%d, content_len=%d)", c.maxTokens, len(lastResult.Content))
 	return lastResult, nil
 }
@@ -229,7 +170,7 @@ func (c *VlmClient) ChatWithImageCtx(ctx context.Context, sysPrompt, userPrompt,
 // doChat 实际发一次 HTTP 请求
 //
 // 2026-09-04 修复: ctx 透传。新版用 http.NewRequestWithContext + httpClient.Do(ctx),
-//   Orchestrator 包的 25s timeout 真正生效,BigModel 排队超时能立即中断。
+//   Orchestrator 包的 timeout 真正生效,BigModel 排队超时能立即中断。
 //   旧实现 http.NewRequest 不传 ctx,timeout 只能等 http.Client.Timeout 兜底,
 //   客户端断连无法提前中断。
 func (c *VlmClient) doChat(ctx context.Context, body []byte, attempt int) (VlmResult, error) {
@@ -240,8 +181,7 @@ func (c *VlmClient) doChat(ctx context.Context, body []byte, attempt int) (VlmRe
 	httpReq.Header.Set("Authorization", "Bearer "+c.apiKey)
 	httpReq.Header.Set("Content-Type", "application/json")
 
-	// 客户端 timeout 给个硬上限 (60s),ctx 25s timeout 优先 (会先 cancel)
-	//   双保险: ctx 25s 触发时, httpClient.Do 立即中断请求
+	// 客户端 timeout 给个硬上限 (60s),ctx 可由 caller 自行加 timeout
 	httpClient := &http.Client{Timeout: 60 * time.Second}
 	resp, err := httpClient.Do(httpReq)
 	if err != nil {
@@ -251,7 +191,7 @@ func (c *VlmClient) doChat(ctx context.Context, body []byte, attempt int) (VlmRe
 	respBytes, _ := io.ReadAll(resp.Body)
 
 	if resp.StatusCode != http.StatusOK {
-		return VlmResult{}, fmt.Errorf("VLM HTTP %d: %s", resp.StatusCode, truncate(string(respBytes), 400))
+		return VlmResult{}, fmt.Errorf("VLM HTTP %d: %s", resp.StatusCode, vlmTruncate(string(respBytes), 400))
 	}
 
 	var parsed struct {
@@ -263,10 +203,10 @@ func (c *VlmClient) doChat(ctx context.Context, body []byte, attempt int) (VlmRe
 		} `json:"choices"`
 	}
 	if err := json.Unmarshal(respBytes, &parsed); err != nil {
-		return VlmResult{}, fmt.Errorf("VLM parse: %w; body=%s", err, truncate(string(respBytes), 200))
+		return VlmResult{}, fmt.Errorf("VLM parse: %w; body=%s", err, vlmTruncate(string(respBytes), 200))
 	}
 	if len(parsed.Choices) == 0 {
-		return VlmResult{}, fmt.Errorf("VLM 无 choices: %s", truncate(string(respBytes), 200))
+		return VlmResult{}, fmt.Errorf("VLM 无 choices: %s", vlmTruncate(string(respBytes), 200))
 	}
 
 	choice := parsed.Choices[0]
@@ -278,100 +218,37 @@ func (c *VlmClient) doChat(ctx context.Context, body []byte, attempt int) (VlmRe
 	return result, nil
 }
 
-// shrinkForVLM 把给 VLM 的图压缩到合适体积,避免大图触发 GLM-4V 慢响应 + max_tokens 截断
-//
-//	策略:
-//	  - 仅 jpg/jpeg 走 resize(re-encode 会重新压缩;png 转 jpeg 同样收益)
-//	  - 文件 < 512KB 且长边 ≤ 1600px: 不动,直接返
-//	  - 否则: 长边缩到 1280px(短边按比例),JPEG quality 80
-//	  - 用最近邻 (NearestNeighbor) 采样,无第三方依赖;对印刷体供货单够清晰
-//	  - webp/bmp/gif 透传(实际供货单都是 jpg,这些场景暂不优化)
-//
-// 性能收益 (e2e 2026-09-04 验证):
-//   - 2.5MB 原图 → 200KB,BigModel 处理 12-25s (单图实测稳定)
-//   - 12 条供货单 max_tokens=2048 不再触顶截断
-//   - 不引入 x/image / imaging 第三方依赖
-func shrinkForVLM(in []byte, mime string) ([]byte, string) {
-	const (
-		skipBytes    = 512 * 1024 // < 512KB 不动
-		skipMaxDim   = 1600       // 长边 ≤ 1600px 不动
-		targetMaxDim = 1280
-		jpegQuality  = 80
-	)
-	// 只优化 jpg/jpeg/png (png 也按 jpeg 重编,体积更小)
-	lowerMime := strings.ToLower(mime)
-	isJpeg := lowerMime == "image/jpeg" || lowerMime == "image/jpg"
-	isPng := lowerMime == "image/png"
-	if !isJpeg && !isPng {
-		return in, mime
-	}
-	// 小图直接跳过
-	if len(in) < skipBytes {
-		// 但长边过大的图(手机拍 4000x3000 几千像素)还是该缩,因为 base64 体积爆炸
-		cfg, _, err := image.DecodeConfig(bytes.NewReader(in))
-		if err != nil || (cfg.Width <= skipMaxDim && cfg.Height <= skipMaxDim) {
-			return in, mime
-		}
-	}
+// ----- internal types -----
 
-	// decode
-	src, _, err := image.Decode(bytes.NewReader(in))
-	if err != nil {
-		log.Printf("[vlm] shrinkForVLM decode 失败 (mime=%s, %d bytes), 用原图: %v",
-			mime, len(in), err)
-		return in, mime
-	}
+const vlmDefaultModel = "glm-4v"
 
-	bounds := src.Bounds()
-	w, h := bounds.Dx(), bounds.Dy()
-	if w <= targetMaxDim && h <= targetMaxDim {
-		// 已经够小
-		return in, mime
-	}
-
-	// 按比例缩到长边 targetMaxDim
-	var newW, newH int
-	if w >= h {
-		newW = targetMaxDim
-		newH = h * targetMaxDim / w
-	} else {
-		newH = targetMaxDim
-		newW = w * targetMaxDim / h
-	}
-	if newW < 1 {
-		newW = 1
-	}
-	if newH < 1 {
-		newH = 1
-	}
-
-	dst := image.NewRGBA(image.Rect(0, 0, newW, newH))
-	// 最近邻缩放 (stdlib image/draw 没有 NearestNeighbor Kernel, 手写 10 行;
-	//   对印刷体供货单够清晰, 不引入 x/image 依赖)
-	nearestNeighborScale(dst, src)
-
-	var buf bytes.Buffer
-	if err := jpeg.Encode(&buf, dst, &jpeg.Options{Quality: jpegQuality}); err != nil {
-		log.Printf("[vlm] shrinkForVLM encode 失败 (mime=%s, %d bytes), 用原图: %v",
-			mime, len(in), err)
-		return in, mime
-	}
-	return buf.Bytes(), "image/jpeg"
+type vlmContent struct {
+	Type     string       `json:"type"`
+	Text     string       `json:"text,omitempty"`
+	ImageURL *vlmImageURL `json:"image_url,omitempty"`
 }
 
-// nearestNeighborScale 最近邻缩放: dst 的每个像素取 src 对应位置的颜色
-//   stdlib image/draw 没暴露 NearestNeighbor Kernel (要 x/image 才有),
-//   这里手写一份,只服务于 shrinkForVLM 一个调用点。
-func nearestNeighborScale(dst *image.RGBA, src image.Image) {
-	db := dst.Bounds()
-	sb := src.Bounds()
-	sw, sh := sb.Dx(), sb.Dy()
-	dw, dh := db.Dx(), db.Dy()
-	for y := 0; y < dh; y++ {
-		sy := sb.Min.Y + y*sh/dh
-		for x := 0; x < dw; x++ {
-			sx := sb.Min.X + x*sw/dw
-			dst.Set(db.Min.X+x, db.Min.Y+y, src.At(sx, sy))
-		}
+type vlmImageURL struct {
+	URL string `json:"url"`
+}
+
+type vlmMessage struct {
+	Role    string       `json:"role"`
+	Content []vlmContent `json:"content"`
+}
+
+type vlmRequest struct {
+	Model       string        `json:"model"`
+	Messages    []vlmMessage  `json:"messages"`
+	Temperature float64       `json:"temperature"`
+	TopP        float64       `json:"top_p"`
+	MaxTokens   int           `json:"max_tokens"`
+}
+
+// vlmTruncate 截断长字符串 (避免 log 爆炸)
+func vlmTruncate(s string, max int) string {
+	if len(s) <= max {
+		return s
 	}
+	return s[:max] + "...(truncated)"
 }
