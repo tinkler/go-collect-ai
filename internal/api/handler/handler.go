@@ -207,6 +207,10 @@ func (h *Handler) Parse(c *gin.Context) {
 		c.JSON(400, gin.H{"error": "supplier 必填 (query ?supplier=xxx)"})
 		return
 	}
+	if h.Orchestrator == nil {
+		c.JSON(503, gin.H{"error": "解析服务未配置或未就绪 (引擎2 DEEPSEEK_API_KEY 缺失?), 请联系管理员查看服务启动日志"})
+		return
+	}
 
 	file, header, err := c.Request.FormFile("file")
 	if err != nil {
@@ -421,6 +425,9 @@ func (h *Handler) AppendImages(c *gin.Context) {
 	addedRows, skippedHashes, newHashes, err := h.Sessions.AppendImages(
 		c.Request.Context(), id, candidates,
 		func(hash, fileName string, imgBytes []byte) ([]model.SkuRow, error) {
+			if h.Orchestrator == nil {
+				return nil, fmt.Errorf("解析服务未配置或未就绪 (引擎2 DEEPSEEK_API_KEY 缺失?)")
+			}
 			res, err := h.Orchestrator.Parse(c.Request.Context(), imgBytes, fileName, supplier)
 			if err != nil {
 				return nil, err
@@ -586,6 +593,15 @@ func (h *Handler) CreateSession(c *gin.Context) {
 		return
 	}
 
+	// 2026-09-04: 双引擎 Orchestrator 未就绪时必须 fail fast
+	//   常见原因: DEEPSEEK_API_KEY 未配 → NewOrchestrator 失败 → h.Orchestrator == nil
+	//   旧实现建库后静默跳过后台 goroutine, session 永远卡 pending/0 行且无任何错误日志
+	if h.Orchestrator == nil {
+		log.Printf("[CreateSession] Orchestrator 未就绪, 拒绝创建 session (请检查服务启动日志中 [main] Orchestrator 构造失败 原因, 通常是 DEEPSEEK_API_KEY 未配置)")
+		c.JSON(503, gin.H{"error": "解析服务未配置或未就绪 (引擎2 DEEPSEEK_API_KEY 缺失?), 请联系管理员查看服务启动日志"})
+		return
+	}
+
 	// 收集所有文件(多图): 优先 files[] 数组, 其次 files 多文件, 最后单图 file
 	var uploads []uploaded
 
@@ -727,13 +743,12 @@ func (h *Handler) CreateSession(c *gin.Context) {
 	log.Printf("[CreateSession] session 已建库 (session_id=%s supplier=%s images=%d, VLM 后台跑)",
 		s.ID, s.SupplierName, len(uploads))
 
-	// 2026-09-04 启动 detached goroutine 跑 VLM (异步填充 rows)
-	//   关键: 用 context.Background() 而非 c.Request.Context(), 客户端断不影响 VLM
+	// 2026-09-04 启动 detached goroutine 跑双引擎 (异步填充 rows)
+	//   关键: 用 context.Background() 而非 c.Request.Context(), 客户端断不影响
 	//   VLM 跑完 → UpdateSessionRows(rows, status='done')
 	//   失败 → UpdateSessionRows(rows=nil, status='failed')
-	if h.Orchestrator != nil {
-		go h.runVLMAsync(id, uploads, supplier, s.ImageHashes)
-	}
+	//   h.Orchestrator != nil 已在函数入口校验
+	go h.runVLMAsync(id, uploads, supplier, s.ImageHashes)
 
 	// enrichRowsWithItemNo 异步 (1s 内完成, 不阻塞响应)
 	// 注意: 此时 s.Rows 还是空, enrich 完会改 rows 但 UpdateSessionRows 跑完后才持久化
@@ -764,6 +779,18 @@ func (h *Handler) runVLMAsync(sessionID string, uploads []uploaded, supplier str
 	// detached ctx: VLM 跑多久都行, 不受客户端影响
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
+
+	// 2026-09-04: goroutine panic 兜底 — 否则整个进程崩溃, systemd 重启后该 session 永远卡 pending
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("[runVLMAsync] ❌ panic: session_id=%s err=%v", sessionID, r)
+			failCtx, failCancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer failCancel()
+			if s, e := h.Sessions.Get(failCtx, sessionID); e == nil && s != nil {
+				_ = h.Sessions.UpdateSessionRows(failCtx, sessionID, s, "failed")
+			}
+		}
+	}()
 
 	var allRows []model.SkuRow
 	var strategyVersion int

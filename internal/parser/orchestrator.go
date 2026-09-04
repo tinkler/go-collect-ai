@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"log"
 	"strings"
+	"time"
 
 	"github.com/tinkler/collect-ai/internal/agent/skill"
 	"github.com/tinkler/collect-ai/internal/model"
@@ -103,15 +104,17 @@ func (o *Orchestrator) Parse(ctx context.Context, imgBytes []byte, fileName, sup
 	// 1) 引擎1: 智谱 prime-sync 文件解析 (印刷体/表格 → 纯文本)
 	//    失败不阻断: 引擎2 纯视觉照样能跑, 只是少了参考文本
 	ocrText := ""
+	t1 := time.Now()
 	ocrRes, err := o.ocr.FileParserSync(ctx, &glmocr.FileParserSyncRequest{
 		FileData: imgBytes,
 		FileName: fileName,
 	})
 	if err != nil {
-		log.Printf("[orch] ⚠️ 引擎1 FileParserSync 失败, 引擎2 纯视觉跑: %v", err)
+		log.Printf("[orch] ⚠️ 引擎1 FileParserSync 失败 (耗时 %s), 引擎2 纯视觉跑: %v", time.Since(t1).Round(time.Millisecond), err)
 	} else {
 		ocrText = strings.TrimSpace(ocrRes.Content)
-		log.Printf("[orch] 引擎1 prime-sync OK: content_len=%d status=%s", len(ocrText), ocrRes.Status)
+		log.Printf("[orch] 引擎1 prime-sync OK (耗时 %s): content_len=%d status=%s",
+			time.Since(t1).Round(time.Millisecond), len(ocrText), ocrRes.Status)
 	}
 	if len(ocrText) > ocrTextMaxLen {
 		ocrText = ocrText[:ocrTextMaxLen] + "...(truncated)"
@@ -131,10 +134,13 @@ func (o *Orchestrator) Parse(ctx context.Context, imgBytes []byte, fileName, sup
 	}
 
 	// 3) 引擎2: DeepSeek 视觉模型 (图 + prompt → 结构化 JSON)
+	t2 := time.Now()
 	content, err := o.visionChat(ctx, prompt, imgBytes, fileName)
 	if err != nil {
-		return nil, fmt.Errorf("引擎2 DeepSeek 视觉失败: %w", err)
+		return nil, fmt.Errorf("引擎2 DeepSeek 视觉失败 (耗时 %s): %w", time.Since(t2).Round(time.Millisecond), err)
 	}
+	log.Printf("[orch] 引擎2 DeepSeek 视觉 OK (耗时 %s, 响应 %d chars)",
+		time.Since(t2).Round(time.Millisecond), len(content))
 	preview := content
 	if len(preview) > 500 {
 		preview = preview[:500] + "..."

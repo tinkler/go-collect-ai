@@ -271,6 +271,9 @@ func main() {
 		//   引擎2 = DeepSeek 视觉模型 (图 + OCR 文本参考 → 结构化 JSON)
 		//   不再: SKU hints 注入 / SkuMatcher L1~L3 匹配 (全部行当新 SKU)
 		glmocrClient := glmocr.New(cfg.BigModelAPIKey, cfg.LlmTimeoutSec+60)
+		// 2026-09-04: 启动诊断 — 不回显 key 内容, 只看长度 (env 未读到时长度=0)
+		log.Printf("[main] 双引擎配置: BIGMODEL_API_KEY len=%d, DEEPSEEK_API_KEY len=%d, DEEPSEEK_BASE=%s, DEEPSEEK_VISION_MODEL=%s",
+			len(cfg.BigModelAPIKey), len(cfg.DeepseekAPIKey), cfg.DeepseekBase, cfg.DeepseekVisionModel)
 		orch, err := parser.NewOrchestrator(
 			glmocrClient,
 			cfg.DeepseekAPIKey, cfg.DeepseekBase, cfg.DeepseekVisionModel,

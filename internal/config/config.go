@@ -44,8 +44,8 @@ type Config struct {
 	LLMModel       string `mapstructure:"LLM_MODEL"` // glm-4-flash
 
 	// DeepSeek (2026-09-04 双引擎: 引擎2 视觉模型解析供货单)
-	DeepseekAPIKey     string `mapstructure:"DEEPSEEK_API_KEY"`
-	DeepseekBase       string `mapstructure:"DEEPSEEK_BASE"`
+	DeepseekAPIKey      string `mapstructure:"DEEPSEEK_API_KEY"`
+	DeepseekBase        string `mapstructure:"DEEPSEEK_BASE"`
 	DeepseekVisionModel string `mapstructure:"DEEPSEEK_VISION_MODEL"`
 
 	// cube-agent-server
@@ -85,9 +85,9 @@ type Config struct {
 
 	// ============== 鉴权 (2026-08-29) ==============
 	// JWT
-	JWTSecret         string `mapstructure:"JWT_SECRET"`
-	AccessTokenTTLSec int    `mapstructure:"ACCESS_TOKEN_TTL_SEC"`
-	RefreshTokenTTLSec int   `mapstructure:"REFRESH_TOKEN_TTL_SEC"`
+	JWTSecret          string `mapstructure:"JWT_SECRET"`
+	AccessTokenTTLSec  int    `mapstructure:"ACCESS_TOKEN_TTL_SEC"`
+	RefreshTokenTTLSec int    `mapstructure:"REFRESH_TOKEN_TTL_SEC"`
 
 	// Dev 模式开关 (启用 /auth/dev-login)
 	DevMode bool `mapstructure:"DEV_MODE"`
@@ -114,6 +114,8 @@ var leaves = []string{
 	"PORT", "UPLOAD_DIR", "MAX_UPLOAD_MB", "PUBLIC_BASE_URL",
 	"PG_HOST", "PG_PORT", "PG_USER", "PG_PASSWORD", "PG_DATABASE",
 	"BIGMODEL_API_KEY", "BIGMODEL_BASE", "OCR_MODEL", "LLM_MODEL",
+	// 双引擎引擎2 (2026-09-04): DeepSeek 视觉模型, 必须 BindEnv 否则 SetDefault("") 会压住 OS env
+	"DEEPSEEK_API_KEY", "DEEPSEEK_BASE", "DEEPSEEK_VISION_MODEL",
 	"AGENT_URL", "AGENT_TOKEN", "DATA_SOURCE",
 	"OCR_TIMEOUT_SEC", "LLM_TIMEOUT_SEC", "USE_LLM", "FUZZY_DISTANCE",
 	"MAX_CONCURRENT_PARSE", "RATE_LIMIT_WAIT_SEC",
