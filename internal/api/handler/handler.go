@@ -54,9 +54,9 @@ type Handler struct {
 	// Phase B+ (2026-09-03): 删 DefaultOcrModel/DefaultLlmModel 字段 (VLM 内部固定 glm-4v)
 }
 
-// uploaded 2026-09-04 提升到顶层 (供 runVLMAsync 接收)
+// uploaded 2026-09-04 提升到顶层 (供 runVLMSync 接收)
 //   - multipart 上传文件的 bytes + header
-//   - 保留在 handler 内存, 异步 goroutine 跑 VLM 用
+//   - 保留在 handler 内存, 同步解析用
 type uploaded struct {
 	header *multipart.FileHeader
 	bytes  []byte
@@ -723,7 +723,7 @@ func (h *Handler) CreateSession(c *gin.Context) {
 		imageURL = imageURLs[0]
 	}
 
-	// 填充 s 剩余字段 (rows=空, status=pending, VLM 后台跑完后 UpdateSessionRows 写入)
+	// 填充 s 剩余字段 (rows=空, status=pending, 同步解析完成后 UpdateSessionRows 写入)
 	s.ImagePath = imagePath
 	s.ImageURL = imageURL
 	s.ImagePaths = imagePaths
@@ -733,12 +733,11 @@ func (h *Handler) CreateSession(c *gin.Context) {
 	s.Note = note
 	s.AnalysisStatus = "pending"
 
-	// 2026-09-04 关键改造: ctx timeout 跟 VLM 任务剥离
+	// 2026-09-04 改为同步模式: 双引擎解析完成才响应
 	//   1) 立即 CreateSession(空 rows, status='pending') - detached ctx + 10s timeout
-	//      即使客户端 60s 断, 这一步也在 10s 内完成, session 立即进 DB
-	//   2) 启动 detached goroutine 跑 VLM, 用 context.Background() (不绑客户端 ctx)
-	//      客户端断不影响 VLM, VLM 跑完才 Update session.rows
-	//   3) 立即返 200 给客户端(可能已断, 走 ctx 检查跳过写响应)
+	//      即使客户端中途断开, session 建库这步也在 10s 内完成
+	//   2) 同步跑双引擎 VLM (detached ctx + 5min timeout, 客户端断不影响解析与落库)
+	//   3) 解析完 → UpdateSessionRows 落库 → 返回完整 session (含 rows)
 	writeCtx, writeCancel := context.WithTimeout(
 		context.WithoutCancel(c.Request.Context()), 10*time.Second)
 	defer writeCancel()
@@ -749,121 +748,92 @@ func (h *Handler) CreateSession(c *gin.Context) {
 		c.JSON(500, gin.H{"error": "存库失败: " + err.Error()})
 		return
 	}
-	log.Printf("[CreateSession] session 已建库 (session_id=%s supplier=%s images=%d, VLM 后台跑)",
+	log.Printf("[CreateSession] session 已建库 (session_id=%s supplier=%s images=%d, 开始同步解析)",
 		s.ID, s.SupplierName, len(uploads))
 
-	// 2026-09-04 启动 detached goroutine 跑双引擎 (异步填充 rows)
-	//   关键: 用 context.Background() 而非 c.Request.Context(), 客户端断不影响
-	//   VLM 跑完 → UpdateSessionRows(rows, status='done')
-	//   失败 → UpdateSessionRows(rows=nil, status='failed')
+	// 2026-09-04 同步跑双引擎: 解析完成才往下走
 	//   h.Orchestrator != nil 已在函数入口校验
-	go h.runVLMAsync(id, uploads, supplier, s.ImageHashes)
+	rows, parseStatus, strategyVersion := h.runVLMSync(id, uploads, supplier, s.ImageHashes)
+	s.Rows = rows
+	s.StrategyVersion = strategyVersion
+	s.AnalysisStatus = parseStatus
 
-	// enrichRowsWithItemNo 异步 (1s 内完成, 不阻塞响应)
-	// 注意: 此时 s.Rows 还是空, enrich 完会改 rows 但 UpdateSessionRows 跑完后才持久化
-	// 这里仅做 warm-up, 不写 DB
-	// 实际上 s.Rows=nil 走 enrich 是空操作, 跳过
+	// 解析结果落库 (detached ctx, 客户端断不影响落库)
+	updCtx, updCancel := context.WithTimeout(
+		context.WithoutCancel(c.Request.Context()), 10*time.Second)
+	defer updCancel()
+	if err := h.Sessions.UpdateSessionRows(updCtx, id, s, parseStatus); err != nil {
+		log.Printf("[CreateSession] UpdateSessionRows 失败: session_id=%s err=%v", id, err)
+	}
+	log.Printf("[CreateSession] 同步解析完成 (session_id=%s rows=%d status=%s)",
+		id, len(rows), parseStatus)
 
-	// 异步触发策略分析 (现在还没 rows, 等 VLM 跑完再触发)
-	// 移到 runVLMAsync 里: VLM 跑完后 StartAnalysisAsync
+	// alert 异步分析 (rows 已有, 分析本身仍走后台, 不阻塞响应)
+	if s.Mode == model.ModePurchase && h.AlertSvc != nil {
+		h.AlertSvc.StartAnalysisAsync(id, h.Sessions.Get)
+	}
 
-	// 写响应前检测 ctx
+	// 写响应前检测 ctx (解析期间客户端可能已断开, session 已落库)
 	if err := c.Request.Context().Err(); err != nil {
-		log.Printf("[CreateSession] 客户端在写响应前已断开 (session_id=%s, ctx_err=%v), session 已建库, 跳过写响应",
+		log.Printf("[CreateSession] 客户端在写响应前已断开 (session_id=%s, ctx_err=%v), session 已落库, 跳过写响应",
 			s.ID, err)
 		return
 	}
 	c.JSON(200, s)
 }
 
-// runVLMAsync 2026-09-04 新增: detached goroutine 跑 VLM
+// runVLMSync 2026-09-04 同步版 (原 runVLMAsync 后台 goroutine 版本已废):
 //
-//   - 跟客户端 ctx 100% 解耦 (用 context.Background())
+//   - 跟客户端 ctx 100% 解耦 (用 context.Background()), 客户端断不影响解析
 //   - 每张图依次跑 VLM + 匹配, 累加 rows
-//   - 跑完调用 h.Sessions.UpdateSessionRows 一次性写入 DB
-//   - 失败: 写 status='failed', rows=空 (用户列表能看到 session 状态)
-//   - enrichRowsWithItemNo 移到 VLM 完成后 (rows 已有)
-//   - StartAnalysisAsync 移到 VLM 完成后 (alert 需要 rows)
-func (h *Handler) runVLMAsync(sessionID string, uploads []uploaded, supplier string, imageHashes []string) {
+//   - 只负责解析, 不写 DB: rows/status 由调用方 (CreateSession) 落库并响应
+//   - panic 兜底: 返回 status='failed', 防止进程崩溃导致 session 卡 pending
+func (h *Handler) runVLMSync(sessionID string, uploads []uploaded, supplier string, imageHashes []string) (rows []model.SkuRow, status string, strategyVersion int) {
 	// detached ctx: VLM 跑多久都行, 不受客户端影响
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 
-	// 2026-09-04: goroutine panic 兜底 — 否则整个进程崩溃, systemd 重启后该 session 永远卡 pending
+	// panic 兜底 — 否则整个进程崩溃, systemd 重启后该 session 永远卡 pending
 	defer func() {
 		if r := recover(); r != nil {
-			log.Printf("[runVLMAsync] ❌ panic: session_id=%s err=%v", sessionID, r)
-			failCtx, failCancel := context.WithTimeout(context.Background(), 10*time.Second)
-			defer failCancel()
-			if s, e := h.Sessions.Get(failCtx, sessionID); e == nil && s != nil {
-				_ = h.Sessions.UpdateSessionRows(failCtx, sessionID, s, "failed")
-			}
+			log.Printf("[runVLMSync] ❌ panic: session_id=%s err=%v", sessionID, r)
+			rows = nil
+			status = "failed"
 		}
 	}()
 
 	var allRows []model.SkuRow
-	var strategyVersion int
 	for idx, u := range uploads {
-		log.Printf("[runVLMAsync] 跑 VLM idx=%d/%d (session_id=%s supplier=%s img_size=%d)",
+		log.Printf("[runVLMSync] 跑 VLM idx=%d/%d (session_id=%s supplier=%s img_size=%d)",
 			idx+1, len(uploads), sessionID, supplier, len(u.bytes))
 		res, err := h.Orchestrator.Parse(ctx, u.bytes, u.header.Filename, supplier)
 		if err != nil {
-			log.Printf("[runVLMAsync] Orchestrator.Parse 失败: idx=%d session_id=%s err=%v",
+			log.Printf("[runVLMSync] Orchestrator.Parse 失败: idx=%d session_id=%s err=%v",
 				idx+1, sessionID, err)
-			// 不立即失败,继续跑后面 idx; 最后统一 Update 失败状态
+			// 不立即失败,继续跑后面 idx; 最后统一按 0 rows 处理
 			continue
 		}
 		if len(res.Rows) == 0 {
-			log.Printf("[runVLMAsync] ⚠️ VLM 解析 0 条 (idx=%d session_id=%s)",
+			log.Printf("[runVLMSync] ⚠️ VLM 解析 0 条 (idx=%d session_id=%s)",
 				idx+1, sessionID)
 		}
 		baseSeq := len(allRows)
-		rows := res.Rows
-		for i := range rows {
-			rows[i].Seq = baseSeq + i + 1
-			rows[i].ImageIndex = idx
+		rs := res.Rows
+		for i := range rs {
+			rs[i].Seq = baseSeq + i + 1
+			rs[i].ImageIndex = idx
 		}
-		allRows = append(allRows, rows...)
+		allRows = append(allRows, rs...)
 		if idx == 0 {
 			strategyVersion = res.StrategyVersion
 		}
 	}
 
-	// 构造完整 session 准备 Update
-	s, err := h.Sessions.Get(ctx, sessionID)
-	if err != nil || s == nil {
-		log.Printf("[runVLMAsync] 拉 session 失败: session_id=%s err=%v", sessionID, err)
-		return
-	}
-	s.Rows = allRows
-	s.StrategyVersion = strategyVersion
-
-	// Update 到 DB
-	status := "done"
+	status = "done"
 	if len(allRows) == 0 {
 		status = "failed" // 失败: VLM 全 0 rows
 	}
-	if err := h.Sessions.UpdateSessionRows(ctx, sessionID, s, status); err != nil {
-		log.Printf("[runVLMAsync] UpdateSessionRows 失败: session_id=%s err=%v", sessionID, err)
-		return
-	}
-	log.Printf("[runVLMAsync] session 已更新 (session_id=%s rows=%d status=%s)",
-		sessionID, len(allRows), status)
-
-	// enrichRowsWithItemNo 异步 (rows 已有, 这次真能 enrich 成功)
-	// 用 detached 5s ctx 跑, 失败/超时不影响
-	rowsCopy := make([]model.SkuRow, len(s.Rows))
-	copy(rowsCopy, s.Rows)
-	go func() {
-		bgCtx, c2 := context.WithTimeout(context.Background(), 5*time.Second)
-		defer c2()
-		h.enrichRowsWithItemNo(bgCtx, rowsCopy)
-	}()
-
-	// alert 异步分析
-	if s.Mode == model.ModePurchase && h.AlertSvc != nil {
-		h.AlertSvc.StartAnalysisAsync(sessionID, h.Sessions.Get)
-	}
+	return allRows, status, strategyVersion
 }
 
 func (h *Handler) ListSessions(c *gin.Context) {
