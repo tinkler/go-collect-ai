@@ -791,10 +791,24 @@ func (h *Handler) CreateSession(c *gin.Context) {
 	}
 	// 2026-09-03: 反查 hbpos t_bd_item_info, 把 barcode → item_no 写到 row.ItemNo
 	//   企业微信"复制"按钮要的就是 item_no, 不是条码; cube 失败也不阻塞
-	h.enrichRowsWithItemNo(writeCtx, s.Rows)
+	//
+	// 2026-09-04 改 fire-and-forget: cube 反查 14 条 ≈ 1s,但会阻塞响应 1s;
+	//   现在 detached ctx + 5s timeout 跑 goroutine, 主流程立即返 200。
+	//   失败/超时也不影响响应(下次 GET /sessions/{id} 会再 enrich 一次)。
+	h.enrichRowsWithItemNoAsync(id, s.Rows)
 	// W4.1: 异步触发策略分析 (立即返回, 不等 LLM)
 	if s.Mode == model.ModePurchase && h.AlertSvc != nil {
 		h.AlertSvc.StartAnalysisAsync(id, h.Sessions.Get)
+	}
+	// 2026-09-04 修复: 写响应前检测 ctx,客户端(企微浏览器 60s / 中间代理 30-40s)
+	//   已断时不再写 HTTP 200,避免出现 "write tcp ... i/o timeout" 错误日志。
+	//   关键:数据已落库 + 写响应时客户端 RST,会触发难看的错误日志但实际无害。
+	//   检测到 ctx canceled 直接 return, 客户端下次 H5 列表 GET /sessions/{id}
+	//   仍能拿到完整数据。
+	if err := c.Request.Context().Err(); err != nil {
+		log.Printf("[CreateSession] 客户端在写响应前已断开 (session_id=%s, rows=%d, ctx_err=%v), 数据已落库, 跳过写响应",
+			s.ID, len(s.Rows), err)
+		return
 	}
 	c.JSON(200, s)
 }

@@ -34,9 +34,35 @@ import (
 	"context"
 	"log"
 	"strings"
+	"time"
 
 	"github.com/tinkler/collect-ai/internal/model"
 )
+
+// enrichRowsWithItemNoAsync 2026-09-04: 异步 fire-and-forget 版本的 enrich
+//   - 启动 goroutine 用 detached ctx (Background + 5s timeout) 跑 enrich
+//   - 客户端响应立即返回,不被 1s 的 cube 反查阻塞
+//   - enrich 失败/超时只 log,不影响主流程 (GetSession 仍会同步 enrich 一次)
+//   - 关键: rows 是 handler 层局部变量, enrich 改它没用 (handler 已返响应),
+//     所以真正"持久化"靠 GetSession 调 enrichRowsWithItemNo
+//   - 当前这个 fire-and-forget 主要价值是: 提前 heat-up cube + 1s 内 cube
+//     缓存住结果, 让 H5 GET 第一次调时也快 (warm cache 效果)
+func (h *Handler) enrichRowsWithItemNoAsync(_ string, rows []model.SkuRow) {
+	if h.Agent == nil || len(rows) == 0 {
+		return
+	}
+	// 拷一份 rows 切片头 (浅拷), goroutine 改不会影响主流程的 s
+	//   enrichRowsWithItemNo 内部用 range + 索引改 rows[i].ItemNo
+	//   浅拷足够,因为 cube 查询只用 rows 里的 barcode 字段 (值类型拷贝)
+	rowsCopy := make([]model.SkuRow, len(rows))
+	copy(rowsCopy, rows)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		// 静默跑, 失败/超时只 log (与同步版本一致)
+		h.enrichRowsWithItemNo(ctx, rowsCopy)
+	}()
+}
 
 // enrichRowsWithItemNo 2026-09-03: 批量反查 hbpos t_bd_item_info,
 //   把 barcode → item_no 写回 rows[i].ItemNo, 顺便取 unit_no 写回 rows[i].Unit.

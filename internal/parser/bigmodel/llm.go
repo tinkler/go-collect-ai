@@ -335,6 +335,11 @@ func recoverTruncatedRows(msg string) ([]model.ParsedOcrRow, bool) {
 }
 
 // parseRowsArray 把 arr 转成 ParsedOcrRow(供 recoverTruncatedRows 复用)
+//
+// 2026-09-04 强化:
+//   - barcode 不强制 13 位, 支持 6-14 位 (8/10/12/13/14 都常见)
+//   - qty 允许小数 (0.5/1.5/2.5 等), 不再过滤 0 (0 是合法采购数 0)
+//   - 客户端兜底: 去 barcode 里的非数字字符 (空格/横线/引号/字母)
 func parseRowsArray(arr []map[string]any) []model.ParsedOcrRow {
 	out := make([]model.ParsedOcrRow, 0, len(arr))
 	for _, o := range arr {
@@ -344,13 +349,24 @@ func parseRowsArray(arr []map[string]any) []model.ParsedOcrRow {
 		}
 		barcode, _ := o["barcode"].(string)
 		name, _ := o["name"].(string)
+		// 2026-09-04 修复: GLM-4V 偶发把 barcode 输出成脏格式
+		//   - "1234 5678 9012" (含空格) → "123456789012"
+		//   - "1234-5678-9012" (含横线) → "123456789012"
+		//   - "0 1234567890123" (前缀 0 + 空格) → "0123456789012"
+		//   - 任意位数 (8/10/12/13/14) 都保留, 不强制 13 位
+		//   - 长度 < 6 或 > 14 → 返空 (无效, 跳过)
+		barcode = normalizeBarcode(barcode)
 		var qtyRaw string
 		switch v := o["qty"].(type) {
 		case float64:
-			qtyRaw = strconv.Itoa(int(v))
+			// 2026-09-04: 保留小数, 12.5 写成 "12.5" 而不是 int(12.5) = 12
+			qtyRaw = formatFloatQty(v)
 		case string:
 			qtyRaw = v
 		}
+		// 2026-09-04 修复: qty 可以是 0 / 小数 / 负数 (parseQty 已经能 parse)
+		//   之前过滤 0 是错的 (0 是合法采购数 0, 商家偶尔会写)
+		//   之前只支持整数, 现在 parseQty 走 string 分支也支持小数
 		var qty *int
 		if qtyRaw != "" {
 			if v, ok := parseQty(qtyRaw); ok {
@@ -379,4 +395,42 @@ func parseRowsArray(arr []map[string]any) []model.ParsedOcrRow {
 		out = append(out, model.ParsedOcrRow{Barcode: barcode, Name: name, QtyRaw: qtyRaw, Qty: qty})
 	}
 	return out
+}
+
+// formatFloatQty 把 float64 格式化为最短合理字符串
+//   - 12.0 → "12"
+//   - 12.5 → "12.5"
+//   - 0.5 → "0.5"
+func formatFloatQty(v float64) string {
+	if v == float64(int(v)) {
+		return strconv.Itoa(int(v))
+	}
+	return strconv.FormatFloat(v, 'f', -1, 64)
+}
+
+// normalizeBarcode 客户端兜底:把脏 barcode 清洗成 6-14 位纯数字
+//
+//	规则:
+//	  1) trim
+//	  2) 去所有非数字字符 (空格/横线/字母/小数点/引号/中文逗号 等)
+//	  3) 长度 6-14 → 返清洗后字符串
+//	  4) 其他长度 → 返空 (无效, matcher 走 L2/L3)
+//
+//	不强制 13 位, 商超供货单常见 8/10/12/13/14 位
+func normalizeBarcode(s string) string {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return ""
+	}
+	cleaned := make([]byte, 0, len(s))
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c >= '0' && c <= '9' {
+			cleaned = append(cleaned, c)
+		}
+	}
+	if len(cleaned) < 6 || len(cleaned) > 14 {
+		return ""
+	}
+	return string(cleaned)
 }

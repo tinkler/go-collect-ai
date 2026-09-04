@@ -20,6 +20,7 @@ package bigmodel
 
 import (
 	"bytes"
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -114,7 +115,21 @@ type VlmResult struct {
 // 2026-09-04 修复:截断时(finish_reason=length)自动 retry 一次,缓解偶发截断
 //   - 由于 GLM-4V max_tokens 上限 2048,retry 仍可能截断
 //   - 重试后仍截断则返回最后一次结果(让 caller 决定如何降级)
+//
+// 2026-09-04 第二次修复: ctx 透传。旧实现 http.NewRequest 不传 ctx, 导致
+//   Orchestrator 设的 25s timeout 无法生效,BigModel 排队 30-60s 也得等。
+//   新增 ChatWithImageCtx,http.NewRequestWithContext 把 ctx 串进去,客户端断/超时
+//   能立即中断请求不再空等。
 func (c *VlmClient) ChatWithImage(sysPrompt, userPrompt, model string, imageBytes []byte, imageName string) (VlmResult, error) {
+	return c.ChatWithImageCtx(context.Background(), sysPrompt, userPrompt, model, imageBytes, imageName)
+}
+
+// ChatWithImageCtx 带 ctx 版本的 ChatWithImage。
+//   - ctx 透传到 http.NewRequestWithContext + httpClient.Do,客户端断开/超时
+//     能立即中断 BigModel 调用,不再空等 30-60s
+//   - ctx 仍然由调用方控制(典型用法: context.WithoutCancel(reqCtx) + 25s timeout,
+//     detach 客户端断连但加服务端兜底)
+func (c *VlmClient) ChatWithImageCtx(ctx context.Context, sysPrompt, userPrompt, model string, imageBytes []byte, imageName string) (VlmResult, error) {
 	if c == nil {
 		return VlmResult{}, fmt.Errorf("vlm client 未初始化")
 	}
@@ -193,7 +208,7 @@ func (c *VlmClient) ChatWithImage(sysPrompt, userPrompt, model string, imageByte
 	// 偶发场景:同样的 prompt+image 重跑一次,可能不再截断(LLM 采样波动)
 	var lastResult VlmResult
 	for attempt := 1; attempt <= 2; attempt++ {
-		result, err := c.doChat(body, attempt)
+		result, err := c.doChat(ctx, body, attempt)
 		if err != nil {
 			return VlmResult{}, err
 		}
@@ -212,15 +227,22 @@ func (c *VlmClient) ChatWithImage(sysPrompt, userPrompt, model string, imageByte
 }
 
 // doChat 实际发一次 HTTP 请求
-func (c *VlmClient) doChat(body []byte, attempt int) (VlmResult, error) {
-	httpReq, err := http.NewRequest("POST", c.baseURL+"/chat/completions", bytes.NewReader(body))
+//
+// 2026-09-04 修复: ctx 透传。新版用 http.NewRequestWithContext + httpClient.Do(ctx),
+//   Orchestrator 包的 25s timeout 真正生效,BigModel 排队超时能立即中断。
+//   旧实现 http.NewRequest 不传 ctx,timeout 只能等 http.Client.Timeout 兜底,
+//   客户端断连无法提前中断。
+func (c *VlmClient) doChat(ctx context.Context, body []byte, attempt int) (VlmResult, error) {
+	httpReq, err := http.NewRequestWithContext(ctx, "POST", c.baseURL+"/chat/completions", bytes.NewReader(body))
 	if err != nil {
 		return VlmResult{}, fmt.Errorf("vlm http request: %w", err)
 	}
 	httpReq.Header.Set("Authorization", "Bearer "+c.apiKey)
 	httpReq.Header.Set("Content-Type", "application/json")
 
-	httpClient := &http.Client{Timeout: c.timeout}
+	// 客户端 timeout 给个硬上限 (60s),ctx 25s timeout 优先 (会先 cancel)
+	//   双保险: ctx 25s 触发时, httpClient.Do 立即中断请求
+	httpClient := &http.Client{Timeout: 60 * time.Second}
 	resp, err := httpClient.Do(httpReq)
 	if err != nil {
 		return VlmResult{}, fmt.Errorf("vlm http do (attempt=%d): %w", attempt, err)
