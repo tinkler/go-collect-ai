@@ -705,8 +705,17 @@ func (h *Handler) CreateSession(c *gin.Context) {
 		res, err := h.Orchestrator.Parse(c.Request.Context(), u.bytes, u.header.Filename,
 			supplier)
 		if err != nil {
+			// 2026-09-04 增强日志: 2026-09-04 线上事故发现 500 真正原因不是这里,但
+			//   当时没有 idx+supplier+img_size+err 完整上下文很难追
+			log.Printf("[CreateSession] Orchestrator.Parse 失败: idx=%d/%d supplier=%s img_size=%d err=%v",
+				idx+1, len(uploads), supplier, len(u.bytes), err)
 			c.JSON(500, gin.H{"error": fmt.Sprintf("VLM 第 %d 张失败: %s", idx+1, err.Error())})
 			return
+		}
+		// VLM 兜底后 rows=nil,记录一行让用户知道本次有几张图没解析出来
+		if len(res.Rows) == 0 {
+			log.Printf("[CreateSession] ⚠️ VLM 解析 0 条 (idx=%d/%d supplier=%s img_size=%d)",
+				idx+1, len(uploads), supplier, len(u.bytes))
 		}
 		// 续接 seq (从已有 max 续)
 		baseSeq := len(allRows)
@@ -744,6 +753,9 @@ func (h *Handler) CreateSession(c *gin.Context) {
 	s.Rows = allRows
 	s.AnalysisStatus = "pending" // W4.1: 立即 pending, 后台跑分析
 	if err := h.Sessions.Create(c.Request.Context(), s); err != nil {
+		// 2026-09-04 增强日志: 线上事故未确定 500 真因, 显式记 session_id + rows 数量 + err
+		log.Printf("[CreateSession] Sessions.Create 失败: session_id=%s supplier=%s rows=%d note=%q err=%v",
+			s.ID, s.SupplierName, len(s.Rows), s.Note, err)
 		c.JSON(500, gin.H{"error": "存库失败: " + err.Error()})
 		return
 	}

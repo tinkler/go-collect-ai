@@ -128,6 +128,10 @@ func (b *Bridge) Handle(chatID, userID, text string) {
 		return
 	}
 	if !b.shouldHandle(chatID) {
+		// 不在白名单: 之前是静默丢弃, 排查 "发了调试没回复" 时完全无迹可循
+		// 现在打一行 skip 日志 (msg 量低, main.go OnMessage 已打原文, 这里只标原因)
+		log.Printf("[bridge] skip chat=%s user=%s (not in COLLECTAI_AGENT_CHAT_IDS whitelist, len=%d)",
+			chatID, userID, len(b.chatSet))
 		return
 	}
 	queue := b.getOrCreateWorker(chatID)
@@ -308,10 +312,16 @@ func (b *Bridge) sendDebugInfo(ctx context.Context, chatID, userID string) {
 	}
 	// 用 \n 真实换行,企微 text 消息会原样显示
 	msg := fmt.Sprintf(
-		"🤖 调试 OK\nchat_id: %s\nuser_id: %s\nllm: %s\nts: %s",
+		"🤖 调试 OK\nchat_id: %s\nuser_id: %s\nllm: %s\n白名单: %s\nts: %s",
 		chatID,
 		userID,
 		llmStatus,
+		func() string {
+			if _, ok := b.chatSet[chatID]; ok {
+				return "yes"
+			}
+			return fmt.Sprintf("no (%d 个群)", len(b.chatSet))
+		}(),
 		time.Now().Format("2006-01-02 15:04:05"),
 	)
 	log.Printf("[bridge] DEBUG chat=%s user=%s llm=%s", chatID, userID, llmStatus)

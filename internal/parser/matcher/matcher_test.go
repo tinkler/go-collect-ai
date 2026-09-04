@@ -69,7 +69,7 @@ func TestL3_TooShortBarcode_Skip(t *testing.T) {
 	), 0)
 
 	got := m.Match(model.ParsedOcrRow{
-		Barcode: "12",  // 太短
+		Barcode: "12", // 太短
 		Name:    "可口可乐",
 	}, 1)
 
@@ -184,11 +184,11 @@ func TestL3_AllSegments_VerifyOrder(t *testing.T) {
 	// 验证 L1-L6 段位顺序(回归测试)
 	// 每个 subtest 用独立 matcher + 独立 SKU 库,避免 L2 name exact 干扰
 	cases := []struct {
-		name       string
-		skus       []model.SkuRecord
-		fuzzy      int
-		ocr        model.ParsedOcrRow
-		wantStatus string
+		name        string
+		skus        []model.SkuRecord
+		fuzzy       int
+		ocr         model.ParsedOcrRow
+		wantStatus  string
 		wantBarcode string
 	}{
 		{
@@ -196,9 +196,9 @@ func TestL3_AllSegments_VerifyOrder(t *testing.T) {
 			skus: []model.SkuRecord{
 				{Barcode: "A", Name: "任意名"},
 			},
-			fuzzy: 1,
-			ocr:        model.ParsedOcrRow{Barcode: "A", Name: "其他名称"},
-			wantStatus: "OK",
+			fuzzy:       1,
+			ocr:         model.ParsedOcrRow{Barcode: "A", Name: "其他名称"},
+			wantStatus:  "OK",
 			wantBarcode: "A",
 		},
 		{
@@ -206,9 +206,9 @@ func TestL3_AllSegments_VerifyOrder(t *testing.T) {
 			skus: []model.SkuRecord{
 				{Barcode: "X", Name: "可口可乐"},
 			},
-			fuzzy: 1,
-			ocr:        model.ParsedOcrRow{Barcode: "ZZ", Name: "可口可乐"},
-			wantStatus: "修正(名称)",
+			fuzzy:       1,
+			ocr:         model.ParsedOcrRow{Barcode: "ZZ", Name: "可口可乐"},
+			wantStatus:  "修正(名称)",
 			wantBarcode: "X",
 		},
 		{
@@ -219,9 +219,9 @@ func TestL3_AllSegments_VerifyOrder(t *testing.T) {
 			skus: []model.SkuRecord{
 				{Barcode: "XX0123", Name: "可口可乐"},
 			},
-			fuzzy: 1,
-			ocr:        model.ParsedOcrRow{Barcode: "0123", Name: "可口可乐水"},
-			wantStatus: "修正(条码后缀+名称模糊)",
+			fuzzy:       1,
+			ocr:         model.ParsedOcrRow{Barcode: "0123", Name: "可口可乐水"},
+			wantStatus:  "修正(条码后缀+名称模糊)",
 			wantBarcode: "XX0123",
 		},
 		{
@@ -232,9 +232,9 @@ func TestL3_AllSegments_VerifyOrder(t *testing.T) {
 			skus: []model.SkuRecord{
 				{Barcode: "D", Name: "果粒橙汤"},
 			},
-			fuzzy: 1,
-			ocr:        model.ParsedOcrRow{Barcode: "ZZ", Name: "果粒橙糖"},
-			wantStatus: "修正(模糊)",
+			fuzzy:       1,
+			ocr:         model.ParsedOcrRow{Barcode: "ZZ", Name: "果粒橙糖"},
+			wantStatus:  "修正(模糊)",
 			wantBarcode: "D",
 		},
 		{
@@ -243,9 +243,9 @@ func TestL3_AllSegments_VerifyOrder(t *testing.T) {
 			skus: []model.SkuRecord{
 				{Barcode: "E", Name: "其他可乐330ml"},
 			},
-			fuzzy: 1,
-			ocr:        model.ParsedOcrRow{Barcode: "ZZ", Name: "可乐330ml"},
-			wantStatus: "修正(子串)",
+			fuzzy:       1,
+			ocr:         model.ParsedOcrRow{Barcode: "ZZ", Name: "可乐330ml"},
+			wantStatus:  "修正(子串)",
 			wantBarcode: "E",
 		},
 		{
@@ -253,9 +253,9 @@ func TestL3_AllSegments_VerifyOrder(t *testing.T) {
 			skus: []model.SkuRecord{
 				{Barcode: "F", Name: "完全没关系的商品"},
 			},
-			fuzzy: 1,
-			ocr:        model.ParsedOcrRow{Barcode: "Q", Name: "完全没见过的商品"},
-			wantStatus: "新SKU",
+			fuzzy:       1,
+			ocr:         model.ParsedOcrRow{Barcode: "Q", Name: "完全没见过的商品"},
+			wantStatus:  "新SKU",
 			wantBarcode: "",
 		},
 	}
@@ -310,5 +310,97 @@ func TestL3_EmptyNameNameGrams(t *testing.T) {
 	// 应该: IsNew=true
 	if !got.IsNew {
 		t.Errorf("无 name 时应 IsNew, got status=%q isNew=%v", got.Status, got.IsNew)
+	}
+}
+
+// ============================================================
+// 2026-09-04 修复: GLM-4V 偶发把 13 位 EAN-13 误读为 14 位
+// (云开商行线上的 "69331691000813" 即典型 case)
+// 兜底: 14 位去首/尾 1 位再查 byBarcode,任一命中即用
+// ============================================================
+
+func TestL1_14Digit_FallbackTrimFirst(t *testing.T) {
+	// SKU 库: 13 位 "6933169100486"
+	// OCR 误读: 14 位 "06933169100486" (前加 0)
+	// 期望: 去首命中, status = "OK(去首位修复14位)"
+	m := New(skus(
+		model.SkuRecord{Barcode: "6933169100486", Name: "正麦1.7kg手拍玉带面"},
+	), 0)
+
+	got := m.Match(model.ParsedOcrRow{
+		Barcode: "06933169100486", // 14 位,前加 0
+		Name:    "正麦1.7kg手拍玉带面",
+	}, 1)
+
+	if got.Status != "OK(去首位修复14位)" {
+		t.Errorf("14位去首位应命中, got status=%q matched=%q", got.Status, got.MatchedBarcode)
+	}
+	if got.MatchedBarcode != "6933169100486" {
+		t.Errorf("matched_barcode = %q, want 6933169100486", got.MatchedBarcode)
+	}
+	if got.IsNew {
+		t.Errorf("不应 IsNew, L1 修复后已命中")
+	}
+}
+
+func TestL1_14Digit_FallbackTrimLast(t *testing.T) {
+	// SKU 库: 13 位 "6933169100486"
+	// OCR 误读: 14 位 "69331691004866" (尾重复一位)
+	m := New(skus(
+		model.SkuRecord{Barcode: "6933169100486", Name: "正麦1.7kg手拍玉带面"},
+	), 0)
+
+	got := m.Match(model.ParsedOcrRow{
+		Barcode: "69331691004866", // 14 位,尾重复
+		Name:    "正麦1.7kg手拍玉带面",
+	}, 1)
+
+	if got.Status != "OK(去尾位修复14位)" {
+		t.Errorf("14位去尾位应命中, got status=%q matched=%q", got.Status, got.MatchedBarcode)
+	}
+	if got.MatchedBarcode != "6933169100486" {
+		t.Errorf("matched_barcode = %q, want 6933169100486", got.MatchedBarcode)
+	}
+}
+
+func TestL1_14Digit_FallbackBothMiss_TruncateTo13(t *testing.T) {
+	// SKU 库: 13 位 "6933169100486"
+	// OCR: 14 位 "99999999999999" (前 14 位都不匹配)
+	// 期望: 都不命中,RawBarcode 截成 13 位,落到 L3 (barcode suffix+name 模糊)
+	m := New(skus(
+		model.SkuRecord{Barcode: "6933169100486", Name: "正麦1.7kg手拍玉带面"},
+	), 0)
+
+	got := m.Match(model.ParsedOcrRow{
+		Barcode: "99999999999999", // 14 位,完全不匹配
+		Name:    "正麦1.7kg手拍玉带面",
+	}, 1)
+
+	// L1 失败, L1 14位 fallback 失败 → 截成 13 位 "9999999999999" → fall through
+	// L2 名称完全等 → 应命中
+	if !strings.Contains(got.Status, "名称") {
+		t.Errorf("L1 全失败应 fall through 到 L2 (名称), got status=%q", got.Status)
+	}
+	if got.RawBarcode != "9999999999999" {
+		t.Errorf("RawBarcode 应被截成 13 位 %q, got %q", "9999999999999", got.RawBarcode)
+	}
+}
+
+func TestL1_14Digit_DuplicateSuffixMatch_PreferFirst(t *testing.T) {
+	// 边界: 去首 / 去尾 都能命中不同 sku
+	// 当前实现: 去首优先(代码顺序)
+	m := New(skus(
+		model.SkuRecord{Barcode: "6933169100486", Name: "skuA"},
+		model.SkuRecord{Barcode: "9331691004866", Name: "skuB"}, // skuB 是 14 位但碰巧 suffix 命中
+	), 0)
+
+	got := m.Match(model.ParsedOcrRow{
+		Barcode: "06933169100486", // 去首=6933169100486 (skuA), 去尾=6933169100486 (skuA)
+		Name:    "任意",
+	}, 1)
+
+	// 14 位: 去首命中 skuA, 直接 return
+	if got.MatchedBarcode != "6933169100486" {
+		t.Errorf("14位去首优先应命中 skuA, got %q", got.MatchedBarcode)
 	}
 }

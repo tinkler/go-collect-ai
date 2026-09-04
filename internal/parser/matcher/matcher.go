@@ -86,9 +86,30 @@ func (m *SkuMatcher) Match(ocr model.ParsedOcrRow, seq int) model.SkuRow {
 
 	// 1) barcode exact
 	if ocr.Barcode != "" {
-		if hit, ok := m.byBarcode[strings.TrimSpace(ocr.Barcode)]; ok {
+		bc := strings.TrimSpace(ocr.Barcode)
+		// 2026-09-04 修复: GLM-4V 偶发把 13 位 EAN-13 误读为 14 位(常见:多加前缀 0
+		//   或重复最后一位),导致所有级联 miss → IsNew 误标。增加 14→13 fallback:
+		//   - 去首 1 位: 适用于 "0" 前缀 (e.g. "06933269100486" → "6933269100486")
+		//   - 去尾 1 位: 适用于重复最后一位 (e.g. "69331691004866" → "6933169100486")
+		//   - 任一 fallback 命中即用,不再 fall through
+		if hit, ok := m.byBarcode[bc]; ok {
 			m.applyMatch(&row, hit, "OK")
 			return row
+		}
+		if len(bc) == 14 {
+			if len(bc) >= 2 {
+				if hit, ok := m.byBarcode[bc[1:]]; ok { // 去首
+					m.applyMatch(&row, hit, "OK(去首位修复14位)")
+					return row
+				}
+				if hit, ok := m.byBarcode[bc[:len(bc)-1]]; ok { // 去尾
+					m.applyMatch(&row, hit, "OK(去尾位修复14位)")
+					return row
+				}
+			}
+			// 都不命中 → fall through 到 name 匹配,14 位原值不写到 row
+			ocr.Barcode = bc[:13] // 至少截成 13 位,避免污染后续 L3 桶查找
+			row.RawBarcode = ocr.Barcode
 		}
 	}
 
@@ -195,12 +216,13 @@ func (m *SkuMatcher) findSubstring(s string) *model.SkuRecord {
 }
 
 // findByBarcodeSuffix4 W3.1 L3 段位
-//   场景: OCR 漏掉条码前缀(打印不全/裁切/手写),只识别到后 N 位
-//   算法:
-//     1) 取 ocr.Barcode 后 4 位 → 在 byBarcodeSuffix4 桶里找候选
-//     2) 对每个候选,跟 ocr.Name 做 Jaccard 字符 2-gram 相似度
-//     3) 取最高分且 ≥ 0.6 的候选返回
-//   阈值可通过 l3JaccardThreshold 调整
+//
+//	场景: OCR 漏掉条码前缀(打印不全/裁切/手写),只识别到后 N 位
+//	算法:
+//	  1) 取 ocr.Barcode 后 4 位 → 在 byBarcodeSuffix4 桶里找候选
+//	  2) 对每个候选,跟 ocr.Name 做 Jaccard 字符 2-gram 相似度
+//	  3) 取最高分且 ≥ 0.6 的候选返回
+//	阈值可通过 l3JaccardThreshold 调整
 func (m *SkuMatcher) findByBarcodeSuffix4(barcode, name string) *model.SkuRecord {
 	if len(barcode) < 4 || name == "" {
 		return nil
@@ -234,7 +256,8 @@ func (m *SkuMatcher) findByBarcodeSuffix4(barcode, name string) *model.SkuRecord
 }
 
 // bigrams 字符 2-gram 集合(中文 OK,按 rune 切)
-//   例: "可口可乐" → {"可口","口可","可乐"}
+//
+//	例: "可口可乐" → {"可口","口可","可乐"}
 func bigrams(s string) map[string]struct{} {
 	runes := []rune(s)
 	if len(runes) < 2 {

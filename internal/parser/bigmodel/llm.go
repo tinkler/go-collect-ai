@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"regexp"
 	"strconv"
@@ -46,7 +47,8 @@ func resolveLlmModel(model string) string {
 }
 
 // ChatCompletion 调 LLM, 返回 choices[0].message.content
-//   model: "glm-4-flash" / "glm-4-plus" / "" (回退 glm-4-flash)
+//
+//	model: "glm-4-flash" / "glm-4-plus" / "" (回退 glm-4-flash)
 func (c *LlmClient) ChatCompletion(sysPrompt, userPrompt, model string) (string, error) {
 	payload := map[string]any{
 		"model": resolveLlmModel(model),
@@ -54,9 +56,9 @@ func (c *LlmClient) ChatCompletion(sysPrompt, userPrompt, model string) (string,
 			{"role": "system", "content": sysPrompt},
 			{"role": "user", "content": userPrompt},
 		},
-		"temperature":    0.1,
-		"top_p":          0.7,
-		"max_tokens":     8192,
+		"temperature":     0.1,
+		"top_p":           0.7,
+		"max_tokens":      8192,
 		"response_format": map[string]string{"type": "json_object"},
 	}
 	bs, _ := json.Marshal(payload)
@@ -99,16 +101,29 @@ func (c *LlmClient) ChatCompletion(sysPrompt, userPrompt, model string) (string,
 	return parsed.Choices[0].Message.Content, nil
 }
 
+// ErrTruncated 响应被截断 (max_tokens 不够),ParseLlmJson 无法挽救。
+// caller 应该: 切更小图重试 / 换 glm-4v-plus / 调低单图密度
+var ErrTruncated = fmt.Errorf("LLM 响应被截断 (max_tokens 触顶)")
+
 // ParseLlmJson 解析 LLM 返回, 跳过 type=skip, 客户端二次过滤
 //
 // Phase A (2026-09-02): 旧的 DefaultSystemPrompt / DefaultInventoryPrompt / DefaultPurchasePrompt
 // 全部删掉,迁到 skills/ocr-purchase/SKILL.md 由 ParserOrchestrator 渲染调用。
+//
+// 2026-09-04: 增加截断检测。被截断时(fence 闭合缺 + 没有 ] 收尾),
+//   - 尝试截断到最后一个 `}` 之前,挽救部分 rows
+//   - 挽救失败则返回 ErrTruncated(让 caller 知道是 token 上限,不是格式问题)
 func ParseLlmJson(msg string) ([]model.ParsedOcrRow, error) {
 	msg = strings.TrimSpace(msg)
 	fence := regexp.MustCompile("```(?:json)?\\s*(.*?)\\s*```")
 	if m := fence.FindStringSubmatch(msg); m != nil {
 		msg = m[1]
 	}
+	msg = strings.TrimSpace(msg)
+
+	// 2026-09-04 截断检测: 没有闭合 ] 通常是 max_tokens 触顶
+	//   正常 JSON 一定以 } 或 ] 结尾,否则就是被截断
+	looksTruncated := !strings.HasSuffix(msg, "}") && !strings.HasSuffix(msg, "]")
 
 	var token any
 	if err := json.Unmarshal([]byte(msg), &token); err != nil {
@@ -116,10 +131,23 @@ func ParseLlmJson(msg string) ([]model.ParsedOcrRow, error) {
 		start := strings.Index(msg, "[")
 		end := strings.LastIndex(msg, "]")
 		if start < 0 || end <= start {
+			// 截断场景:尝试截到最后一个 } 之前,挽救完整行
+			if looksTruncated {
+				if recovered, ok := recoverTruncatedRows(msg); ok {
+					log.Printf("[ParseLlmJson] 截断响应挽救成功, 恢复 %d 行", len(recovered))
+					return recovered, nil
+				}
+			}
+			if looksTruncated {
+				return nil, fmt.Errorf("%w: %s", ErrTruncated, truncate(msg, 200))
+			}
 			return nil, fmt.Errorf("LLM 返回非 JSON: %s", truncate(msg, 200))
 		}
 		token = nil
 		if err2 := json.Unmarshal([]byte(msg[start:end+1]), &token); err2 != nil {
+			if looksTruncated {
+				return nil, fmt.Errorf("%w: %s; inner_err=%v", ErrTruncated, truncate(msg, 200), err2)
+			}
 			return nil, fmt.Errorf("LLM JSON parse 失败: %w; body=%s", err2, truncate(msg, 200))
 		}
 	}
@@ -151,53 +179,7 @@ func ParseLlmJson(msg string) ([]model.ParsedOcrRow, error) {
 		return nil, fmt.Errorf("LLM JSON 没有数组字段: %s", truncate(msg, 200))
 	}
 
-	out := make([]model.ParsedOcrRow, 0, len(arr))
-	for _, o := range arr {
-		typ, _ := o["type"].(string)
-		if strings.ToLower(typ) == "skip" {
-			continue
-		}
-		barcode, _ := o["barcode"].(string)
-		name, _ := o["name"].(string)
-		// qty 可能是 number (LLM) 或 string (兼容)
-		var qtyRaw string
-		switch v := o["qty"].(type) {
-		case float64:
-			qtyRaw = strconv.Itoa(int(v))
-		case string:
-			qtyRaw = v
-		}
-		if name == "" {
-			name = ""
-		}
-		var qty *int
-		if qtyRaw != "" {
-			if v, ok := parseQty(qtyRaw); ok {
-				qty = &v
-			}
-		}
-		// 客户端二次过滤
-		if looksLikeHeader(name) {
-			continue
-		}
-		if looksLikeIsolatedUnit(name) {
-			continue
-		}
-		if looksLikeSubtitle(name) {
-			continue
-		}
-		if looksLikeSignature(name) {
-			continue
-		}
-		if containsMultipleBarcodes(name, barcode) {
-			continue
-		}
-		if name == "" && barcode == "" && qty == nil {
-			continue
-		}
-		out = append(out, model.ParsedOcrRow{Barcode: barcode, Name: name, QtyRaw: qtyRaw, Qty: qty})
-	}
-	return out, nil
+	return parseRowsArray(arr), nil
 }
 
 // parseQty 解析 "12" / "12.0" / "12件" / "3.5" -> int
@@ -296,4 +278,105 @@ func containsMultipleBarcodes(name, barcode string) bool {
 	text := barcode + " " + name
 	matches := regexp.MustCompile(`\b\d{13}\b`).FindAllString(text, -1)
 	return len(matches) >= 2
+}
+
+// recoverTruncatedRows 截断响应挽救:用 brace 深度匹配找出所有完整 row
+//   - 典型场景: VLM 在某个 row 中途被 max_tokens 截断,前面的 row 完整
+//   - 策略: 从 array 起点 `[` 开始扫描,逐字符追踪 `{`/`}` 嵌套深度
+//     深度回到 0 时,得到一个完整 row,单独 parse 后累积
+//   - 限制: 只能挽救"已闭合"的 row;被截断的最后一 row 必然丢
+func recoverTruncatedRows(msg string) ([]model.ParsedOcrRow, bool) {
+	// 找 array 起点(优先 ["rows": [ 之后,否则就第一个 [)
+	arrayStart := -1
+	if i := strings.Index(msg, `"rows"`); i >= 0 {
+		j := strings.Index(msg[i:], "[")
+		if j >= 0 {
+			arrayStart = i + j
+		}
+	}
+	if arrayStart < 0 {
+		arrayStart = strings.Index(msg, "[")
+	}
+	if arrayStart < 0 {
+		return nil, false
+	}
+
+	// brace 深度匹配,收集所有完整 row
+	depth := 0
+	rowStart := -1
+	var rows []map[string]any
+	for i := arrayStart; i < len(msg); i++ {
+		c := msg[i]
+		if c == '{' {
+			if depth == 0 {
+				rowStart = i
+			}
+			depth++
+		} else if c == '}' {
+			depth--
+			if depth == 0 && rowStart >= 0 {
+				rowJSON := msg[rowStart : i+1]
+				var row map[string]any
+				if err := json.Unmarshal([]byte(rowJSON), &row); err == nil {
+					rows = append(rows, row)
+				}
+				rowStart = -1
+			}
+		} else if depth < 0 {
+			// array 闭合 ] 已经过了,后面都是 wrapper 闭合
+			break
+		}
+	}
+	if len(rows) == 0 {
+		return nil, false
+	}
+	// 复用正常解析流程(过滤 type=skip / header / subtitle 等)
+	return parseRowsArray(rows), true
+}
+
+// parseRowsArray 把 arr 转成 ParsedOcrRow(供 recoverTruncatedRows 复用)
+func parseRowsArray(arr []map[string]any) []model.ParsedOcrRow {
+	out := make([]model.ParsedOcrRow, 0, len(arr))
+	for _, o := range arr {
+		typ, _ := o["type"].(string)
+		if strings.ToLower(typ) == "skip" {
+			continue
+		}
+		barcode, _ := o["barcode"].(string)
+		name, _ := o["name"].(string)
+		var qtyRaw string
+		switch v := o["qty"].(type) {
+		case float64:
+			qtyRaw = strconv.Itoa(int(v))
+		case string:
+			qtyRaw = v
+		}
+		var qty *int
+		if qtyRaw != "" {
+			if v, ok := parseQty(qtyRaw); ok {
+				qty = &v
+			}
+		}
+		// 客户端硬过滤(同 ParseLlmJson)
+		if looksLikeHeader(name) {
+			continue
+		}
+		if looksLikeIsolatedUnit(name) {
+			continue
+		}
+		if looksLikeSubtitle(name) {
+			continue
+		}
+		if looksLikeSignature(name) {
+			continue
+		}
+		if containsMultipleBarcodes(name, barcode) {
+			continue
+		}
+		if name == "" && barcode == "" && qty == nil {
+			continue
+		}
+		out = append(out, model.ParsedOcrRow{Barcode: barcode, Name: name, QtyRaw: qtyRaw, Qty: qty})
+	}
+	return out
 }

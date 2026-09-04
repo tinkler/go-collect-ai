@@ -1,11 +1,11 @@
 // Package parser - Orchestrator 协调 VLM + Strategy + SkuMatcher (Phase B+ 2026-09-03)
 //
-//   旧版 (2026-09-02 之前): OCR (hand_write) → GLM-4-flash 文本 → SkuMatcher
-//     问题: OCR 严重误读 (笔→延, 宝→裁), LLM 全判 skip → 0 rows
+//	旧版 (2026-09-02 之前): OCR (hand_write) → GLM-4-flash 文本 → SkuMatcher
+//	  问题: OCR 严重误读 (笔→延, 宝→裁), LLM 全判 skip → 0 rows
 //
-//   新版 (2026-09-03 之后): GLM-4V 多模态直读图 → JSON → SkuMatcher
-//     优势: 跳过 OCR 中间环节, 13位 barcode 100% 正确, qty 100% 正确
-//     代价: 慢 2x + 贵 5-10x
+//	新版 (2026-09-03 之后): GLM-4V 多模态直读图 → JSON → SkuMatcher
+//	  优势: 跳过 OCR 中间环节, 13位 barcode 100% 正确, qty 100% 正确
+//	  代价: 慢 2x + 贵 5-10x
 //
 // 关键合规点 (AGENTS.md §1/§4):
 //   - 0 个业务判断在 Go 里 (选 generic/specific 走查表)
@@ -77,8 +77,9 @@ type ParseResult struct {
 }
 
 // Parse 收图 bytes → 解析为 SkuRow
-//   supplier: 必填
-//   fileName: 推断 mime (jpg/png/webp)
+//
+//	supplier: 必填
+//	fileName: 推断 mime (jpg/png/webp)
 func (o *Orchestrator) Parse(ctx context.Context, imgBytes []byte, fileName, supplier string) (*ParseResult, error) {
 	if len(imgBytes) == 0 {
 		return nil, fmt.Errorf("imgBytes 不能为空")
@@ -141,23 +142,29 @@ func (o *Orchestrator) Parse(ctx context.Context, imgBytes []byte, fileName, sup
 	}
 
 	// 4) 调 VLM 多模态
-	content, err := o.vlm.ChatWithImage(sysPrompt, "", o.vlmModel, imgBytes, fileName)
+	vlmRes, err := o.vlm.ChatWithImage(sysPrompt, "", o.vlmModel, imgBytes, fileName)
 	if err != nil {
 		log.Printf("[orch] VLM 失败, fallback 启发式: %v", err)
 		res.Rows = o.heuristicMatch(ctx, imgBytes, fileName, supplier)
 		return res, nil
+	}
+	content := vlmRes.Content
+	// 2026-09-04: VLM 截断检测 (finish_reason=length 已被 VlmClient retry 过一次,
+	//   仍截断则到这步也是 truncated=true,内容是部分 JSON)
+	if vlmRes.Truncated {
+		log.Printf("[orch] ⚠️ VLM 响应被截断 (max_tokens=已达 BigModel 上限 2048, content_len=%d)", len(content))
 	}
 	// debug
 	preview := content
 	if len(preview) > 500 {
 		preview = preview[:500] + "..."
 	}
-	log.Printf("[orch] VLM 响应 (前 500): %s", preview)
+	log.Printf("[orch] VLM 响应 (前 500, truncated=%v, finish_reason=%s): %s", vlmRes.Truncated, vlmRes.FinishReason, preview)
 
 	// 5) 解析 JSON
 	parsed, err := bigmodel.ParseLlmJson(content)
 	if err != nil {
-		log.Printf("[orch] VLM JSON 解析失败, fallback 启发式: %v", err)
+		log.Printf("[orch] VLM JSON 解析失败, fallback 启发式: %v (truncated=%v)", err, vlmRes.Truncated)
 		res.Rows = o.heuristicMatch(ctx, imgBytes, fileName, supplier)
 		return res, nil
 	}
@@ -187,7 +194,8 @@ func (o *Orchestrator) heuristicMatch(ctx context.Context, imgBytes []byte, file
 }
 
 // buildGenericHints 通用 hints 生成
-//   (跟 Phase A 一致, 没变)
+//
+//	(跟 Phase A 一致, 没变)
 func (o *Orchestrator) buildGenericHints(ctx context.Context, supplier string) map[string]any {
 	skus, err := o.skus.LoadBySupplier(ctx, supplier, 5000)
 	if err != nil {
