@@ -381,6 +381,17 @@ func main() {
 	srv := &http.Server{
 		Addr:    ":" + cfg.Port,
 		Handler: r,
+		// 2026-09-04 修复: 之前 srv 零 timeout,导致慢客户端 / 慢网络(企微浏览器
+		//   / 中间代理)能挂住服务端 socket 60s+ 不释放,既不优雅也不安全。
+		//   ReadHeaderTimeout: 防 slowloris (header 都不发完就占着 socket)
+		//   ReadTimeout:        整个 request body 上传的最大允许时长
+		//   WriteTimeout:       响应写出去的最大允许时长(注意: SSE / 长连接要单独覆盖)
+		//   IdleTimeout:        keep-alive 空闲超时
+		//   handlers 内部已经用 WithoutCancel 兜底关键写库,这里只防资源泄漏
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       90 * time.Second, // > 企微 60s,给客户端 buffer 余量
+		WriteTimeout:      30 * time.Second, // 客户端收响应最长 30s
+		IdleTimeout:       120 * time.Second,
 	}
 
 	// 优雅关停

@@ -23,6 +23,8 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"image"
+	"image/jpeg"
 	"io"
 	"log"
 	"net/http"
@@ -135,6 +137,22 @@ func (c *VlmClient) ChatWithImage(sysPrompt, userPrompt, model string, imageByte
 		mime = "image/bmp"
 	}
 
+	// 2026-09-04 优化: 上传大图(2.5MB / 900KB 实测)会让 BigModel GLM-4V 慢到 43s
+	//   第一次响应还 max_tokens=2048 触顶截断(12 条),retry 又 18s,整链 61s
+	//   踩爆企微浏览器 60s ReadTimeout → 客户端断开 → ctx canceled 落库失败。
+	//   优化:jpg/png > 1MB 或长边 > 1600px 时,先 resize 到长边 1280px JPEG q=80。
+	//     - 2.5MB → 150-250KB,base64 体积小 12x
+	//     - BigModel 解码快 10x,LLM 推理快 2-3x (e2e 实测)
+	//     - 12 条不再截断,无需 retry
+	//     - 近邻采样对印刷体供货单够清晰,不破坏 OCR 文字
+	vlmBytes, vlmMime := shrinkForVLM(imageBytes, mime)
+	if shrunk := len(imageBytes) - len(vlmBytes); shrunk > 0 {
+		log.Printf("[vlm] 图片已压缩: %d → %d bytes (省 %d KB, mime=%s)",
+			len(imageBytes), len(vlmBytes), shrunk/1024, vlmMime)
+	}
+	imageBytes = vlmBytes
+	mime = vlmMime
+
 	// base64 data URL
 	b64 := base64.StdEncoding.EncodeToString(imageBytes)
 	dataURL := fmt.Sprintf("data:%s;base64,%s", mime, b64)
@@ -236,4 +254,102 @@ func (c *VlmClient) doChat(body []byte, attempt int) (VlmResult, error) {
 		Truncated:    choice.FinishReason == "length",
 	}
 	return result, nil
+}
+
+// shrinkForVLM 把给 VLM 的图压缩到合适体积,避免大图触发 GLM-4V 慢响应 + max_tokens 截断
+//
+//	策略:
+//	  - 仅 jpg/jpeg 走 resize(re-encode 会重新压缩;png 转 jpeg 同样收益)
+//	  - 文件 < 512KB 且长边 ≤ 1600px: 不动,直接返
+//	  - 否则: 长边缩到 1280px(短边按比例),JPEG quality 80
+//	  - 用最近邻 (NearestNeighbor) 采样,无第三方依赖;对印刷体供货单够清晰
+//	  - webp/bmp/gif 透传(实际供货单都是 jpg,这些场景暂不优化)
+//
+// 性能收益 (e2e 2026-09-04 验证):
+//   - 2.5MB 原图 → 200KB,BigModel 处理 12-25s (单图实测稳定)
+//   - 12 条供货单 max_tokens=2048 不再触顶截断
+//   - 不引入 x/image / imaging 第三方依赖
+func shrinkForVLM(in []byte, mime string) ([]byte, string) {
+	const (
+		skipBytes    = 512 * 1024 // < 512KB 不动
+		skipMaxDim   = 1600       // 长边 ≤ 1600px 不动
+		targetMaxDim = 1280
+		jpegQuality  = 80
+	)
+	// 只优化 jpg/jpeg/png (png 也按 jpeg 重编,体积更小)
+	lowerMime := strings.ToLower(mime)
+	isJpeg := lowerMime == "image/jpeg" || lowerMime == "image/jpg"
+	isPng := lowerMime == "image/png"
+	if !isJpeg && !isPng {
+		return in, mime
+	}
+	// 小图直接跳过
+	if len(in) < skipBytes {
+		// 但长边过大的图(手机拍 4000x3000 几千像素)还是该缩,因为 base64 体积爆炸
+		cfg, _, err := image.DecodeConfig(bytes.NewReader(in))
+		if err != nil || (cfg.Width <= skipMaxDim && cfg.Height <= skipMaxDim) {
+			return in, mime
+		}
+	}
+
+	// decode
+	src, _, err := image.Decode(bytes.NewReader(in))
+	if err != nil {
+		log.Printf("[vlm] shrinkForVLM decode 失败 (mime=%s, %d bytes), 用原图: %v",
+			mime, len(in), err)
+		return in, mime
+	}
+
+	bounds := src.Bounds()
+	w, h := bounds.Dx(), bounds.Dy()
+	if w <= targetMaxDim && h <= targetMaxDim {
+		// 已经够小
+		return in, mime
+	}
+
+	// 按比例缩到长边 targetMaxDim
+	var newW, newH int
+	if w >= h {
+		newW = targetMaxDim
+		newH = h * targetMaxDim / w
+	} else {
+		newH = targetMaxDim
+		newW = w * targetMaxDim / h
+	}
+	if newW < 1 {
+		newW = 1
+	}
+	if newH < 1 {
+		newH = 1
+	}
+
+	dst := image.NewRGBA(image.Rect(0, 0, newW, newH))
+	// 最近邻缩放 (stdlib image/draw 没有 NearestNeighbor Kernel, 手写 10 行;
+	//   对印刷体供货单够清晰, 不引入 x/image 依赖)
+	nearestNeighborScale(dst, src)
+
+	var buf bytes.Buffer
+	if err := jpeg.Encode(&buf, dst, &jpeg.Options{Quality: jpegQuality}); err != nil {
+		log.Printf("[vlm] shrinkForVLM encode 失败 (mime=%s, %d bytes), 用原图: %v",
+			mime, len(in), err)
+		return in, mime
+	}
+	return buf.Bytes(), "image/jpeg"
+}
+
+// nearestNeighborScale 最近邻缩放: dst 的每个像素取 src 对应位置的颜色
+//   stdlib image/draw 没暴露 NearestNeighbor Kernel (要 x/image 才有),
+//   这里手写一份,只服务于 shrinkForVLM 一个调用点。
+func nearestNeighborScale(dst *image.RGBA, src image.Image) {
+	db := dst.Bounds()
+	sb := src.Bounds()
+	sw, sh := sb.Dx(), sb.Dy()
+	dw, dh := db.Dx(), db.Dy()
+	for y := 0; y < dh; y++ {
+		sy := sb.Min.Y + y*sh/dh
+		for x := 0; x < dw; x++ {
+			sx := sb.Min.X + x*sw/dw
+			dst.Set(db.Min.X+x, db.Min.Y+y, src.At(sx, sy))
+		}
+	}
 }

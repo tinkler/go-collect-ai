@@ -700,6 +700,18 @@ func (h *Handler) CreateSession(c *gin.Context) {
 		// W4.1: 算每张图 hash, 用于后续 append 去重
 		imageHashes = append(imageHashes, store.HashImageBytes(u.bytes))
 
+		// 2026-09-04 修复: 客户端(企微浏览器/中间代理)ReadTimeout 60s 断开后,
+		//   c.Request.Context() 立即 canceled,但 VLM 调用用的是独立 http.Client
+		//   timeout 不会被 cancel 影响。如果不先看 ctx,客户端断了还继续调 BigModel
+		//   = 浪费 12-25s + ¥0.5-1 + 12 条数据落库失败。
+		//   先看 ctx: 已 cancel → 返 499 (No Content) 不浪费 VLM token。
+		if err := c.Request.Context().Err(); err != nil {
+			log.Printf("[CreateSession] 客户端提前断开 (idx=%d/%d supplier=%s ctx_err=%v), 跳过 VLM",
+				idx+1, len(uploads), supplier, err)
+			c.JSON(499, gin.H{"error": "client canceled before VLM: " + err.Error()})
+			return
+		}
+
 		// Phase A: 改用 Orchestrator (template_id / customPrompt 都不再需要, 走 strategy.body)
 		// Phase B+ (2026-09-03): VLM-only 模式
 		res, err := h.Orchestrator.Parse(c.Request.Context(), u.bytes, u.header.Filename,
@@ -752,7 +764,17 @@ func (h *Handler) CreateSession(c *gin.Context) {
 	s.Note = note
 	s.Rows = allRows
 	s.AnalysisStatus = "pending" // W4.1: 立即 pending, 后台跑分析
-	if err := h.Sessions.Create(c.Request.Context(), s); err != nil {
+
+	// 2026-09-04 修复: 客户端断开(企微 60s ReadTimeout)会让 c.Request.Context()
+	//   立即 canceled,但 VLM 12 条已经成功解析,数据不能丢。
+	//   关键路径 (Create / Get / enrich / AttachPlanQty) 必须 detach 客户端 ctx,
+	//   否则刚解析出的数据因为客户端早断而落库失败 = 重大事故。
+	//   保留 trace values,只去掉 cancel 链。
+	writeCtx, writeCancel := context.WithTimeout(
+		context.WithoutCancel(c.Request.Context()), 15*time.Second)
+	defer writeCancel()
+
+	if err := h.Sessions.Create(writeCtx, s); err != nil {
 		// 2026-09-04 增强日志: 线上事故未确定 500 真因, 显式记 session_id + rows 数量 + err
 		log.Printf("[CreateSession] Sessions.Create 失败: session_id=%s supplier=%s rows=%d note=%q err=%v",
 			s.ID, s.SupplierName, len(s.Rows), s.Note, err)
@@ -760,16 +782,16 @@ func (h *Handler) CreateSession(c *gin.Context) {
 		return
 	}
 	// 回填 row_id
-	if saved, err := h.Sessions.Get(c.Request.Context(), id); err == nil && saved != nil {
+	if saved, err := h.Sessions.Get(writeCtx, id); err == nil && saved != nil {
 		s.Rows = saved.Rows
 	}
 	// 采购模式 + 有 restock 服务: 附加 plan_qty
 	if s.Mode == model.ModePurchase && h.RestockSvc != nil {
-		_ = h.RestockSvc.AttachPlanQtyToRows(c.Request.Context(), s.SupplierName, s.Rows)
+		_ = h.RestockSvc.AttachPlanQtyToRows(writeCtx, s.SupplierName, s.Rows)
 	}
 	// 2026-09-03: 反查 hbpos t_bd_item_info, 把 barcode → item_no 写到 row.ItemNo
 	//   企业微信"复制"按钮要的就是 item_no, 不是条码; cube 失败也不阻塞
-	h.enrichRowsWithItemNo(c.Request.Context(), s.Rows)
+	h.enrichRowsWithItemNo(writeCtx, s.Rows)
 	// W4.1: 异步触发策略分析 (立即返回, 不等 LLM)
 	if s.Mode == model.ModePurchase && h.AlertSvc != nil {
 		h.AlertSvc.StartAnalysisAsync(id, h.Sessions.Get)
