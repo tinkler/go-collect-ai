@@ -68,10 +68,8 @@ func main() {
 	sessionRepo := store.NewSessionRepo(pool)
 	strategyRepo := store.NewStrategyRepo(pool) // Phase A (2026-09-02)
 
-	// Phase B+ (2026-09-03): VLM-only 模式, 不再需要 OCR client
-	//   2026-09-04 双引擎重构: VLM client 删除, 引擎1 改 glmocr (prime-sync), 引擎2 DeepSeek 视觉
-	//   llmClient 保留给 seasonClassifier 等用
-	llmClient := bigmodel.NewLlmClient(cfg.BigModelAPIKey, cfg.BigModelBase, cfg.LlmTimeoutSec)
+	// llmClient 保留给 seasonClassifier 等用
+	// llmClient := bigmodel.NewLlmClient(cfg.BigModelAPIKey, cfg.BigModelBase, cfg.LlmTimeoutSec)
 	// 数据源: 启动后即固定,只走 .env / cfg 配置 (2026-08-31 简化,移除 dsstate 持久化 + 切换 API)
 	initialDS := cfg.DataSource
 	log.Printf("[main] datasource: %s (from env/cfg, 启动后即固定)", initialDS)
@@ -123,8 +121,8 @@ func main() {
 	})
 	restockSvc := restock.NewService(restockCfg, pool, restockCube)
 	// W3.5: 季节判定分类器 (关键词快速 + LLM 慢路径 + 6h 缓存)
-	seasonClassifier := buildSeasonClassifier(llmClient)
-	alertSvc := purchasealert.NewServiceWithClassifier(pool, seasonClassifier)                                // W3.2+W3.5
+	// seasonClassifier := buildSeasonClassifier(llmClient)
+	// alertSvc := purchasealert.NewServiceWithClassifier(pool, seasonClassifier)                                // W3.2+W3.5
 	promoAlertSvc := promotionalert.NewService(pool, strings.TrimSpace(os.Getenv("PROMOTION_ALERT_CHAT_ID"))) // W3.3: 堆头费到期预警 (空=禁用)
 	supplierPaySvc := supplierpayment.NewService(pool, strings.TrimSpace(os.Getenv("OWNER_CHAT_ID")))         // W4.3: 供应商结算 cron
 	// W5: cube 数据源注入 (默认 Noop, 设 COLLECTAI_CUBE_QUERIER=real 接真实 cube)
@@ -180,7 +178,7 @@ func main() {
 		CashRepo:    cashRepo,    // W4
 		PayRepo:     payRepo,     // W4
 		RestockSvc:  restockSvc,  // 2026-08-28: 采购收货单附加 plan_qty
-		AlertSvc:    alertSvc,    // 2026-09-01 W3.2: 采购订单智能提醒
+		AlertSvc:    nil,         // 2026-09-01 W3.2: 采购订单智能提醒
 		AgentRunner: agentRunner, // W2.5: H5 端 Agent chat
 		// Phase B+ (2026-09-03): 删 DefaultOcrModel/DefaultLlmModel 字段 (VLM 内部固定)
 	}
@@ -258,8 +256,8 @@ func main() {
 	//   alertSvc.Apply 优先调 agentRunner.RunAnalysis 跑 purchase-alert skill
 	//   LLM 不可用 / skill 缺失 / 跑失败 → fallback 到 Go rules
 	if agentRunner != nil && skillStore != nil {
-		alertSvc.SetAgentRunner(agentRunner)
-		alertSvc.SetSkillLoader(&skillStoreAdapter{store: skillStore})
+		// alertSvc.SetAgentRunner(agentRunner)
+		// alertSvc.SetSkillLoader(&skillStoreAdapter{store: skillStore})
 		log.Printf("[main] alertSvc 走 LLM skill 路径 (purchase-alert), 失败 fallback Go rules")
 	} else {
 		log.Printf("[main] alertSvc 走 Go rules fallback (agentRunner=%v skillStore=%v)",
