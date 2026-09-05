@@ -135,24 +135,108 @@ func (s *Store) SetRolePermissions(ctx context.Context, roleID string, perms []s
 // ============== User Role ==============
 
 // GrantRole grants role to user. Idempotent.
+//
+// 单角色同步 (2026-09-05): 鉴权热路径只读 users.role 单字段 + rolePerms 内存缓存,
+// 不读 user_roles 表;因此 GrantRole 必须把生效的 primary role 同步写到 users.role,
+// 否则授权后重新登录 / 重启后端都不生效 (见 router.go#L156-176 的 RequirePerm 链路).
+//
+// 规则:
+//   - IsPrimary=true: 先清空该 user 其他 is_primary=true 行 (保证 primary 唯一)
+//   - UPSERT user_roles
+//   - 若 user 当前无任何 is_primary=true 的有效角色 → 把本次 grant 升为 primary
+//     (覆盖 admin 前端不勾 IsPrimary 的常见场景, 至少让一个角色生效)
+//   - 同步 users.role = 该 user 当前有效 primary role_id
 func (s *Store) GrantRole(ctx context.Context, ur *UserRole) error {
-	_, err := s.Pool.Exec(ctx, `
+	tx, err := s.Pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck
+
+	if ur.IsPrimary {
+		if _, err := tx.Exec(ctx, `UPDATE user_roles SET is_primary=false WHERE user_id=$1 AND is_primary=true`, ur.UserID); err != nil {
+			return err
+		}
+	}
+	if _, err := tx.Exec(ctx, `
 		INSERT INTO user_roles (user_id, role_id, scope_type, scope_id, is_primary, granted_by, expires_at)
 		VALUES ($1,$2,$3,$4,$5,$6,$7)
 		ON CONFLICT (user_id, role_id, scope_type, scope_id) DO UPDATE SET
 			is_primary = EXCLUDED.is_primary,
 			granted_by = EXCLUDED.granted_by,
 			expires_at = EXCLUDED.expires_at
-	`, ur.UserID, ur.RoleID, ur.ScopeType, ur.ScopeID, ur.IsPrimary, ur.GrantedBy, ur.ExpiresAt)
-	return err
+	`, ur.UserID, ur.RoleID, ur.ScopeType, ur.ScopeID, ur.IsPrimary, ur.GrantedBy, ur.ExpiresAt); err != nil {
+		return err
+	}
+	// 兜底: 若 user 当前没有 is_primary=true 的有效角色, 把本次 grant 升为 primary
+	//   (admin 前端没勾 IsPrimary 时, 至少让一个角色生效, 避免授权后仍无权限)
+	if _, err := tx.Exec(ctx, `
+		UPDATE user_roles ur SET is_primary=true
+		WHERE user_id=$1 AND role_id=$2 AND scope_type=$3 AND scope_id=$4
+		  AND NOT EXISTS (
+		    SELECT 1 FROM user_roles
+		    WHERE user_id=$1 AND is_primary=true
+		      AND (expires_at IS NULL OR expires_at > now())
+		  )
+	`, ur.UserID, ur.RoleID, ur.ScopeType, ur.ScopeID); err != nil {
+		return err
+	}
+	// 同步 users.role = 当前有效 primary role_id (无则保留原值)
+	if _, err := tx.Exec(ctx, `
+		UPDATE users SET
+			role = COALESCE((
+				SELECT role_id FROM user_roles
+				WHERE user_id=$1 AND is_primary=true
+				  AND (expires_at IS NULL OR expires_at > now())
+				ORDER BY granted_at DESC LIMIT 1
+			), users.role),
+			updated_at = now()
+		WHERE id=$1
+	`, ur.UserID); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
 }
 
+// RevokeRole 删除 user_roles 绑定, 并在必要时回填 users.role.
+//
+// 单角色同步 (2026-09-05): 若被删的 role_id == users.role (即当前生效的主角色),
+// 需从剩余有效角色里挑一个回填: is_primary=true 优先, 否则 granted_at 最早的;
+// 都没有则退回 'cashier' (登录时的默认最小角色).
 func (s *Store) RevokeRole(ctx context.Context, userID, roleID, scopeType, scopeID string) error {
-	_, err := s.Pool.Exec(ctx, `
+	tx, err := s.Pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck
+
+	var currentRole string
+	_ = tx.QueryRow(ctx, `SELECT COALESCE(role,'') FROM users WHERE id=$1`, userID).Scan(&currentRole)
+
+	if _, err := tx.Exec(ctx, `
 		DELETE FROM user_roles
 		WHERE user_id=$1 AND role_id=$2 AND scope_type=$3 AND scope_id=$4
-	`, userID, roleID, scopeType, scopeID)
-	return err
+	`, userID, roleID, scopeType, scopeID); err != nil {
+		return err
+	}
+
+	// 被删的就是 users.role 当前值 → 需要回填
+	if currentRole == roleID {
+		var newRole string
+		err := tx.QueryRow(ctx, `
+			SELECT role_id FROM user_roles
+			WHERE user_id=$1 AND (expires_at IS NULL OR expires_at > now())
+			ORDER BY is_primary DESC, granted_at ASC
+			LIMIT 1
+		`, userID).Scan(&newRole)
+		if err != nil || newRole == "" {
+			newRole = "cashier" // 退回登录默认角色 (UpsertUserByExternalID 的兜底)
+		}
+		if _, err := tx.Exec(ctx, `UPDATE users SET role=$2, updated_at=now() WHERE id=$1`, userID, newRole); err != nil {
+			return err
+		}
+	}
+	return tx.Commit(ctx)
 }
 
 // ListUserRoles returns active (non-expired) roles for user.
