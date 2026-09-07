@@ -51,6 +51,9 @@ type Handler struct {
 	RestockSvc   *restock.Service
 	AlertSvc     *purchasealert.Service
 	AgentRunner  *agent.Runner
+	// 2026-09-07: POP 打印页 LOGO 配置 (启动时读 env POP_LOGO_NAME / POP_LOGO_FILE)
+	PopLogoName string
+	PopLogoFile string
 	// Phase B+ (2026-09-03): 删 DefaultOcrModel/DefaultLlmModel 字段 (VLM 内部固定 glm-4v)
 }
 
@@ -66,6 +69,35 @@ type uploaded struct {
 
 func (h *Handler) Health(c *gin.Context) {
 	c.JSON(200, gin.H{"status": "ok", "ts": time.Now().Unix()})
+}
+
+// ============== System 配置 (POP 打印 LOGO 等) ==============
+//
+//	GetPopConfig GET /api/v1/system/pop-config
+//	2026-09-07: POP 打印页用, 前端拉 LOGO 配置
+//	  启动时配置: env POP_LOGO_NAME / POP_LOGO_FILE
+//	  静态文件:   uploads/<POP_LOGO_FILE> (e.g. uploads/pop-logo.png) 存在 → 用图片
+//	返回:
+//	  {
+//	    "logo_name": "小商超",
+//	    "logo_url":  "/uploads/pop-logo.png"  // 不存在时为空字符串
+//	  }
+//	权限: 公开 (前端登录前就要知道 LOGO, 否则首屏空白)
+func (h *Handler) GetPopConfig(c *gin.Context) {
+	logoName := h.PopLogoName
+	logoFile := h.PopLogoFile
+	logoURL := ""
+	if logoFile != "" {
+		// 检查 uploads/<file> 是否存在
+		abs := filepath.Join(h.UploadDir, logoFile)
+		if _, err := os.Stat(abs); err == nil {
+			logoURL = "/uploads/" + logoFile
+		}
+	}
+	c.JSON(200, gin.H{
+		"logo_name": logoName,
+		"logo_url":  logoURL,
+	})
 }
 
 // ============== Suppliers ==============
@@ -1444,4 +1476,136 @@ func (h *Handler) SearchProducts(c *gin.Context) {
 			"supplier_viewable": supplierViewable,
 		},
 	})
+}
+
+// ============== POP 打印用: 查商品当前生效促销 (2026-09-07) ==============
+//
+//	GET /api/v1/products/promo?barcode=xxx
+//	数据源: cube promotion_active_price (hbpos, t_pub_plan_flow, 1:1 barcode 查)
+//	权限: session:read (跟 SearchProducts 同)
+//	返回: { promo: null } | { promo: { price, orig_price, begin, end, plan_no } }
+//
+//	设计:
+//	- 走 h.Agent.Execute 直调 cube (promotion 是业务专用 cube, 不走 mapping registry)
+//	- min_promo_price 拿最低 (多 plan 同一 item 时取最便宜)
+//	- 7 天内窗口 (cube 内部 WHERE 限定, POP 打印用 7 天足够)
+//	- time dim begin_date / end_date: 给前端展示活动期
+//	- 失败容错: agent 不可达 / cube 不存在 → 返 { promo: null } (前端降级走手动切特价)
+func (h *Handler) SearchProductPromo(c *gin.Context) {
+	barcode := strings.TrimSpace(c.Query("barcode"))
+	if barcode == "" {
+		c.JSON(400, gin.H{"error": "missing barcode"})
+		return
+	}
+	if err := h.Agent.Ping(); err != nil {
+		// agent 不可达时静默降级 (POP 打印主流程不依赖 promo, 手动切特价兜底)
+		c.JSON(200, gin.H{"promo": nil, "reason": "agent unreachable"})
+		return
+	}
+	rows, err := h.Agent.Execute(
+		"promotion_active_price",
+		[]string{"promotion_active_price.min_promo_price"},
+		[]string{
+			"promotion_active_price.item_no",
+			"promotion_active_price.plan_no",
+			"promotion_active_price.orig_price",
+			"promotion_active_price.promo_price",
+			"promotion_active_price.begin_date",
+			"promotion_active_price.end_date",
+		},
+		[]map[string]any{
+			{"member": "promotion_active_price.item_no", "operator": "equals", "values": []any{barcode}},
+		},
+		nil,
+		20, // 多 plan 同一 item 拿全, 前端取 min
+	)
+	if err != nil {
+		// cube 不存在 / SQL 错 → 降级返 null
+		c.JSON(200, gin.H{"promo": nil, "reason": "query failed: " + err.Error()})
+		return
+	}
+	if len(rows) == 0 {
+		c.JSON(200, gin.H{"promo": nil})
+		return
+	}
+	// 多 plan 时挑 min_promo_price 最低
+	var best map[string]any
+	minPrice := 1e18
+	for _, r := range rows {
+		// 兼容裸名 / 带 cube. 前缀 两种 key 形式 (agent client 实际行为: 不带前缀, 只带 measure 后缀)
+		v := promoFloat(r["min_promo_price"])
+		if v == 0 {
+			v = promoFloat(r["promotion_active_price.min_promo_price"])
+		}
+		if v > 0 && v < minPrice {
+			minPrice = v
+			best = r
+		}
+	}
+	// 2026-09-07: debug log — 看实际 map 长啥样 (keys + types)
+	if best != nil {
+		log.Printf("[promo] best keys=%v", mapKeys(best))
+		for k, v := range best {
+			log.Printf("[promo]   %s = %T %v", k, v, v)
+		}
+	}
+	if best == nil {
+		c.JSON(200, gin.H{"promo": nil})
+		return
+	}
+	// 时间格式兼容: cube 可能返 string ("2025-11-01T00:00:00Z") 或 time.Time
+	// 统一截前 10 位 yyyy-mm-dd
+	parseDate := func(v any) string {
+		if v == nil {
+			return ""
+		}
+		s := fmt.Sprint(v)
+		if len(s) >= 10 {
+			return s[:10]
+		}
+		return s
+	}
+	// 2026-09-07 fix: cube /v1/load 返的 row key 是 "promotion_active_price.orig_price" (带 cube 前缀),
+	//   裸名 key 拿不到. 用 helper 兼容两种 key
+	get := func(key string) any {
+		if v, ok := best[key]; ok { return v }
+		if v, ok := best["promotion_active_price."+key]; ok { return v }
+		return nil
+	}
+	c.JSON(200, gin.H{
+		"promo": gin.H{
+			"price":      minPrice,
+			"orig_price": promoFloat(get("orig_price")),
+			"begin":      parseDate(get("begin_date")),
+			"end":        parseDate(get("end_date")),
+			"plan_no":    get("plan_no"),
+		},
+	})
+}
+
+// promoFloat 安全转 any → float64 (cube 返回数字可能是 float64 / int / string)
+func promoFloat(v any) float64 {
+	switch x := v.(type) {
+	case float64:
+		return x
+	case float32:
+		return float64(x)
+	case int:
+		return float64(x)
+	case int64:
+		return float64(x)
+	case string:
+		f, _ := strconv.ParseFloat(x, 64)
+		return f
+	}
+	return 0
+}
+
+// 2026-09-07: debug helper — 取 map 的所有 key
+func mapKeys(m map[string]any) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	return keys
 }

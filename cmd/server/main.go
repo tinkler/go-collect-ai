@@ -165,6 +165,9 @@ func main() {
 		UploadDir:  cfg.UploadDir,
 		PublicBase: cfg.PublicBaseURL,
 		MaxUpload:  int64(cfg.MaxUploadMB) * 1024 * 1024,
+		// 2026-09-07: POP 打印 LOGO 配置 (启动时从 env 读, 前端通过 /system/pop-config 拉)
+		PopLogoName: cfg.PopLogoName,
+		PopLogoFile: cfg.PopLogoFile,
 		// Phase A (2026-09-02): Orchestrator 字段在 agentRunner 初始化后填(下方)
 		Orchestrator: nil,
 		Agent:        agentClient,

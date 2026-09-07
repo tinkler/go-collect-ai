@@ -30,6 +30,13 @@ type Config struct {
 	MaxUploadMB   int    `mapstructure:"MAX_UPLOAD_MB"`
 	PublicBaseURL string `mapstructure:"PUBLIC_BASE_URL"` // 用于生成图片 URL, 飞书 H5 用
 
+	// 2026-09-07: POP 打印页 LOGO 配置
+	//   - PopLogoName: 商超名 (e.g. "小商超"), 出现在 POP 模板顶部
+	//   - PopLogoFile: 静态 LOGO 文件名 (放在 UploadDir 下, e.g. "pop-logo.png")
+	//                 存在则前端用图片, 不存在则只用文字名
+	PopLogoName string `mapstructure:"POP_LOGO_NAME"`
+	PopLogoFile string `mapstructure:"POP_LOGO_FILE"`
+
 	// PostgreSQL
 	PGHost     string `mapstructure:"PG_HOST"`
 	PGPort     int    `mapstructure:"PG_PORT"`
@@ -112,6 +119,7 @@ type Config struct {
 // (按字段名直接 match env var, 不加前缀以保持向后兼容)
 var leaves = []string{
 	"PORT", "UPLOAD_DIR", "MAX_UPLOAD_MB", "PUBLIC_BASE_URL",
+	"POP_LOGO_NAME", "POP_LOGO_FILE",  // 2026-09-07: POP 打印页 LOGO 配置
 	"PG_HOST", "PG_PORT", "PG_USER", "PG_PASSWORD", "PG_DATABASE",
 	"BIGMODEL_API_KEY", "BIGMODEL_BASE", "OCR_MODEL", "LLM_MODEL",
 	// 双引擎引擎2 (2026-09-04): DeepSeek 视觉模型, 必须 BindEnv 否则 SetDefault("") 会压住 OS env
@@ -187,6 +195,9 @@ func Load() (*Config, error) {
 	v.SetDefault("UPLOAD_DIR", "./uploads")
 	v.SetDefault("MAX_UPLOAD_MB", 16)
 	v.SetDefault("PUBLIC_BASE_URL", "")
+	// 2026-09-07: POP 打印 LOGO 默认值 (用户用环境变量覆盖, 或把图片放到 uploads/pop-logo.png)
+	v.SetDefault("POP_LOGO_NAME", "小商超")
+	v.SetDefault("POP_LOGO_FILE", "pop-logo.png")
 
 	v.SetDefault("PG_HOST", "127.0.0.1")
 	v.SetDefault("PG_PORT", 5432)

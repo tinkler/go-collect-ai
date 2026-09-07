@@ -61,6 +61,8 @@ func NewRouter(h *handler.Handler, cfg *config.Config, restockSvc *restock.Servi
 	{
 		// health (公开)
 		api.GET("/health", h.Health)
+		// 2026-09-07: POP 打印 LOGO 配置 (公开, 前端登录前就要拉)
+		api.GET("/system/pop-config", h.GetPopConfig)
 
 		// WECOM JS-SDK 签名 (公开, 走企业微信 H5 自建应用调用)
 		//   dev 模式: 返 503 + reason=dev_mode, 前端 fallback 手动输入
@@ -138,6 +140,10 @@ func NewRouter(h *handler.Handler, cfg *config.Config, restockSvc *restock.Servi
 
 			// 业务层 API(2026-08-31: /datasources 端点删除,数据源启动后即固定)
 			authed.GET("/products/search", auth.RequirePerm("session:read"), h.SearchProducts)
+			// 2026-09-07: POP 打印用 — 查商品当前生效促销价
+			//   perm=session:read 跟 searchProducts 同 (最基础, 任何登录用户都能用)
+			//   走 cube promotion_active_price (hbpos 数据源, 7 天窗口, 1:1 barcode 查)
+			authed.GET("/products/promo", auth.RequirePerm("session:read"), h.SearchProductPromo)
 
 			// restock (2026-09-02 重构精简)
 			//   4 个端点, 不分 date / office / floor, 不推群
