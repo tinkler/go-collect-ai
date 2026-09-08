@@ -313,6 +313,56 @@ func (e *Executor) query(
 	return e.mapper.ToBusinessResponse(entity, ds, rows, bizFields)
 }
 
+// ============================================================
+// freshcheck 模块方法 (W1.3, 2026-09-09)
+// 配套: cube-agent-server feat/freshcheck-cube 的 2 个 plugin
+// 风格: 跟 SearchProducts 保持一致, 无 ctx, 返 []map[string]any
+// ============================================================
+
+// SalesWithRefundInWindow 拉窗口内销售流水(含退货标记)
+//   - 给 freshcheck Step 2 退货回冲用
+//   - 返业务字段名, 调用方按 is_refund 过滤退货
+//   - 配套: configs/mappings.yaml entities.sales_with_refund
+func (e *Executor) SalesWithRefundInWindow(branchNo string, startUnix, endUnix int64, limit int) ([]map[string]any, error) {
+	bizFields := []string{
+		"row_id", "oper_date", "branch_no", "item_no", "item_name",
+		"item_clsno", "item_clsname", "item_brand", "main_supcust",
+		"sell_way", "is_refund", "voucher_no", "origin_flow_id",
+		"sale_qnty", "sale_money", "total_cost", "gross_profit",
+		"refund_qnty", "refund_amt",
+	}
+	filters := []BusinessFilter{}
+	if branchNo != "" {
+		filters = append(filters, BusinessFilter{Field: "branch_no", Op: "equals", Values: []any{branchNo}})
+	}
+	// 暂不传 time filter 到 cube (cube 端 SQL 自带近 1 年过滤),
+	// freshcheck 调用方拿到行后按 oper_date 二次过滤 [startUnix, endUnix]
+	if limit <= 0 {
+		limit = 10000
+	}
+	return e.query("sales_with_refund", e.client.GetDataSource(), bizFields, filters, limit)
+}
+
+// FreshItemsByCategory 拉某生鲜子类下的所有 SKU
+//   - 给 freshcheck W1 建账用 (筛 leaf/root/aquatic/meat/frozen)
+//   - freshCategory 为空时拉全量生鲜 (fresh_category NOT NULL)
+//   - 配套: configs/mappings.yaml entities.items_with_clsno
+func (e *Executor) FreshItemsByCategory(freshCategory string, limit int) ([]map[string]any, error) {
+	bizFields := []string{
+		"item_no", "item_name", "item_clsno", "item_clsname",
+		"item_brand", "item_brandname", "main_supcust", "unit",
+		"fresh_category", "turnover_class", "stock_qty",
+	}
+	filters := []BusinessFilter{}
+	if freshCategory != "" {
+		filters = append(filters, BusinessFilter{Field: "fresh_category", Op: "equals", Values: []any{freshCategory}})
+	}
+	if limit <= 0 {
+		limit = 10000
+	}
+	return e.query("items_with_clsno", e.client.GetDataSource(), bizFields, filters, limit)
+}
+
 // splitAndTrim 按多个分隔符切字符串并去重 trim
 func splitAndTrim(s string, seps string) []string {
 	parts := strings.FieldsFunc(s, func(r rune) bool {

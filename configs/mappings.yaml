@@ -184,3 +184,160 @@ entities:
           create_date:   supplier_returns.oper_date
           branch_no:     supplier_returns.branch_no
       # 未来加 erp 源: 暂未实现, 等业务需要再补
+
+  # ============================================================
+  # freshcheck 生鲜免日盘管理 (W1.3, 2026-09-09)
+  # 配套: cube-agent-server feat/freshcheck-cube 分支的 2 个 plugin
+  #   - sales_with_refund  (含退货标记 + 原单号, 给 Step 2 退货回冲用)
+  #   - items_with_clsno   (含生鲜子类派生, 给建账筛 SKU 用)
+  # ============================================================
+
+  # ----- sales_with_refund: 销售流水全集(含退货) -----
+  sales_with_refund:
+    name: sales_with_refund
+    description: 销售流水全集(含退货标记 + 原单号, 给 freshcheck 周期结算的退货回冲算法用)
+    fields:
+      row_id:
+        type: dimension
+        description: 伪 PK (ROW_NUMBER 派生, 实际查询用 cube 直接按 time filter)
+      oper_date:
+        type: time
+        description: 销售时间 (oper_date, support dateRange + granularity)
+      branch_no:
+        type: dimension
+        description: 门店编号
+      item_no:
+        type: dimension
+        description: 商品货号
+      item_name:
+        type: dimension
+        description: 商品名
+      item_clsno:
+        type: dimension
+        description: 商品分类编码
+      item_clsname:
+        type: dimension
+        description: 商品分类名
+      item_brand:
+        type: dimension
+        description: 品牌
+      main_supcust:
+        type: dimension
+        description: 主供应商
+      sell_way:
+        type: dimension
+        description: 思迅 sell_way 原值 (A=正/B=退, 需 introspect 确认)
+      is_refund:
+        type: dimension
+        description: 是否退货 (0/1, 业务层翻译)
+      voucher_no:
+        type: dimension
+        description: 原单号 (退单关联正单, 跨期回冲靠这个)
+      origin_flow_id:
+        type: dimension
+        description: 退单原 flow_id (若 t_rm_saleflow 有此字段)
+      sale_qnty:
+        type: measure
+        description: 销量 (退货为负, sum 自动抵消)
+      sale_money:
+        type: measure
+        description: 销售额
+      total_cost:
+        type: measure
+        description: 成本 (in_price * sale_qnty)
+      gross_profit:
+        type: measure
+        description: 毛利 (sale_money - total_cost)
+      refund_qnty:
+        type: measure
+        description: 退货总量 (绝对值, 校验用)
+      refund_amt:
+        type: measure
+        description: 退货总额 (绝对值)
+    sources:
+      hbpos:
+        # cube: cube-agent-server/feat/freshcheck-cube (commit b9a06fa)
+        cube: sales_with_refund
+        fields:
+          row_id:        sales_with_refund.row_id
+          oper_date:     sales_with_refund.oper_date
+          branch_no:     sales_with_refund.branch_no
+          item_no:       sales_with_refund.item_no
+          item_name:     sales_with_refund.item_name
+          item_clsno:    sales_with_refund.item_clsno
+          item_clsname:  sales_with_refund.item_clsname
+          item_brand:    sales_with_refund.item_brand
+          main_supcust:  sales_with_refund.main_supcust
+          sell_way:      sales_with_refund.sell_way
+          is_refund:     sales_with_refund.is_refund
+          voucher_no:    sales_with_refund.voucher_no
+          origin_flow_id: sales_with_refund.origin_flow_id
+          sale_qnty:     sales_with_refund.sale_qnty
+          sale_money:    sales_with_refund.sale_money
+          total_cost:    sales_with_refund.total_cost
+          gross_profit:  sales_with_refund.gross_profit
+          refund_qnty:   sales_with_refund.refund_qnty
+          refund_amt:    sales_with_refund.refund_amt
+      # 未来加 erp 源: 暂未实现, 等业务需要再补
+
+  # ----- items_with_clsno: 商品主表 + 生鲜子类派生 -----
+  items_with_clsno:
+    name: items_with_clsno
+    description: 商品主表(11W 行全集) + 生鲜子类派生(fresh_category) + 快/慢周转(turnover_class) + 库存聚合(stock_qty)
+    fields:
+      item_no:
+        type: dimension
+        description: 商品货号 (PK)
+      item_name:
+        type: dimension
+        description: 商品名
+      item_clsno:
+        type: dimension
+        description: 商品分类编码
+      item_clsname:
+        type: dimension
+        description: 商品分类名
+      item_brand:
+        type: dimension
+        description: 品牌
+      item_brandname:
+        type: dimension
+        description: 品牌名
+      main_supcust:
+        type: dimension
+        description: 主供应商
+      unit:
+        type: dimension
+        description: 计量单位
+      fresh_category:
+        type: dimension
+        description: 生鲜子类 (leaf/root/aquatic/meat/frozen, NULL=非生鲜)
+        # 业务枚举值
+        value_map:
+          leaf: 'leaf'
+          root: 'root'
+          aquatic: 'aquatic'
+          meat: 'meat'
+          frozen: 'frozen'
+      turnover_class:
+        type: dimension
+        description: 快/慢周转 (fast/slow, 决定损耗模型)
+      stock_qty:
+        type: measure
+        description: 库存总量 (Scalar Subquery SUM, 跟 t_bd_item_info 复用)
+    sources:
+      hbpos:
+        cube: items_with_clsno
+        fields:
+          item_no:         items_with_clsno.item_no
+          item_name:       items_with_clsno.item_name
+          item_clsno:      items_with_clsno.item_clsno
+          item_clsname:    items_with_clsno.item_clsname
+          item_brand:      items_with_clsno.item_brand
+          item_brandname:  items_with_clsno.item_brandname
+          main_supcust:    items_with_clsno.main_supcust
+          unit:            items_with_clsno.unit
+          fresh_category:  items_with_clsno.fresh_category
+          turnover_class:  items_with_clsno.turnover_class
+          stock_qty:       items_with_clsno.stock_qty
+      # 未来加 erp 源: 暂未实现, 等业务需要再补
