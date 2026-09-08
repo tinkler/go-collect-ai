@@ -303,6 +303,58 @@ func (s *Store) HTTPHealth(c *gin.Context) {
 	})
 }
 
+// ============== 6. C7 同步校验 (W1.6) ==============
+//
+// HTTPHealthSyncCheck 手动触发 C7 校验
+//   body: { branch_no?: string }
+//   admin / freshcheck:override 权限
+//   返回 SyncResult JSON
+func (s *Store) HTTPHealthSyncCheck(sc *SyncChecker) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		var req struct {
+			BranchNo string `json:"branch_no"`
+		}
+		_ = c.ShouldBindJSON(&req)
+		branchNo := req.BranchNo
+		if branchNo == "" {
+			branchNo = "0001"
+		}
+
+		// 临时切到请求 branchNo
+		oldBranch := sc.BranchNo
+		sc.BranchNo = branchNo
+		defer func() { sc.BranchNo = oldBranch }()
+
+		res, err := sc.RunOnce(c.Request.Context())
+		if res == nil {
+			c.JSON(500, gin.H{"error": "nil result"})
+			return
+		}
+		status := 200
+		if !res.OK {
+			status = 409 // C7 失败语义用 409
+		}
+		if err != nil {
+			c.JSON(status, gin.H{
+				"ok":            res.OK,
+				"window_start":  res.WindowStart,
+				"window_end":    res.WindowEnd,
+				"cube_value":    res.CubeValue,
+				"source_value":  res.SourceValue,
+				"diff_abs":      res.DiffAbs,
+				"diff_pct":      res.DiffPct,
+				"threshold_pct": res.ThresholdPct,
+				"source_rows":   res.SourceRows,
+				"duration_ms":   res.DurationMs,
+				"query_sql":     res.QuerySQL,
+				"error":         res.ErrorMessage,
+			})
+			return
+		}
+		c.JSON(status, res)
+	}
+}
+
 // ============== helper ==============
 
 // StatusIntToStr (防止 w1.4 之后的代码引用, 保留兼容)

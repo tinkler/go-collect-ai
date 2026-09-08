@@ -130,6 +130,26 @@ func main() {
 	} else {
 		log.Printf("[main] freshcheck: 13 张表就绪")
 	}
+
+	// freshcheck C7 同步校验 (W1.6, 2026-09-09)
+	//   需要 business.Gateway 调 cube (复用 restock 的 gateway)
+	//   需要 SourceClient 调 cube-agent-server /admin/source-direct
+	//   CRITICAL: 不直连思迅, 走 cube-agent-server 代理 (AGENTS.md §12.1)
+	var freshcheckSync *freshcheck.SyncChecker
+	if os.Getenv("FRESHCHECK_C7_CUBE_URL") == "" {
+		log.Printf("[main] freshcheck C7 未启动: FRESHCHECK_C7_CUBE_URL 未设 (例: http://127.0.0.1:8088)")
+	} else {
+		branchNo := strings.TrimSpace(os.Getenv("RESTOCK_BRANCH_NO"))
+		if branchNo == "" {
+			branchNo = "0001"
+		}
+		// 复用现有 gateway 构造 CubeQuerier
+		freshcheckCube := freshcheck.NewCubeQuerier(gateway, freshcheckStore)
+		freshcheckSource := freshcheck.NewSourceClient(os.Getenv("FRESHCHECK_C7_CUBE_URL"))
+		freshcheckSync = freshcheck.NewSyncChecker(freshcheckStore, freshcheckCube, freshcheckSource, branchNo)
+		freshcheckSync.Start(context.Background())
+		log.Printf("[main] freshcheck C7 cron 启动 (branch=%s cube_url=%s)", branchNo, os.Getenv("FRESHCHECK_C7_CUBE_URL"))
+	}
 	// W3.5: 季节判定分类器 (关键词快速 + LLM 慢路径 + 6h 缓存)
 	// seasonClassifier := buildSeasonClassifier(llmClient)
 	// alertSvc := purchasealert.NewServiceWithClassifier(pool, seasonClassifier)                                // W3.2+W3.5
@@ -390,7 +410,7 @@ func main() {
 	wxSvc := wxsign.New(cfg.WeComCorpID, cfg.WeComAgentID, cfg.WeComCorpSecret)
 	log.Printf("[main] wxsign: configured=%v (corp_id=%q agent_id=%q)", wxSvc.IsConfigured(), cfg.WeComCorpID, cfg.WeComAgentID)
 
-	r := api.NewRouter(h, cfg, restockSvc, authSvc, authSign, rbacStore, wxSvc, freshcheckStore)
+	r := api.NewRouter(h, cfg, restockSvc, authSvc, authSign, rbacStore, wxSvc, freshcheckStore, freshcheckSync)
 	log.Printf("[main] 限流: max_concurrent_parse=%d, wait_sec=%d", cfg.MaxConcurrentParse, cfg.RateLimitWaitSec)
 	log.Printf("[main] auth: dev_mode=%v, cookie_domain=%s, cookie_secure=%v, access_ttl=%ds, refresh_ttl=%ds",
 		cfg.DevMode, cfg.CookieDomain, cfg.CookieSecure, cfg.AccessTokenTTLSec, cfg.RefreshTokenTTLSec)
