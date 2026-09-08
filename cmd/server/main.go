@@ -18,6 +18,7 @@ import (
 	"github.com/tinkler/collect-ai/internal/auth"
 	"github.com/tinkler/collect-ai/internal/business"
 	"github.com/tinkler/collect-ai/internal/config"
+	"github.com/tinkler/collect-ai/internal/freshcheck"
 
 	"github.com/gin-gonic/gin"
 	"github.com/tinkler/collect-ai/internal/parser"
@@ -120,6 +121,15 @@ func main() {
 		BindFile:  cfg.WeComBindFile,
 	})
 	restockSvc := restock.NewService(restockCfg, pool, restockCube)
+	// freshcheck 生鲜免日盘 (W1.4, 2026-09-09) — 纯 PG store, 无 cron
+	freshcheckStore := freshcheck.NewStore(pool)
+	if missing, err := freshcheckStore.VerifyTablesExist(context.Background()); err != nil {
+		log.Printf("[main] freshcheck VerifyTablesExist: %v (W1.1 迁移未跑? 启动后表会建)", err)
+	} else if len(missing) > 0 {
+		log.Printf("[main] freshcheck 缺失表: %v (W1.1 迁移未跑, 启动会建)", missing)
+	} else {
+		log.Printf("[main] freshcheck: 13 张表就绪")
+	}
 	// W3.5: 季节判定分类器 (关键词快速 + LLM 慢路径 + 6h 缓存)
 	// seasonClassifier := buildSeasonClassifier(llmClient)
 	// alertSvc := purchasealert.NewServiceWithClassifier(pool, seasonClassifier)                                // W3.2+W3.5
@@ -380,7 +390,7 @@ func main() {
 	wxSvc := wxsign.New(cfg.WeComCorpID, cfg.WeComAgentID, cfg.WeComCorpSecret)
 	log.Printf("[main] wxsign: configured=%v (corp_id=%q agent_id=%q)", wxSvc.IsConfigured(), cfg.WeComCorpID, cfg.WeComAgentID)
 
-	r := api.NewRouter(h, cfg, restockSvc, authSvc, authSign, rbacStore, wxSvc)
+	r := api.NewRouter(h, cfg, restockSvc, authSvc, authSign, rbacStore, wxSvc, freshcheckStore)
 	log.Printf("[main] 限流: max_concurrent_parse=%d, wait_sec=%d", cfg.MaxConcurrentParse, cfg.RateLimitWaitSec)
 	log.Printf("[main] auth: dev_mode=%v, cookie_domain=%s, cookie_secure=%v, access_ttl=%ds, refresh_ttl=%ds",
 		cfg.DevMode, cfg.CookieDomain, cfg.CookieSecure, cfg.AccessTokenTTLSec, cfg.RefreshTokenTTLSec)

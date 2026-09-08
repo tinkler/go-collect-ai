@@ -394,6 +394,40 @@ func Migrate(ctx context.Context, pool *pgxpool.Pool) error {
 		ON CONFLICT (key) DO NOTHING`,
 
 		// ============================================================
+		// freshcheck 模块 RBAC perm seed (W1.4d, 2026-09-09)
+		// 4 个新 perm, 给前端 perm guard + 后端 RequirePerm 用
+		// owner 通配 * 自动覆盖, 不需要单独 seed
+		// ============================================================
+		`INSERT INTO permissions (id, domain, action, description) VALUES
+			('freshcheck:pool:write',     'freshcheck', 'pool:write',     '入框/出框事件录入 (H5 录单用)'),
+			('freshcheck:settle:read',    'freshcheck', 'settle:read',    '查看周期结算结果 (R1-R5 报表)'),
+			('freshcheck:settle:run',     'freshcheck', 'settle:run',     '触发周期结算 + 重算 + 跨期重算'),
+			('freshcheck:config:write',   'freshcheck', 'config:write',   '改生鲜SKU映射/特价码/损耗率/阈值/轨道配置'),
+			('freshcheck:override',       'freshcheck', 'override',       '周期锁超线豁免 + 告警处置')
+		ON CONFLICT (id) DO NOTHING`,
+
+		// ----- role_permissions 关联 -----
+		// 角色策略 (跟 plan.md §6.2 表格对齐):
+		//   - owner    拿 * (不需 seed)
+		//   - manager  拿全部 4 个 freshcheck perm
+		//   - buyer    拿 settle:read + settle:run + config:write
+		//   - floor    只拿 pool:write
+		//   - office   拿 settle:read
+		//   - cashier  无
+		`INSERT INTO role_permissions (role_id, perm_id) VALUES
+			('manager', 'freshcheck:pool:write'),
+			('manager', 'freshcheck:settle:read'),
+			('manager', 'freshcheck:settle:run'),
+			('manager', 'freshcheck:config:write'),
+			('manager', 'freshcheck:override'),
+			('buyer',   'freshcheck:settle:read'),
+			('buyer',   'freshcheck:settle:run'),
+			('buyer',   'freshcheck:config:write'),
+			('floor',   'freshcheck:pool:write'),
+			('office',  'freshcheck:settle:read')
+		ON CONFLICT DO NOTHING`,
+
+		// ============================================================
 		// freshcheck 生鲜免日盘管理 (W1, 2026-09-09)
 		// 需求: docs/生鲜免日盘管理扩展子系统设计需求文档.md v1.0
 		// 设计: docs/freshcheck-{architecture,data-model,settlement}.md

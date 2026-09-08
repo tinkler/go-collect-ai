@@ -11,6 +11,7 @@ import (
 	"github.com/tinkler/collect-ai/internal/api/middleware"
 	"github.com/tinkler/collect-ai/internal/auth"
 	"github.com/tinkler/collect-ai/internal/config"
+	"github.com/tinkler/collect-ai/internal/freshcheck"
 	"github.com/tinkler/collect-ai/internal/rbac"
 	"github.com/tinkler/collect-ai/internal/restock"
 	"github.com/tinkler/collect-ai/internal/wxsign"
@@ -22,7 +23,7 @@ import (
 // Gin 路由中间件顺序约定: 中间件在前, handler 在最后
 //   r.GET("/x", AuthMiddleware(), RequirePerm("p"), handler)
 //   → AuthMiddleware → RequirePerm → handler
-func NewRouter(h *handler.Handler, cfg *config.Config, restockSvc *restock.Service, authSvc *auth.Service, authSign *auth.Signer, rbacStore *rbac.Store, wxSvc *wxsign.Service) *gin.Engine {
+func NewRouter(h *handler.Handler, cfg *config.Config, restockSvc *restock.Service, authSvc *auth.Service, authSign *auth.Signer, rbacStore *rbac.Store, wxSvc *wxsign.Service, freshcheckStore *freshcheck.Store) *gin.Engine {
 	r := gin.New()
 	r.Use(gin.Recovery(), gin.Logger())
 
@@ -155,6 +156,31 @@ func NewRouter(h *handler.Handler, cfg *config.Config, restockSvc *restock.Servi
 			authed.POST("/restock/feedback", restock.RestockFeedback(restockSvc))
 			authed.GET("/restock/purchase-plans", auth.RequirePerm("plan:read"), restock.RestockPurchasePlansList(restockSvc))
 			authed.POST("/restock/cron/tick", auth.RequirePerm("admin"), restock.RestockManualTick(restockSvc))
+
+			// ============== freshcheck 生鲜免日盘管理 (W1.4, 2026-09-09) ==============
+			// 配置类端点 (5 类), 全部走 freshcheck:config:write (写) 或 公开 (读, 由 RequirePerm 控制)
+			//   路由前缀 /api/v1/freshcheck/*
+			//   W2-W4 持续加: pool events / settle / reports
+			fc := freshcheckStore
+			// 健康检查 (公开, 启动 sanity check 用)
+			authed.GET("/freshcheck/health", fc.HTTPHealth)
+			// SKU 映射
+			authed.GET("/freshcheck/config/sku-map", auth.RequirePerm("freshcheck:settle:read"), fc.HTTPListSkuMap)
+			authed.GET("/freshcheck/config/sku-map/:item_no", auth.RequirePerm("freshcheck:settle:read"), fc.HTTPGetSkuMap)
+			authed.PUT("/freshcheck/config/sku-map/:item_no", auth.RequirePerm("freshcheck:config:write"), fc.HTTPUpsertSkuMap)
+			// 特价码
+			authed.GET("/freshcheck/config/pool-codes", auth.RequirePerm("freshcheck:settle:read"), fc.HTTPListPoolCodes)
+			authed.GET("/freshcheck/config/pool-codes/:pool", auth.RequirePerm("freshcheck:settle:read"), fc.HTTPGetPoolCode)
+			authed.PUT("/freshcheck/config/pool-codes/:pool", auth.RequirePerm("freshcheck:config:write"), fc.HTTPUpsertPoolCode)
+			// 损耗率
+			authed.GET("/freshcheck/config/loss-rates", auth.RequirePerm("freshcheck:settle:read"), fc.HTTPListLossRates)
+			authed.PUT("/freshcheck/config/loss-rates", auth.RequirePerm("freshcheck:config:write"), fc.HTTPUpsertLossRate)
+			// 业务阈值
+			authed.GET("/freshcheck/config/thresholds", auth.RequirePerm("freshcheck:settle:read"), fc.HTTPListThresholds)
+			authed.PUT("/freshcheck/config/thresholds/:key", auth.RequirePerm("freshcheck:config:write"), fc.HTTPUpdateThreshold)
+			// 品类结算轨道
+			authed.GET("/freshcheck/config/category-tracks", auth.RequirePerm("freshcheck:settle:read"), fc.HTTPListCategoryTracks)
+			authed.PUT("/freshcheck/config/category-tracks/:fc", auth.RequirePerm("freshcheck:config:write"), fc.HTTPUpsertCategoryTrack)
 
 			// ============== Admin 权限管理 (2026-08-30) ==============
 			rbacH := rbac.NewHandler(rbacStore)
