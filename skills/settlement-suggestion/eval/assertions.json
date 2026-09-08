@@ -1,0 +1,48 @@
+{
+  "skill": "settlement-suggestion",
+  "version": "1.0.0",
+  "assertions": [
+    {
+      "id": "assert-001",
+      "case_id": "case-001",
+      "type": "json_field",
+      "check": "overlap_days",
+      "value": 30
+    },
+    {
+      "id": "assert-002",
+      "case_id": "case-001",
+      "type": "json_field",
+      "check": "month_share",
+      "value": 5000.0
+    },
+    {
+      "id": "assert-003",
+      "case_id": "case-002",
+      "type": "json_field",
+      "check": "overlap_days",
+      "value": 30
+    },
+    {
+      "id": "assert-004",
+      "case_id": "case-002",
+      "type": "json_field",
+      "check": "month_share",
+      "value": 3000.0
+    },
+    {
+      "id": "assert-005",
+      "case_id": "case-004",
+      "type": "json_field",
+      "check": "investment_weight",
+      "value": 1.7
+    },
+    {
+      "id": "assert-006",
+      "case_id": "case-004",
+      "type": "contains",
+      "check": "rationale",
+      "value": "strategic"
+    }
+  ]
+}

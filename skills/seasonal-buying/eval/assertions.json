@@ -1,0 +1,55 @@
+{
+  "skill": "seasonal-buying",
+  "version": "1.0.0",
+  "assertions": [
+    {
+      "id": "assert-001",
+      "case_id": "case-001",
+      "type": "json_field",
+      "check": "next_event.name",
+      "value": "中秋节"
+    },
+    {
+      "id": "assert-002",
+      "case_id": "case-001",
+      "type": "json_field",
+      "check": "next_event.days_until",
+      "value": 23
+    },
+    {
+      "id": "assert-003",
+      "case_id": "case-001",
+      "type": "json_field",
+      "check": "next_event.recommended_multiplier",
+      "value": 5.0
+    },
+    {
+      "id": "assert-004",
+      "case_id": "case-002",
+      "type": "contains",
+      "check": "active_seasons",
+      "value": "雪糕季"
+    },
+    {
+      "id": "assert-005",
+      "case_id": "case-003",
+      "type": "json_field",
+      "check": "next_event.name",
+      "value": "春节"
+    },
+    {
+      "id": "assert-006",
+      "case_id": "case-003",
+      "type": "json_field",
+      "check": "next_event.recommended_multiplier",
+      "value": 8.0
+    },
+    {
+      "id": "assert-007",
+      "case_id": "case-004",
+      "type": "json_field",
+      "check": "next_event.name",
+      "value": "618"
+    }
+  ]
+}

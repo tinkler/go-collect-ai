@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"log"
+	"mime/multipart"
 	"os"
 	"path/filepath"
 	"sort"
@@ -13,66 +15,54 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/tinkler/collect-ai/internal/agent"
+	"github.com/tinkler/collect-ai/internal/agent/skill"
+	"github.com/tinkler/collect-ai/internal/auth"
 	"github.com/tinkler/collect-ai/internal/business"
 	"github.com/tinkler/collect-ai/internal/model"
 	"github.com/tinkler/collect-ai/internal/parser"
-	"github.com/tinkler/collect-ai/internal/parser/agent"
-	"github.com/tinkler/collect-ai/internal/parser/matcher"
+	parseragent "github.com/tinkler/collect-ai/internal/parser/agent"
+	"github.com/tinkler/collect-ai/internal/purchasealert"
+	"github.com/tinkler/collect-ai/internal/restock"
 	"github.com/tinkler/collect-ai/internal/store"
 )
 
 // Handler 持有依赖
+//
+// Phase A (2026-09-02): Parser → Orchestrator, TemplateRepo 移除, parse_session.template_id 字段去掉
+//   - 取代原半硬编码 + template 覆盖老路
+//   - 详见 docs/ocr-purchase-skill-architecture.md
 type Handler struct {
-	UploadDir     string
-	PublicBase    string
-	MaxUpload     int64 // bytes
-	Parser        *parser.Parser
-	Agent         *agent.Client
-	BusinessReg   *business.Registry // 业务字段映射(products / suppliers 跨数据源)
-	Sessions      *store.SessionRepo
-	Templates     *store.TemplateRepo
-	FuzzyDistance int // rematch 用 (旧接口保留)
-	// 兜底值 (per-template 没配时, 用这几个)
-	DefaultOcrModel  string
-	DefaultLlmModel  string
-	DefaultUseLlm    bool
-	DefaultFuzzyDist int
+	UploadDir    string
+	PublicBase   string
+	MaxUpload    int64                // bytes
+	Orchestrator *parser.Orchestrator // Phase A: 新增, OCR + Strategy + LLM 编排
+	Agent        *parseragent.Client  // 仅用于 Ping / GetDataSource (2026-09-02: cube 调用已收编到 BizExecutor)
+	BizExecutor  *business.Executor   // 2026-09-02: cube 业务字段调用入口
+	BusinessReg  *business.Registry   // 业务字段映射(products / suppliers 跨数据源)
+	Pool         *pgxpool.Pool        // W4.1: GetAnalysisStatus 轻量查询
+	Sessions     *store.SessionRepo
+	Strategies   *store.StrategyRepo // Phase A: 新增, per-supplier 特定解析策略
+	SkillStore   *skill.Store        // Phase A: 新增, 读 skills/ocr-purchase/SKILL.md
+	CashRepo     *store.CashBalanceRepo
+	PayRepo      *store.SupplierPaymentRepo
+	RestockSvc   *restock.Service
+	AlertSvc     *purchasealert.Service
+	AgentRunner  *agent.Runner
+	// 2026-09-07: POP 打印页 LOGO 配置 (启动时读 env POP_LOGO_NAME / POP_LOGO_FILE)
+	PopLogoName string
+	PopLogoFile string
+	// Phase B+ (2026-09-03): 删 DefaultOcrModel/DefaultLlmModel 字段 (VLM 内部固定 glm-4v)
 }
 
-// resolveTemplateConfig 根据 template_id 查 PG, 合并兜底值
-//   - 优先顺序: 显式 override (customPrompt) > template.X > handler 兜底 (env)
-//   - template 不存在 / template_id 为空 → 直接用兜底
-//   - use_llm / fuzzy_distance 是 nullable (DB NULL / Go nil) → 区分"未配"和"显式 false / 0"
-func (h *Handler) resolveTemplateConfig(ctx context.Context, templateID, customPrompt string) (effectivePrompt, effectiveOcrModel, effectiveLlmModel string, useLlm bool, fuzzyDist int, tpl *model.Template) {
-	effectiveOcrModel = h.DefaultOcrModel
-	effectiveLlmModel = h.DefaultLlmModel
-	useLlm = h.DefaultUseLlm
-	fuzzyDist = h.DefaultFuzzyDist
-	if templateID == "" {
-		return
-	}
-	t, err := h.Templates.GetByID(ctx, templateID)
-	if err != nil || t == nil {
-		return // 查不到也别报错, 走兜底
-	}
-	tpl = t
-	if t.OcrModel != "" {
-		effectiveOcrModel = t.OcrModel
-	}
-	if t.LlmModel != "" {
-		effectiveLlmModel = t.LlmModel
-	}
-	if t.UseLlm != nil {
-		useLlm = *t.UseLlm
-	}
-	if t.FuzzyDistance != nil {
-		fuzzyDist = *t.FuzzyDistance
-	}
-	if customPrompt == "" {
-		customPrompt = t.LlmPrompt
-	}
-	effectivePrompt = customPrompt
-	return
+// uploaded 2026-09-04 提升到顶层 (供 runVLMSync 接收)
+//   - multipart 上传文件的 bytes + header
+//   - 保留在 handler 内存, 同步解析用
+type uploaded struct {
+	header *multipart.FileHeader
+	bytes  []byte
 }
 
 // ============== Health ==============
@@ -81,84 +71,65 @@ func (h *Handler) Health(c *gin.Context) {
 	c.JSON(200, gin.H{"status": "ok", "ts": time.Now().Unix()})
 }
 
+// ============== System 配置 (POP 打印 LOGO 等) ==============
+//
+//	GetPopConfig GET /api/v1/system/pop-config
+//	2026-09-07: POP 打印页用, 前端拉 LOGO 配置
+//	  启动时配置: env POP_LOGO_NAME / POP_LOGO_FILE
+//	  静态文件:   uploads/<POP_LOGO_FILE> (e.g. uploads/pop-logo.png) 存在 → 用图片
+//	返回:
+//	  {
+//	    "logo_name": "小商超",
+//	    "logo_url":  "/uploads/pop-logo.png"  // 不存在时为空字符串
+//	  }
+//	权限: 公开 (前端登录前就要知道 LOGO, 否则首屏空白)
+func (h *Handler) GetPopConfig(c *gin.Context) {
+	logoName := h.PopLogoName
+	logoFile := h.PopLogoFile
+	logoURL := ""
+	if logoFile != "" {
+		// 检查 uploads/<file> 是否存在
+		abs := filepath.Join(h.UploadDir, logoFile)
+		if _, err := os.Stat(abs); err == nil {
+			logoURL = "/uploads/" + logoFile
+		}
+	}
+	c.JSON(200, gin.H{
+		"logo_name": logoName,
+		"logo_url":  logoURL,
+	})
+}
+
 // ============== Suppliers ==============
 
 // ListSuppliers 拉所有 distinct 供应商(业务字段名)
-//   ?datasource=erp|hbpos  不传则用当前 agent client 的数据源
-//   返回:{"suppliers": [...], "count": N, "datasource": "..."}
+//
+//	?datasource=erp|hbpos  不传则用当前 agent client 的数据源
+//	返回:{"suppliers": [...], "count": N, "datasource": "..."}
 func (h *Handler) ListSuppliers(c *gin.Context) {
 	if err := h.Agent.Ping(); err != nil {
 		c.JSON(503, gin.H{"error": "agent 不可达: " + err.Error()})
+		return
+	}
+	if h.BizExecutor == nil {
+		c.JSON(500, gin.H{"error": "business executor not configured"})
 		return
 	}
 	limit, _ := strconv.Atoi(c.Query("limit"))
 	if limit == 0 {
 		limit = 20000
 	}
-	ds := c.Query("datasource")
-	if ds == "" {
-		ds = h.Agent.GetDataSource()
-	}
-	if h.BusinessReg == nil {
-		c.JSON(500, gin.H{"error": "business registry not configured"})
-		return
-	}
-	ent, ok := h.BusinessReg.Get("suppliers")
-	if !ok {
-		c.JSON(500, gin.H{"error": "suppliers entity not found"})
-		return
-	}
-	src, ok := ent.Sources[ds]
-	if !ok {
-		c.JSON(400, gin.H{"error": "suppliers entity has no mapping for datasource " + ds})
-		return
-	}
-	if src.Cube == "" {
-		c.JSON(400, gin.H{"error": "suppliers " + ds + " has no cube"})
-		return
-	}
-	supplierNameRef := src.FieldRefs["supplier_name"]
-	if supplierNameRef == "" {
-		c.JSON(400, gin.H{"error": "supplier_name field not mapped for " + ds})
-		return
-	}
-	measures := []string{}
-	if ds == "erp" {
-		if r, ok := src.FieldRefs["stock_qty"]; ok && r != "" {
-			measures = []string{r}
-		}
-	} else {
-		measures = []string{"suppliers.count"}
-	}
-
-	rows, err := h.Agent.Execute(src.Cube, measures, []string{supplierNameRef}, nil, []string{"sup_only"}, limit)
+	// 2026-09-02: 重复 Executor.DistinctSuppliers 收编
+	out, err := h.BizExecutor.DistinctSuppliers(limit)
 	if err != nil {
-		c.JSON(500, gin.H{"error": "agent query: " + err.Error()})
+		c.JSON(500, gin.H{"error": "list suppliers: " + err.Error()})
 		return
-	}
-	bizRows, err := h.BusinessReg.ToBusinessResponse("suppliers", ds, rows, []string{"supplier_name"})
-	if err != nil {
-		c.JSON(500, gin.H{"error": "translate response: " + err.Error()})
-		return
-	}
-	set := make(map[string]struct{})
-	for _, br := range bizRows {
-		if s, ok := br["supplier_name"].(string); ok {
-			s = strings.TrimSpace(s)
-			if s != "" {
-				set[s] = struct{}{}
-			}
-		}
-	}
-	out := make([]string, 0, len(set))
-	for k := range set {
-		out = append(out, k)
 	}
 	sortStrings(out)
 	c.JSON(200, gin.H{
 		"suppliers":  out,
 		"count":      len(out),
-		"datasource": ds,
+		"datasource": h.Agent.GetDataSource(),
 	})
 }
 
@@ -172,15 +143,16 @@ func sortStrings(s []string) {
 }
 
 // ListSuppliersByBrand GET /api/v1/suppliers/by-brand?brand=xxx&datasource=xxx&limit=N
-//   按品牌(产品名 contains brand)反查供应商, 按 product_count 降序
-//   业务字段名 → 物理字段名由 business registry 翻译
-//   返回:
-//     {
-//       "brand": "蒙牛",
-//       "datasource": "erp",
-//       "suppliers": [{"supplier_name": "汇一", "product_count": 47}, ...],
-//       "count": 2
-//     }
+//
+//	按品牌(产品名 contains brand)反查供应商, 按 product_count 降序
+//	业务字段名 → 物理字段名由 business registry 翻译
+//	返回:
+//	  {
+//	    "brand": "蒙牛",
+//	    "datasource": "erp",
+//	    "suppliers": [{"supplier_name": "汇一", "product_count": 47}, ...],
+//	    "count": 2
+//	  }
 func (h *Handler) ListSuppliersByBrand(c *gin.Context) {
 	brand := strings.TrimSpace(c.Query("brand"))
 	if brand == "" {
@@ -191,91 +163,36 @@ func (h *Handler) ListSuppliersByBrand(c *gin.Context) {
 		c.JSON(503, gin.H{"error": "agent 不可达: " + err.Error()})
 		return
 	}
-	if h.BusinessReg == nil {
-		c.JSON(500, gin.H{"error": "business registry not configured"})
+	if h.BizExecutor == nil {
+		c.JSON(500, gin.H{"error": "business executor not configured"})
 		return
 	}
-	ds := c.Query("datasource")
-	if ds == "" {
-		ds = h.Agent.GetDataSource()
-	}
+	// 数据源启动后即固定(2026-08-31),不再接受 ?datasource= 覆盖
+	ds := h.Agent.GetDataSource()
 	limit, _ := strconv.Atoi(c.Query("limit"))
 	if limit == 0 {
 		limit = 50000
 	}
 
-	ent, ok := h.BusinessReg.Get("products")
-	if !ok {
-		c.JSON(500, gin.H{"error": "products entity not found"})
-		return
-	}
-	src, ok := ent.Sources[ds]
-	if !ok {
-		c.JSON(400, gin.H{"error": "products has no mapping for datasource " + ds})
-		return
-	}
-	if src.Cube == "" {
-		c.JSON(400, gin.H{"error": "products " + ds + " has no cube"})
-		return
-	}
-
-	productNameRef := src.FieldRefs["product_name"]
-	supplierNameRef := src.FieldRefs["supplier_name"]
-	if supplierNameRef == "" {
-		c.JSON(400, gin.H{"error": "supplier_name not mapped for " + ds})
-		return
-	}
-	if productNameRef == "" {
-		c.JSON(400, gin.H{"error": "product_name not mapped for " + ds})
-		return
-	}
-
-	// 业务字段 → 物理 measures/dimensions
-	//   dimensions 用 product_name + supplier_name (按 product 粒度取, 再 distinct supplier)
-	measures := []string{}
-	dimensions := []string{}
-	for _, bf := range []string{"product_name", "supplier_name"} {
-		ref, ok := src.FieldRefs[bf]
-		if !ok || ref == "" {
-			continue
-		}
-		if ent.Fields[bf].Type == business.FieldTypeMeasure {
-			measures = append(measures, ref)
-		} else {
-			dimensions = append(dimensions, ref)
-		}
-	}
-	if len(dimensions) == 0 {
-		c.JSON(400, gin.H{"error": "no dimensions resolved for brand query (datasource " + ds + ")"})
-		return
-	}
-
-	// 按 product_name contains XXX 过滤
-	//   注意: agent 数据里 brand 字段经常是空的,所以"按品牌反查"实际语义是
-	//         "商品名包含这个关键词的产品归属于哪些供应商"
-	//   t_bd_item_info cube SQL 已加 supcust_flag='1' 过滤,排除客户
-	filters := []map[string]any{
-		{"member": productNameRef, "operator": "contains", "values": []string{brand}},
-	}
-
-	rows, err := h.Agent.Execute(src.Cube, measures, dimensions, filters, []string{"sup_only"}, limit)
+	// 2026-09-02: 翻译部分收编到 Executor.SearchProductsByBrand
+	rows, err := h.BizExecutor.SearchProductsByBrand(brand, limit)
 	if err != nil {
 		c.JSON(500, gin.H{"error": "agent query: " + err.Error()})
 		return
 	}
 
-	// 内存聚合: supplier -> distinct products -> count
+	// 内存聚合: supplier -> distinct products -> count (handler 业务层,不动)
 	type supplierAgg struct {
 		Products map[string]struct{}
 		Count    int
 	}
 	agg := make(map[string]*supplierAgg)
 	for _, r := range rows {
-		supplier := asAnyString(r[supplierNameRef])
+		supplier := asAnyString(r["supplier_name"])
 		if supplier == "" {
 			continue
 		}
-		product := asAnyString(r[productNameRef])
+		product := asAnyString(r["product_name"])
 		a, ok := agg[supplier]
 		if !ok {
 			a = &supplierAgg{Products: make(map[string]struct{})}
@@ -314,66 +231,18 @@ func (h *Handler) ListSuppliersByBrand(c *gin.Context) {
 	})
 }
 
-// ============== Templates ==============
-
-// ListTemplates 飞书端: 拉某供应商的模板 (默认 + purchase only)
-func (h *Handler) ListTemplates(c *gin.Context) {
-	supplier := c.Query("supplier")
-	onlyDefault := c.Query("default") == "1" || c.Query("default") == "true"
-	mode := c.Query("mode") // "purchase" | "inventory" | "" (auto)
-	purchaseOnly := c.Query("purchase") == "1" || c.Query("purchase") == "true" || mode == "purchase"
-	if mode == "" {
-		// 飞书端默认只看 purchase
-		purchaseOnly = true
-	}
-	list, err := h.Templates.ListForSupplier(c.Request.Context(), supplier, mode, onlyDefault, purchaseOnly)
-	if err != nil {
-		c.JSON(500, gin.H{"error": err.Error()})
-		return
-	}
-	c.JSON(200, gin.H{"templates": list, "count": len(list)})
-}
-
-// SyncTemplates C# 端调用: 整体覆盖同步
-func (h *Handler) SyncTemplates(c *gin.Context) {
-	var req struct {
-		Templates []model.Template `json:"templates"`
-	}
-	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(400, gin.H{"error": "bad json: " + err.Error()})
-		return
-	}
-	if err := h.Templates.UpsertAll(c.Request.Context(), req.Templates); err != nil {
-		c.JSON(500, gin.H{"error": err.Error()})
-		return
-	}
-	c.JSON(200, gin.H{"synced": len(req.Templates)})
-}
-
-// ListAllTemplates C# 端管理界面用
-func (h *Handler) ListAllTemplates(c *gin.Context) {
-	list, err := h.Templates.ListAll(c.Request.Context())
-	if err != nil {
-		c.JSON(500, gin.H{"error": err.Error()})
-		return
-	}
-	c.JSON(200, gin.H{"templates": list, "count": len(list)})
-}
-
 // ============== Parse (不存库) ==============
 
 func (h *Handler) Parse(c *gin.Context) {
 	supplier := c.Query("supplier")
-	mode := c.DefaultQuery("mode", "purchase")
 	if supplier == "" {
 		c.JSON(400, gin.H{"error": "supplier 必填 (query ?supplier=xxx)"})
 		return
 	}
-	customPrompt := c.Query("prompt")
-	templateID := c.Query("template_id")
-
-	effectivePrompt, effectiveOcrModel, effectiveLlmModel, useLlm, fuzzyDist, _ :=
-		h.resolveTemplateConfig(c.Request.Context(), templateID, customPrompt)
+	if h.Orchestrator == nil {
+		c.JSON(503, gin.H{"error": "解析服务未配置或未就绪 (引擎2 DEEPSEEK_API_KEY 缺失?), 请联系管理员查看服务启动日志"})
+		return
+	}
 
 	file, header, err := c.Request.FormFile("file")
 	if err != nil {
@@ -387,35 +256,37 @@ func (h *Handler) Parse(c *gin.Context) {
 		return
 	}
 
-	rows, lines, _, err := h.Parser.ParseImageBytes(c.Request.Context(), imgBytes, header.Filename,
-		supplier, mode, effectivePrompt, effectiveOcrModel, effectiveLlmModel, useLlm, fuzzyDist)
+	// Phase B+ (2026-09-03): VLM-only 模式, 不再传 ocr/llm model (Orchestrator 内部固定 glm-4v)
+	res, err := h.Orchestrator.Parse(c.Request.Context(), imgBytes, header.Filename,
+		supplier)
 	if err != nil {
 		c.JSON(500, gin.H{"error": err.Error()})
 		return
 	}
 	c.JSON(200, gin.H{
-		"supplier":       supplier,
-		"mode":           mode,
-		"ocr_lines":      len(lines),
-		"ocr_model":      effectiveOcrModel,
-		"llm_model":      effectiveLlmModel,
-		"use_llm":        useLlm,
-		"fuzzy_distance": fuzzyDist,
-		"rows":           rows,
+		"supplier":         supplier,
+		"strategy_version": res.StrategyVersion,
+		"rows":             res.Rows,
 	})
 }
 
-// Rematch 用现有 rows (来自 OCR 解析/历史) + 新 supplier 重新跑 SkuMatcher
-// 不调 OCR / LLM, 只换 SKU 库重新匹配
-// body: { "rows": [{ "row_id": 1, "raw_barcode": "...", "raw_name": "...", "raw_qty": "..." }], "mode": "purchase" }
-// query: ?supplier=xxx (必填)
+// Rematch 用现有 rows 重新整理 (2026-09-04 双引擎重构: 走 Orchestrator L1 barcode 对应回填)
+//
+//	语义: 不做 L2~L5 (name 匹配/模糊/后缀/相似度), 仅做 L1 barcode 全等 (trim 后精确)
+//	 → 命中: 填 matched_* + stock_qty + unit, Status=已匹配, IsNew=false
+//	 → 未命中: matched_* 置空, Status=新品, IsNew=true
+//	 保留: row_id / seq / image_index / raw_* / qty / unit_price / is_deleted
+//
+//	body:  { "rows": [{ "row_id": 1, "raw_barcode": "...", "raw_name": "..." }] }
+//	query: ?supplier=xxx (必填, 用于查该供应商商品库)
 func (h *Handler) Rematch(c *gin.Context) {
 	supplier := c.Query("supplier")
 	if supplier == "" {
 		c.JSON(400, gin.H{"error": "supplier 必填 (query ?supplier=xxx)"})
 		return
 	}
-	mode := c.DefaultQuery("mode", "purchase")
+	// Phase A: mode 参数已废,固定走 purchase 模式
+	_ = c.DefaultQuery("mode", "purchase")
 
 	var req struct {
 		Rows []model.SkuRow `json:"rows"`
@@ -429,71 +300,332 @@ func (h *Handler) Rematch(c *gin.Context) {
 		return
 	}
 
-	// 加载新 supplier 的 SKU(走业务层,business mapping 翻译)
-	skus, err := h.loadSupplierSkusBiz(supplier, 5000)
-	if err != nil {
-		c.JSON(500, gin.H{"error": "加载 SKU 失败: " + err.Error()})
+	var out []model.SkuRow
+	if h.Orchestrator != nil {
+		out = h.Orchestrator.MatchSupplierRows(c.Request.Context(), supplier, req.Rows)
+	} else {
+		// Orchestrator 不可用时的降级: 统一当新品 (不匹配, matched_* 置空)
+		out = make([]model.SkuRow, 0, len(req.Rows))
+		for _, r := range req.Rows {
+			out = append(out, model.SkuRow{
+				RowID:      r.RowID,
+				Seq:        r.Seq,
+				ImageIndex: r.ImageIndex,
+				RawBarcode: r.RawBarcode,
+				RawName:    r.RawName,
+				RawQty:     r.RawQty,
+				Qty:        r.Qty,
+				UnitPrice:  r.UnitPrice,
+				IsDeleted:  r.IsDeleted,
+				Status:     "新品",
+				IsNew:      true,
+			})
+		}
+	}
+
+	c.JSON(200, gin.H{
+		"supplier":  supplier,
+		"sku_count": 0,
+		"rows":      out,
+		"rematched": len(out),
+		"skipped":   0,
+	})
+}
+
+// ============== Sessions ==============
+
+// AppendImages 追加图片到已有 session (W4.1 重复图去重)
+//
+//	流程:
+//	  1) 收图 (files[] / files / file) — 跟 CreateSession 一样
+//	  2) 算每张图 sha256, 调 Sessions.AppendImages (内部判重)
+//	  3) 重复的 hash → 跳过, 不解析, 不入 rows
+//	  4) 新的 → 调 Orchestrator.Parse, 续接 seq + image_index
+//	  5) 触发异步策略分析 (analysis_status 重置 pending → running → done)
+//	前端调用: 已经有一个 session, 用户点"添加图片"+"提交识别" → POST /sessions/:id/images
+//	Response 包含:
+//	  - added_rows: 新加的行 (含新 row_id)
+//	  - skipped_hashes: 已存在的 hash (UI 可提示"该图已识别过, 已跳过")
+//	  - analysis_status: 当前状态 (前端轮询)
+func (h *Handler) AppendImages(c *gin.Context) {
+	id := c.Param("id")
+	if id == "" {
+		c.JSON(400, gin.H{"error": "session id 必填"})
 		return
 	}
 
-	// 重新匹配
-	m := matcher.New(skus, h.FuzzyDistance)
-	out := make([]model.SkuRow, 0, len(req.Rows))
-	for i, r := range req.Rows {
-		// 转成 ParsedOcrRow
-		parsed := model.ParsedOcrRow{
-			Barcode: r.RawBarcode,
-			Name:    r.RawName,
-			QtyRaw:  r.RawQty,
-			Qty:     r.Qty,
-		}
-		matched := m.Match(parsed, i+1)
-		// 保留原 row_id, 防止前端索引错位
-		matched.RowID = r.RowID
-		matched.IsDeleted = r.IsDeleted
-		matched.UnitPrice = r.UnitPrice
-		// 用户已改 matched_* 字段: 如果新 supplier 下应该重置, 但保留 UnitPrice
-		// (只重置 matched_*, 用户的 qty 修改保留)
-		// 这里直接用 m.Match 的结果 (覆盖), 用户的 qty 改通过 PUT 后续保存
-		if matched.Qty == nil {
-			matched.Qty = r.Qty
-		}
-		out = append(out, matched)
+	// 1) 先确认 session 存在
+	existing, err := h.Sessions.Get(c.Request.Context(), id)
+	if err != nil {
+		c.JSON(500, gin.H{"error": err.Error()})
+		return
+	}
+	if existing == nil {
+		c.JSON(404, gin.H{"error": "session not found"})
+		return
+	}
+	supplier := existing.SupplierName
+
+	// 2) 收图 (复用 CreateSession 一样的多图逻辑)
+	if err := c.Request.ParseMultipartForm(32 << 20); err != nil {
+		log.Printf("[AppendImages] ParseMultipartForm err: %v", err)
 	}
 
-	// 盘点模式: 重算 StockDiff
-	if mode == string(model.ModeInventory) {
-		for i := range out {
-			if out[i].StockQty != nil && out[i].Qty != nil {
-				diff := float64(*out[i].Qty) - *out[i].StockQty
-				out[i].StockDiff = &diff
-				out[i].StockMismatch = diff != 0
-				if out[i].StockMismatch && out[i].Status == "OK" {
-					out[i].Status = "盘存差异"
+	type uploaded struct {
+		header *multipart.FileHeader
+		bytes  []byte
+	}
+	var uploads []uploaded
+
+	if files := c.Request.MultipartForm; files != nil && files.File != nil {
+		if fhs, ok := files.File["files[]"]; ok && len(fhs) > 0 {
+			for _, fh := range fhs {
+				f, err := fh.Open()
+				if err != nil {
+					c.JSON(400, gin.H{"error": "打开文件失败: " + err.Error()})
+					return
+				}
+				bytes, err := io.ReadAll(f)
+				f.Close()
+				if err != nil {
+					c.JSON(500, gin.H{"error": err.Error()})
+					return
+				}
+				uploads = append(uploads, uploaded{fh, bytes})
+			}
+		} else if fhs, ok := files.File["files"]; ok && len(fhs) > 0 {
+			for _, fh := range fhs {
+				f, err := fh.Open()
+				if err != nil {
+					c.JSON(400, gin.H{"error": "打开文件失败: " + err.Error()})
+					return
+				}
+				bytes, err := io.ReadAll(f)
+				f.Close()
+				if err != nil {
+					c.JSON(500, gin.H{"error": err.Error()})
+					return
+				}
+				uploads = append(uploads, uploaded{fh, bytes})
+			}
+		}
+	}
+	if len(uploads) == 0 {
+		file, header, err := c.Request.FormFile("file")
+		if err != nil {
+			c.JSON(400, gin.H{"error": "未收到 file/files: " + err.Error()})
+			return
+		}
+		defer file.Close()
+		bytes, err := io.ReadAll(file)
+		if err != nil {
+			c.JSON(500, gin.H{"error": err.Error()})
+			return
+		}
+		uploads = append(uploads, uploaded{header, bytes})
+	}
+	if len(uploads) == 0 {
+		c.JSON(400, gin.H{"error": "未收到任何图片"})
+		return
+	}
+
+	// 3) 算 hash + 落盘新文件 + 准备 candidate
+	bucket := id[:2]
+	absDir := filepath.Join(h.UploadDir, bucket)
+	if err := os.MkdirAll(absDir, 0o755); err != nil {
+		c.JSON(500, gin.H{"error": "创建上传目录失败: " + err.Error()})
+		return
+	}
+	candidates := make([]store.ImageCandidate, 0, len(uploads))
+	for _, u := range uploads {
+		hash := store.HashImageBytes(u.bytes)
+		// 用 hash 前 8 位 + 原 ext 做文件名 (避免重复, 也方便人查)
+		ext := filepath.Ext(u.header.Filename)
+		if ext == "" {
+			ext = ".jpg"
+		}
+		// 真正落盘在判重之后 (AppendImages 返回 skipped 时省一次写)
+		// 这里先全部写, 简化逻辑
+		fileName := fmt.Sprintf("%s_%s%s", id, hash[:8], ext)
+		_ = filepath.Join(bucket, fileName) // 暂存引用 (后续 v2 用, 现在只用 hash 判重)
+		absPath := filepath.Join(absDir, fileName)
+		if _, err := os.Stat(absPath); os.IsNotExist(err) {
+			if err := os.WriteFile(absPath, u.bytes, 0o644); err != nil {
+				c.JSON(500, gin.H{"error": "保存图片失败: " + err.Error()})
+				return
+			}
+		}
+		candidates = append(candidates, store.ImageCandidate{
+			Hash:     hash,
+			FileName: u.header.Filename,
+			ImgBytes: u.bytes,
+		})
+	}
+
+	// 4) 调 AppendImages (内部判重 + 解析新图 + 续接 seq)
+	addedRows, skippedHashes, newHashes, err := h.Sessions.AppendImages(
+		c.Request.Context(), id, candidates,
+		func(hash, fileName string, imgBytes []byte) ([]model.SkuRow, error) {
+			if h.Orchestrator == nil {
+				return nil, fmt.Errorf("解析服务未配置或未就绪 (引擎2 DEEPSEEK_API_KEY 缺失?)")
+			}
+			res, err := h.Orchestrator.Parse(c.Request.Context(), imgBytes, fileName, supplier)
+			if err != nil {
+				return nil, err
+			}
+			return res.Rows, nil
+		},
+	)
+	if err != nil {
+		c.JSON(500, gin.H{"error": "append 失败: " + err.Error()})
+		return
+	}
+
+	// 5) 触发异步策略分析 (append 后必重跑)
+	if h.AlertSvc != nil {
+		h.AlertSvc.StartAnalysisAsync(id, h.Sessions.Get)
+	}
+
+	// 6) 回填 row_id
+	for i := range addedRows {
+		if saved, err := h.Sessions.Get(c.Request.Context(), id); err == nil && saved != nil {
+			// 找刚加的行 (按 Seq + ImageIndex)
+			for _, r := range saved.Rows {
+				if r.Seq == addedRows[i].Seq && r.ImageIndex == addedRows[i].ImageIndex && addedRows[i].RowID == 0 {
+					addedRows[i].RowID = r.RowID
+					break
 				}
 			}
 		}
 	}
 
 	c.JSON(200, gin.H{
-		"supplier":      supplier,
-		"mode":          mode,
-		"sku_count":     len(skus),
-		"rows":          out,
-		"rematched":     len(out),
-		"skipped":       0,
+		"session_id":      id,
+		"added_rows":      addedRows,
+		"added_count":     len(addedRows),
+		"skipped_hashes":  skippedHashes,
+		"skipped_count":   len(skippedHashes),
+		"new_hashes":      newHashes,
+		"new_count":       len(newHashes),
+		"analysis_status": "pending", // 后台分析中
 	})
 }
 
-// ============== Sessions ==============
+// GetAnalysisStatus 轻量状态查询 (W4.1 轮询用)
+//
+//	替代方案: 也可直接用 GET /sessions/:id 拿 analysis_status
+//	但轮询时不需要拉全部 rows, 这个端点更轻
+func (h *Handler) GetAnalysisStatus(c *gin.Context) {
+	id := c.Param("id")
+	var status, errMsg string
+	var at *time.Time
+	var alertCount int
+	err := h.Pool.QueryRow(c.Request.Context(), `
+		SELECT analysis_status, analysis_at, analysis_error
+		FROM parse_session WHERE id = $1
+	`, id).Scan(&status, &at, &errMsg)
+	if err == pgx.ErrNoRows {
+		c.JSON(404, gin.H{"error": "not found"})
+		return
+	}
+	if err != nil {
+		c.JSON(500, gin.H{"error": err.Error()})
+		return
+	}
+	_ = h.Pool.QueryRow(c.Request.Context(), `
+		SELECT COUNT(*) FROM purchase_session_alert WHERE session_id = $1
+	`, id).Scan(&alertCount)
+	c.JSON(200, gin.H{
+		"session_id":      id,
+		"analysis_status": status,
+		"analysis_at":     at,
+		"analysis_error":  errMsg,
+		"alert_count":     alertCount,
+	})
+}
 
-// CreateSession multipart 收图 + 存库
+// TriggerAnalysis (2026-09-03) 重新触发 LLM/purchase-alert 策略分析
+//
+//	场景: 用户在收货单详情页手动按"重新分析"按钮
+//	- 不重跑 OCR/解析 (rows 已经是用户编辑过的最终结果)
+//	- 复用 StartAnalysisAsync: 内部 cancel 旧 run + 启新 run, 并发安全
+//	- body: { "force": true } → 即使 status='running' 也允许重跑 (默认拒重入, 10s 节流)
+//	权限: session:update (跟 EditRow 同级, 不要给 read 用户)
+//	注意: 不进限流中间件, 跟 analysis-status 同级 (后台 goroutine 自己跑)
+func (h *Handler) TriggerAnalysis(c *gin.Context) {
+	id := c.Param("id")
+	if id == "" {
+		c.JSON(400, gin.H{"error": "session id 必填"})
+		return
+	}
+
+	// 1) 确认 session 存在 + mode=purchase (purchase 模式才有 alert skill)
+	existing, err := h.Sessions.Get(c.Request.Context(), id)
+	if err != nil {
+		c.JSON(500, gin.H{"error": err.Error()})
+		return
+	}
+	if existing == nil {
+		c.JSON(404, gin.H{"error": "session not found"})
+		return
+	}
+	if existing.Mode != model.ModePurchase {
+		c.JSON(400, gin.H{"error": "只有采购模式 session 支持策略分析 (mode=" + string(existing.Mode) + ")"})
+		return
+	}
+
+	// 2) 读 body { force } — 默认不强制
+	var body struct {
+		Force bool `json:"force"`
+	}
+	_ = c.ShouldBindJSON(&body) // body 可空
+
+	// 3) 节流: 如果已经在 running, 默认 10s 内拒重入 (用户连点保护)
+	if h.AlertSvc == nil {
+		c.JSON(503, gin.H{"error": "alert service 未配置"})
+		return
+	}
+	if !body.Force {
+		var status string
+		var lastAt *time.Time
+		err := h.Pool.QueryRow(c.Request.Context(), `
+			SELECT analysis_status, analysis_at
+			FROM parse_session WHERE id = $1
+		`, id).Scan(&status, &lastAt)
+		if err == nil && status == "running" {
+			// 10s 节流: 用户短时间内连点, 第二次直接告诉 "已经在跑"
+			if lastAt != nil && time.Since(*lastAt) < 10*time.Second {
+				c.JSON(409, gin.H{
+					"error":   "分析正在进行中, 10s 内不要重复触发",
+					"status":  "running",
+					"started": lastAt,
+				})
+				return
+			}
+		}
+	}
+
+	// 4) 触发 (异步, 立即返回)
+	h.AlertSvc.StartAnalysisAsync(id, h.Sessions.Get)
+
+	c.JSON(200, gin.H{
+		"session_id":      id,
+		"analysis_status": "pending", // 几秒后变 running
+		"triggered":       true,
+	})
+}
+
+// CreateSession multipart 收图(支持 1 张或多张) + 存库
+//
+//	多图: form-data 用 files[] 重复提交, 或 files (单字段多文件)
+//	单图兼容: 仍可用 file 字段(向后兼容飞书 H5)
+//	2026-08-28 加入多图支持
+//
+// Phase A (2026-09-02): 删 template_id / template_name / prompt 参数, 改用 Orchestrator.Parse
+//   - 内部根据 supplier 查 supplier_parse_strategy 自动选 generic / specific / handwrite 路径
+//   - 解析成功后记 strategy_version 到 parse_session (0 = 通用, >0 = 特定 strategy 版本)
 func (h *Handler) CreateSession(c *gin.Context) {
 	supplier := c.Query("supplier")
-	mode := c.DefaultQuery("mode", "purchase")
-	templateID := c.Query("template_id")
-	templateName := c.Query("template_name")
-	customPrompt := c.Query("prompt")
 	note := c.Query("note")
 	source := c.DefaultQuery("source", "feishu")
 
@@ -502,71 +634,238 @@ func (h *Handler) CreateSession(c *gin.Context) {
 		return
 	}
 
-	effectivePrompt, effectiveOcrModel, effectiveLlmModel, useLlm, fuzzyDist, _ :=
-		h.resolveTemplateConfig(c.Request.Context(), templateID, customPrompt)
-
-	file, header, err := c.Request.FormFile("file")
-	if err != nil {
-		c.JSON(400, gin.H{"error": "未收到 file: " + err.Error()})
-		return
-	}
-	defer file.Close()
-	imgBytes, err := io.ReadAll(file)
-	if err != nil {
-		c.JSON(500, gin.H{"error": err.Error()})
+	// 2026-09-04: 双引擎 Orchestrator 未就绪时必须 fail fast
+	//   常见原因: DEEPSEEK_API_KEY 未配 → NewOrchestrator 失败 → h.Orchestrator == nil
+	//   旧实现建库后静默跳过后台 goroutine, session 永远卡 pending/0 行且无任何错误日志
+	if h.Orchestrator == nil {
+		log.Printf("[CreateSession] Orchestrator 未就绪, 拒绝创建 session (请检查服务启动日志中 [main] Orchestrator 构造失败 原因, 通常是 DEEPSEEK_API_KEY 未配置)")
+		c.JSON(503, gin.H{"error": "解析服务未配置或未就绪 (引擎2 DEEPSEEK_API_KEY 缺失?), 请联系管理员查看服务启动日志"})
 		return
 	}
 
-	rows, _, _, err := h.Parser.ParseImageBytes(c.Request.Context(), imgBytes, header.Filename,
-		supplier, mode, effectivePrompt, effectiveOcrModel, effectiveLlmModel, useLlm, fuzzyDist)
-	if err != nil {
-		c.JSON(500, gin.H{"error": err.Error()})
+	// 收集所有文件(多图): 优先 files[] 数组, 其次 files 多文件, 最后单图 file
+	var uploads []uploaded
+
+	// 强制 parse multipart(不调的话, MultipartForm 为 nil, 拿不到 files map)
+	if err := c.Request.ParseMultipartForm(32 << 20); err != nil {
+		// parse 失败, 退化到 file 字段
+		log.Printf("[CreateSession] ParseMultipartForm err: %v, fallback to file field", err)
+	}
+
+	if files := c.Request.MultipartForm; files != nil && files.File != nil {
+		if fhs, ok := files.File["files[]"]; ok && len(fhs) > 0 {
+			for _, fh := range fhs {
+				f, err := fh.Open()
+				if err != nil {
+					c.JSON(400, gin.H{"error": "打开文件失败: " + err.Error()})
+					return
+				}
+				bytes, err := io.ReadAll(f)
+				f.Close()
+				if err != nil {
+					c.JSON(500, gin.H{"error": err.Error()})
+					return
+				}
+				uploads = append(uploads, uploaded{fh, bytes})
+			}
+		} else if fhs, ok := files.File["files"]; ok && len(fhs) > 0 {
+			for _, fh := range fhs {
+				f, err := fh.Open()
+				if err != nil {
+					c.JSON(400, gin.H{"error": "打开文件失败: " + err.Error()})
+					return
+				}
+				bytes, err := io.ReadAll(f)
+				f.Close()
+				if err != nil {
+					c.JSON(500, gin.H{"error": err.Error()})
+					return
+				}
+				uploads = append(uploads, uploaded{fh, bytes})
+			}
+		}
+	}
+	if len(uploads) == 0 {
+		// 单图兼容: 飞书 H5 / 旧调用方可能只发 file
+		file, header, err := c.Request.FormFile("file")
+		if err != nil {
+			log.Printf("[CreateSession] 没有 file/files, 收到字段: %v", c.Request.MultipartForm)
+			c.JSON(400, gin.H{"error": "未收到 file/files: " + err.Error()})
+			return
+		}
+		defer file.Close()
+		bytes, err := io.ReadAll(file)
+		if err != nil {
+			c.JSON(500, gin.H{"error": err.Error()})
+			return
+		}
+		uploads = append(uploads, uploaded{header, bytes})
+	}
+
+	if len(uploads) == 0 {
+		c.JSON(400, gin.H{"error": "未收到任何图片"})
 		return
 	}
 
-	// 保存图片到 uploads/
+	// 预先创建 session id, 用来组织多图目录
 	id := uuid.NewString()
-	ext := filepath.Ext(header.Filename)
-	if ext == "" {
-		ext = ".jpg"
-	}
-	relPath := filepath.Join(id[:2], id+ext)
-	absDir := filepath.Join(h.UploadDir, id[:2])
+	bucket := id[:2]
+	absDir := filepath.Join(h.UploadDir, bucket)
 	if err := os.MkdirAll(absDir, 0o755); err != nil {
 		c.JSON(500, gin.H{"error": "创建上传目录失败: " + err.Error()})
 		return
 	}
-	absPath := filepath.Join(absDir, id+ext)
-	if err := os.WriteFile(absPath, imgBytes, 0o644); err != nil {
-		c.JSON(500, gin.H{"error": "保存图片失败: " + err.Error()})
-		return
-	}
-	imageURL := ""
-	if h.PublicBase != "" {
-		imageURL = fmt.Sprintf("%s/uploads/%s/%s", h.PublicBase, id[:2], id+ext)
-	}
 
+	// 逐张图写盘 + 立即建空 session (W4.1+2026-09-04 异步模式)
 	s := &model.Session{
 		ID:           id,
 		SupplierName: supplier,
-		TemplateID:   templateID,
-		TemplateName: templateName,
-		Mode:         model.TemplateMode(mode),
-		ImagePath:    relPath,
-		ImageURL:     imageURL,
-		Source:       source,
-		Note:         note,
-		Rows:         rows,
+		Mode:         model.ModePurchase, // Phase A: 固定 purchase
 	}
-	if err := h.Sessions.Create(c.Request.Context(), s); err != nil {
+	var imagePaths, imageURLs, imageHashes []string
+	for idx, u := range uploads {
+		ext := filepath.Ext(u.header.Filename)
+		if ext == "" {
+			ext = ".jpg"
+		}
+		// 多图文件命名: <id>_<idx>.<ext>
+		fileName := fmt.Sprintf("%s_%d%s", id, idx, ext)
+		relPath := filepath.Join(bucket, fileName)
+		absPath := filepath.Join(absDir, fileName)
+		if err := os.WriteFile(absPath, u.bytes, 0o644); err != nil {
+			c.JSON(500, gin.H{"error": "保存图片失败: " + err.Error()})
+			return
+		}
+		imagePaths = append(imagePaths, relPath)
+		if h.PublicBase != "" {
+			imageURLs = append(imageURLs, fmt.Sprintf("%s/uploads/%s/%s", h.PublicBase, bucket, fileName))
+		} else {
+			imageURLs = append(imageURLs, fmt.Sprintf("/uploads/%s/%s", bucket, fileName))
+		}
+		imageHashes = append(imageHashes, store.HashImageBytes(u.bytes))
+	}
+
+	// 单图兼容字段(取第一张)
+	imagePath := ""
+	imageURL := ""
+	if len(imagePaths) > 0 {
+		imagePath = imagePaths[0]
+	}
+	if len(imageURLs) > 0 {
+		imageURL = imageURLs[0]
+	}
+
+	// 填充 s 剩余字段 (rows=空, status=pending, 同步解析完成后 UpdateSessionRows 写入)
+	s.ImagePath = imagePath
+	s.ImageURL = imageURL
+	s.ImagePaths = imagePaths
+	s.ImageURLs = imageURLs
+	s.ImageHashes = imageHashes
+	s.Source = source
+	s.Note = note
+	s.AnalysisStatus = "pending"
+
+	// 2026-09-04 改为同步模式: 双引擎解析完成才响应
+	//   1) 立即 CreateSession(空 rows, status='pending') - detached ctx + 10s timeout
+	//      即使客户端中途断开, session 建库这步也在 10s 内完成
+	//   2) 同步跑双引擎 VLM (detached ctx + 5min timeout, 客户端断不影响解析与落库)
+	//   3) 解析完 → UpdateSessionRows 落库 → 返回完整 session (含 rows)
+	writeCtx, writeCancel := context.WithTimeout(
+		context.WithoutCancel(c.Request.Context()), 10*time.Second)
+	defer writeCancel()
+
+	if err := h.Sessions.Create(writeCtx, s); err != nil {
+		log.Printf("[CreateSession] Sessions.Create 失败: session_id=%s supplier=%s err=%v",
+			s.ID, s.SupplierName, err)
 		c.JSON(500, gin.H{"error": "存库失败: " + err.Error()})
 		return
 	}
-	// 回填 row_id
-	if saved, err := h.Sessions.Get(c.Request.Context(), id); err == nil && saved != nil {
-		s.Rows = saved.Rows
+	log.Printf("[CreateSession] session 已建库 (session_id=%s supplier=%s images=%d, 开始同步解析)",
+		s.ID, s.SupplierName, len(uploads))
+
+	// 2026-09-04 同步跑双引擎: 解析完成才往下走
+	//   h.Orchestrator != nil 已在函数入口校验
+	rows, parseStatus, strategyVersion := h.runVLMSync(id, uploads, supplier, s.ImageHashes)
+	s.Rows = rows
+	s.StrategyVersion = strategyVersion
+	s.AnalysisStatus = parseStatus
+
+	// 解析结果落库 (detached ctx, 客户端断不影响落库)
+	updCtx, updCancel := context.WithTimeout(
+		context.WithoutCancel(c.Request.Context()), 10*time.Second)
+	defer updCancel()
+	if err := h.Sessions.UpdateSessionRows(updCtx, id, s, parseStatus); err != nil {
+		log.Printf("[CreateSession] UpdateSessionRows 失败: session_id=%s err=%v", id, err)
+	}
+	log.Printf("[CreateSession] 同步解析完成 (session_id=%s rows=%d status=%s)",
+		id, len(rows), parseStatus)
+
+	// alert 异步分析 (rows 已有, 分析本身仍走后台, 不阻塞响应)
+	if s.Mode == model.ModePurchase && h.AlertSvc != nil {
+		h.AlertSvc.StartAnalysisAsync(id, h.Sessions.Get)
+	}
+
+	// 写响应前检测 ctx (解析期间客户端可能已断开, session 已落库)
+	if err := c.Request.Context().Err(); err != nil {
+		log.Printf("[CreateSession] 客户端在写响应前已断开 (session_id=%s, ctx_err=%v), session 已落库, 跳过写响应",
+			s.ID, err)
+		return
 	}
 	c.JSON(200, s)
+}
+
+// runVLMSync 2026-09-04 同步版 (原 runVLMAsync 后台 goroutine 版本已废):
+//
+//   - 跟客户端 ctx 100% 解耦 (用 context.Background()), 客户端断不影响解析
+//   - 每张图依次跑 VLM + 匹配, 累加 rows
+//   - 只负责解析, 不写 DB: rows/status 由调用方 (CreateSession) 落库并响应
+//   - panic 兜底: 返回 status='failed', 防止进程崩溃导致 session 卡 pending
+func (h *Handler) runVLMSync(sessionID string, uploads []uploaded, supplier string, imageHashes []string) (rows []model.SkuRow, status string, strategyVersion int) {
+	// detached ctx: VLM 跑多久都行, 不受客户端影响
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+
+	// panic 兜底 — 否则整个进程崩溃, systemd 重启后该 session 永远卡 pending
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("[runVLMSync] ❌ panic: session_id=%s err=%v", sessionID, r)
+			rows = nil
+			status = "failed"
+		}
+	}()
+
+	var allRows []model.SkuRow
+	for idx, u := range uploads {
+		log.Printf("[runVLMSync] 跑 VLM idx=%d/%d (session_id=%s supplier=%s img_size=%d)",
+			idx+1, len(uploads), sessionID, supplier, len(u.bytes))
+		res, err := h.Orchestrator.Parse(ctx, u.bytes, u.header.Filename, supplier)
+		if err != nil {
+			log.Printf("[runVLMSync] Orchestrator.Parse 失败: idx=%d session_id=%s err=%v",
+				idx+1, sessionID, err)
+			// 不立即失败,继续跑后面 idx; 最后统一按 0 rows 处理
+			continue
+		}
+		if len(res.Rows) == 0 {
+			log.Printf("[runVLMSync] ⚠️ VLM 解析 0 条 (idx=%d session_id=%s)",
+				idx+1, sessionID)
+		}
+		baseSeq := len(allRows)
+		rs := res.Rows
+		for i := range rs {
+			rs[i].Seq = baseSeq + i + 1
+			rs[i].ImageIndex = idx
+		}
+		allRows = append(allRows, rs...)
+		if idx == 0 {
+			strategyVersion = res.StrategyVersion
+		}
+	}
+
+	status = "done"
+	if len(allRows) == 0 {
+		status = "failed" // 失败: VLM 全 0 rows
+	}
+	return allRows, status, strategyVersion
 }
 
 func (h *Handler) ListSessions(c *gin.Context) {
@@ -601,7 +900,252 @@ func (h *Handler) GetSession(c *gin.Context) {
 		c.JSON(404, gin.H{"error": "not found"})
 		return
 	}
+	// 采购模式 + 有 restock 服务: 附加 plan_qty (2026-08-28)
+	if s.Mode == model.ModePurchase && h.RestockSvc != nil {
+		_ = h.RestockSvc.AttachPlanQtyToRows(c.Request.Context(), s.SupplierName, s.Rows)
+	}
+	// 2026-09-03: 反查 hbpos t_bd_item_info, 把 barcode → item_no 写到 row.ItemNo
+	//   企业微信"复制"按钮要的就是 item_no, 不是条码; cube 失败也不阻塞
+	h.enrichRowsWithItemNo(c.Request.Context(), s.Rows)
+	// W4.1: 异步分析 — 不再同步 Apply, 直接读 alerts
+	//   analysis_status='done' 时返回 alerts + summary
+	//   analysis_status='pending'/'running'/'failed' 时 alerts 可能是空或旧值, 前端按 status 处理
+	if s.Mode == model.ModePurchase && h.AlertSvc != nil {
+		ctx := c.Request.Context()
+		existing, _ := h.AlertSvc.ListAlertsBySession(ctx, id)
+		// W4.1: 拆分 row-specific alerts (表格行内 icon) + session-level summary (图片卡片下)
+		rowAlerts, summary := splitAlertsByScope(existing)
+		s.Alerts = convertAlertsToModel(rowAlerts)
+		s.Summary = convertAlertsToModel(summary)
+	}
 	c.JSON(200, s)
+}
+
+// splitAlertsByScope 拆分 row-specific vs session-level alerts (W4.1)
+//
+//	row_id > 0 → row-specific (表格行内 icon)
+//	row_id = 0 → session-level (总结栏)
+func splitAlertsByScope(in []purchasealert.Alert) (rowAlerts []purchasealert.Alert, summary []purchasealert.Alert) {
+	for _, a := range in {
+		if a.RowID == 0 {
+			summary = append(summary, a)
+		} else {
+			rowAlerts = append(rowAlerts, a)
+		}
+	}
+	return
+}
+
+// convertAlertsToModel purchasealert.Alert → model.AlertItem (避免 handler 依赖 purchasealert.Alert 类型)
+// W4: 现金日报 endpoint
+func (h *Handler) SetCashBalance(c *gin.Context) {
+	var body struct {
+		Date   string  `json:"date" binding:"required"`
+		Amount float64 `json:"amount" binding:"required"`
+		Source string  `json:"source"`
+		Note   string  `json:"note"`
+	}
+	if err := c.ShouldBindJSON(&body); err != nil {
+		c.JSON(400, gin.H{"error": "bad json: " + err.Error()})
+		return
+	}
+	date, err := time.Parse("2006-01-02", body.Date)
+	if err != nil {
+		c.JSON(400, gin.H{"error": "date 格式错误 YYYY-MM-DD"})
+		return
+	}
+	if body.Source == "" {
+		body.Source = "manual"
+	}
+	if err := h.CashRepo.Upsert(c.Request.Context(), date, body.Amount, body.Source, body.Note, ""); err != nil {
+		c.JSON(500, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(200, gin.H{"date": body.Date, "amount": body.Amount, "source": body.Source, "note": body.Note})
+}
+
+func (h *Handler) GetCashBalance(c *gin.Context) {
+	dateStr := c.Query("date")
+	daysStr := c.DefaultQuery("days", "")
+	if dateStr != "" {
+		date, err := time.Parse("2006-01-02", dateStr)
+		if err != nil {
+			c.JSON(400, gin.H{"error": "date 格式错误"})
+			return
+		}
+		cb, err := h.CashRepo.GetByDate(c.Request.Context(), date)
+		if err != nil {
+			c.JSON(500, gin.H{"error": err.Error()})
+			return
+		}
+		if cb == nil {
+			c.JSON(404, gin.H{"error": "not found"})
+			return
+		}
+		c.JSON(200, cb)
+		return
+	}
+	if daysStr != "" {
+		days := 7
+		_, _ = fmt.Sscanf(daysStr, "%d", &days)
+		out, err := h.CashRepo.GetLatest(c.Request.Context(), days)
+		if err != nil {
+			c.JSON(500, gin.H{"error": err.Error()})
+			return
+		}
+		c.JSON(200, gin.H{"balances": out, "count": len(out)})
+		return
+	}
+	// default: today
+	date := time.Now().UTC().Truncate(24 * time.Hour)
+	cb, err := h.CashRepo.GetByDate(c.Request.Context(), date)
+	if err != nil {
+		c.JSON(500, gin.H{"error": err.Error()})
+		return
+	}
+	if cb == nil {
+		c.JSON(200, gin.H{"date": date.Format("2006-01-02"), "amount": 0, "source": "none", "note": "尚未录入"})
+		return
+	}
+	c.JSON(200, cb)
+}
+
+// W2.5: H5 端触发 Agent 跑一轮 (复用 Runner.Run)
+//
+//	Body: { "user_id": "u1", "session_id": "s1", "message": "汇一是自采" }
+//	Response: { "reply": "...", "tool_calls": [...] }
+//	LLM 不可用时返降级提示 (200 OK, 不报错)
+func (h *Handler) AgentChat(c *gin.Context) {
+	if h.AgentRunner == nil {
+		c.JSON(503, gin.H{"error": "agent runner 未配置"})
+		return
+	}
+	var body struct {
+		UserID    string `json:"user_id"`
+		SessionID string `json:"session_id"`
+		Message   string `json:"message" binding:"required"`
+	}
+	if err := c.ShouldBindJSON(&body); err != nil {
+		c.JSON(400, gin.H{"error": "bad json: " + err.Error()})
+		return
+	}
+	if strings.TrimSpace(body.Message) == "" {
+		c.JSON(400, gin.H{"error": "message 必填"})
+		return
+	}
+	if strings.TrimSpace(body.UserID) == "" {
+		body.UserID = "u_" + c.ClientIP()
+	}
+	if strings.TrimSpace(body.SessionID) == "" {
+		body.SessionID = "sess_" + body.UserID + "_" + time.Now().Format("20060102150405")
+	}
+
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 90*time.Second)
+	defer cancel()
+
+	if !h.AgentRunner.Enabled() {
+		c.JSON(200, gin.H{
+			"reply":      "智能助理暂未配置 (需 COLLECTAI_LLM_API_KEY),无法回复。",
+			"tool_calls": []string{},
+			"enabled":    false,
+		})
+		return
+	}
+
+	events, err := h.AgentRunner.Run(ctx, body.UserID, body.SessionID, body.Message)
+	if err != nil {
+		log.Printf("[handler.AgentChat] runner.Run err: %v", err)
+		c.JSON(200, gin.H{
+			"reply":   "我没听懂,换个说法试试",
+			"enabled": true,
+			"error":   err.Error(),
+		})
+		return
+	}
+
+	var reply strings.Builder
+	toolCalls := []string{}
+	chunks := 0
+	for ev := range events {
+		if ev == nil || ev.Raw == nil {
+			continue
+		}
+		// 抽文本 chunk
+		if ev.Raw.Response != nil {
+			for _, ch := range ev.Raw.Response.Choices {
+				if ch.Delta.Content != "" {
+					reply.WriteString(ch.Delta.Content)
+					chunks++
+				} else if ch.Message.Content != "" {
+					reply.WriteString(ch.Message.Content)
+					chunks++
+				}
+			}
+		}
+		// 抽 tool calls
+		if ev.Raw.Response != nil {
+			for _, ch := range ev.Raw.Response.Choices {
+				if len(ch.Message.ToolCalls) > 0 {
+					for _, tc := range ch.Message.ToolCalls {
+						if tc.Function.Name != "" {
+							toolCalls = append(toolCalls, tc.Function.Name)
+						}
+					}
+				}
+			}
+		}
+	}
+	msg := strings.TrimSpace(reply.String())
+	if msg == "" {
+		msg = "我没听懂,换个说法试试"
+	}
+	c.JSON(200, gin.H{
+		"reply":      msg,
+		"tool_calls": toolCalls,
+		"chunks":     chunks,
+		"enabled":    true,
+	})
+}
+
+func (h *Handler) ListPendingPayments(c *gin.Context) {
+	if h.PayRepo == nil {
+		c.JSON(503, gin.H{"error": "payment repo 未配置"})
+		return
+	}
+	limit := 50
+	if v := c.Query("limit"); v != "" {
+		fmt.Sscanf(v, "%d", &limit)
+	}
+	out, err := h.PayRepo.ListPending(c.Request.Context(), limit)
+	if err != nil {
+		c.JSON(500, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(200, gin.H{"suggestions": out, "count": len(out)})
+}
+
+func convertAlertsToModel(in []purchasealert.Alert) []model.AlertItem {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make([]model.AlertItem, 0, len(in))
+	for _, a := range in {
+		it := model.AlertItem{
+			AlertID:   a.AlertID,
+			RowID:     a.RowID,
+			Rule:      a.Rule,
+			Severity:  a.Severity,
+			Message:   a.Message,
+			AckedBy:   a.AckedBy,
+			CreatedAt: a.CreatedAt,
+		}
+		if !a.AckedAt.IsZero() {
+			t := a.AckedAt
+			it.AckedAt = &t
+		}
+		out = append(out, it)
+	}
+	return out
 }
 
 func (h *Handler) DeleteSession(c *gin.Context) {
@@ -611,6 +1155,86 @@ func (h *Handler) DeleteSession(c *gin.Context) {
 		return
 	}
 	c.JSON(200, gin.H{"deleted": id})
+}
+
+// ============== Strategy (Phase A, 2026-09-02) ==============
+//   per-supplier 特定解析策略, 取代旧 template
+//   Phase A: 3 个端点 (GET / PUT / POST optimize) 全部可用
+//     - GET  /suppliers/:name/strategy        查 (没有返 404)
+//     - PUT  /suppliers/:name/strategy        改 (覆盖 body/overlay/hints/handwrite/enabled)
+//     - POST /suppliers/:name/strategy/optimize 触发 LLM 优化 (Phase A: 占位,Phase B 实现)
+
+// GetStrategy 查某 supplier 的 strategy
+//
+//	不存在 → 404 + {"exists": false} (前端可据此显示"未建"提示)
+func (h *Handler) GetStrategy(c *gin.Context) {
+	name := c.Param("name")
+	if name == "" {
+		c.JSON(400, gin.H{"error": "name 必填"})
+		return
+	}
+	s, err := h.Strategies.GetBySupplier(c.Request.Context(), name)
+	if err != nil {
+		c.JSON(500, gin.H{"error": err.Error()})
+		return
+	}
+	if s == nil {
+		c.JSON(404, gin.H{"exists": false, "supplier": name})
+		return
+	}
+	c.JSON(200, gin.H{"exists": true, "strategy": s})
+}
+
+// UpsertStrategy 覆盖式改 strategy (运营手动纠错用)
+//
+//	body: 完整 model.Strategy JSON (含 supplier_name 必填)
+//	行为: Upsert,version 由调用方管理 (建议 +1)
+//	注意: 不并发安全(Phase A 单调用方),Phase B 改乐观锁
+func (h *Handler) UpsertStrategy(c *gin.Context) {
+	name := c.Param("name")
+	var s model.Strategy
+	if err := c.ShouldBindJSON(&s); err != nil {
+		c.JSON(400, gin.H{"error": "bad json: " + err.Error()})
+		return
+	}
+	if s.SupplierName == "" {
+		s.SupplierName = name
+	}
+	if s.SupplierName != name {
+		c.JSON(400, gin.H{"error": "URL name 与 JSON supplier_name 不一致"})
+		return
+	}
+	if err := h.Strategies.Upsert(c.Request.Context(), &s); err != nil {
+		c.JSON(500, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(200, gin.H{"upserted": true, "strategy": s})
+}
+
+// OptimizeStrategy 触发 LLM 优化 (Phase A: 占位,Phase B 接入 optimize-parse-strategy skill)
+//
+//	行为:
+//	  - 现在: 立即触发通用流程 + 记 last_auto_optimized_at
+//	  - Phase B: 调 runner.Run 让 LLM 读 diff + 调 invoke_skill("optimize-parse-strategy")
+//	前端可手动触发或等自动阈值 (edit_count >= 3)
+func (h *Handler) OptimizeStrategy(c *gin.Context) {
+	name := c.Param("name")
+	if name == "" {
+		c.JSON(400, gin.H{"error": "name 必填"})
+		return
+	}
+	// Phase A 占位: 只重置 edit_count,Phase B 接入完整 LLM 优化流程
+	// (Phase B: 拿最近 N 次 session 的 LLM 解析结果 + 人工修正 diff, 调 optimize-parse-strategy skill)
+	if err := h.Strategies.ResetEditCount(c.Request.Context(), name); err != nil {
+		c.JSON(500, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(200, gin.H{
+		"optimized": false,
+		"phase":     "A",
+		"note":      "Phase A 仅重置 edit_count,Phase B 接入完整 LLM 优化",
+		"supplier":  name,
+	})
 }
 
 // ============== Row 操作 ==============
@@ -674,22 +1298,8 @@ func (h *Handler) ExportSession(c *gin.Context) {
 		c.JSON(404, gin.H{"error": "not found"})
 		return
 	}
-	if s.Mode == model.ModeInventory {
-		// 盘点模式: 检查差异
-		var mism int
-		for _, r := range s.Rows {
-			if r.StockMismatch {
-				mism++
-			}
-		}
-		if mism > 0 {
-			c.JSON(409, gin.H{
-				"error":             "盘点模式有差异行, 请先确认",
-				"stock_mismatch_count": mism,
-			})
-			return
-		}
-	}
+	// Phase A (2026-09-02): 盘点模式已下线, ExportSession 不再检查 StockMismatch
+	// 参见 docs/ocr-purchase-skill-architecture.md §三
 
 	var sb stringBuilder
 	// 头: 注释行
@@ -738,147 +1348,12 @@ func (s *stringBuilder) WriteString(str string) {
 }
 func (s *stringBuilder) String() string { return string(s.buf) }
 
-// ============== 数据源切换 (unified cube) ==============
-
-// GetDataSource GET /api/v1/datasource
-//   返回当前数据源名(erp / hbpos)
-func (h *Handler) GetDataSource(c *gin.Context) {
-	if h.Agent == nil {
-		c.JSON(503, gin.H{"error": "agent client not configured"})
-		return
-	}
-	c.JSON(200, gin.H{
-		"datasource": h.Agent.GetDataSource(),
-	})
-}
-
-// SetDataSource POST /api/v1/datasource
-//   body: {"datasource": "erp" | "hbpos"}
-//   切换 agent client 的数据源(下次 /v1/load 自动用新 ds)
-func (h *Handler) SetDataSource(c *gin.Context) {
-	if h.Agent == nil {
-		c.JSON(503, gin.H{"error": "agent client not configured"})
-		return
-	}
-	var body struct {
-		DataSource string `json:"datasource"`
-	}
-	if err := c.BindJSON(&body); err != nil {
-		c.JSON(400, gin.H{"error": "invalid body: " + err.Error()})
-		return
-	}
-	ds := strings.ToLower(strings.TrimSpace(body.DataSource))
-	if ds == "" {
-		// 允许空 = 重置默认
-		ds = "erp"
-	}
-	if ds != "erp" && ds != "hbpos" {
-		c.JSON(400, gin.H{
-			"error": "datasource must be 'erp' or 'hbpos'",
-			"got":   body.DataSource,
-		})
-		return
-	}
-	h.Agent.SetDataSource(ds)
-	c.JSON(200, gin.H{
-		"datasource": ds,
-		"status":     "ok",
-	})
-}
+// ============== 数据源 (2026-08-31 彻底移除) ==============
+//   /api/v1/datasource 路由删除,GetDataSource / SetDataSource 函数删除
+//   数据源启动后即固定(从 .env / cfg),不再有任何运行时 API
+//   前端不需要知道当前数据源,也不允许切换
 
 // ============== 业务层(业务字段 ↔ 物理字段 翻译) ==============
-
-// loadSupplierSkusBiz 用 business mapping 翻译
-//   前端/parser 给业务字段名(supplier_name, barcode, ...)
-//   内部翻译为物理字段,调 agent,响应再翻回业务字段名
-//   返回 []model.SkuRecord 业务字段模型(供 SkuMatcher 用)
-func (h *Handler) loadSupplierSkusBiz(supplierKeyword string, limit int) ([]model.SkuRecord, error) {
-	if h.BusinessReg == nil {
-		return nil, fmt.Errorf("business registry not configured")
-	}
-	ds := h.Agent.GetDataSource()
-	ent, ok := h.BusinessReg.Get("products")
-	if !ok {
-		return nil, fmt.Errorf("products entity not found")
-	}
-	src, ok := ent.Sources[ds]
-	if !ok {
-		return nil, fmt.Errorf("products entity has no mapping for datasource %s", ds)
-	}
-	// 业务字段清单(只取该 ds 支持的)
-	bizFields := []string{"barcode", "product_name", "supplier_id", "supplier_name", "category", "brand", "stock_qty"}
-	// 物理字段清单
-	measures := []string{}
-	dimensions := []string{}
-	for _, bf := range bizFields {
-		ref, ok := src.FieldRefs[bf]
-		if !ok || ref == "" {
-			continue
-		}
-		if ent.Fields[bf].Type == business.FieldTypeMeasure {
-			measures = append(measures, ref)
-		} else {
-			dimensions = append(dimensions, ref)
-		}
-	}
-	// supplier_name filter
-	supplierNameRef := src.FieldRefs["supplier_name"]
-	if supplierNameRef == "" {
-		return nil, fmt.Errorf("supplier_name not mapped for datasource %s", ds)
-	}
-	// 多关键词
-	keywords := splitAndTrim(supplierKeyword, ";,\n\r\t ")
-	if len(keywords) == 0 {
-		return nil, fmt.Errorf("supplier keyword empty")
-	}
-	seen := make(map[string]struct{})
-	var merged []model.SkuRecord
-	for _, kw := range keywords {
-		filters := []map[string]any{
-			{"member": supplierNameRef, "operator": "contains", "values": []string{kw}},
-		}
-		rows, err := h.Agent.Execute(src.Cube, measures, dimensions, filters, []string{"sup_only"}, limit)
-		if err != nil {
-			return nil, err
-		}
-		// 翻回业务字段名
-		bizRows, err := h.BusinessReg.ToBusinessResponse("products", ds, rows, bizFields)
-		if err != nil {
-			return nil, err
-		}
-		for _, br := range bizRows {
-			r := mapToSkuRecord(br)
-			if r.Barcode == "" && r.Name == "" {
-				continue
-			}
-			key := ""
-			if r.Barcode != "" {
-				key = "bc:" + r.Barcode
-			} else {
-				key = "sn:" + r.MainSuppName + "|" + r.Name
-			}
-			if _, ok := seen[key]; !ok {
-				seen[key] = struct{}{}
-				merged = append(merged, r)
-			}
-		}
-	}
-	return merged, nil
-}
-
-// mapToSkuRecord 业务字段 map → model.SkuRecord
-func mapToSkuRecord(br map[string]any) model.SkuRecord {
-	r := model.SkuRecord{
-		Barcode:      asAnyString(br["barcode"]),
-		Name:         asAnyString(br["product_name"]),
-		MainSuppId:   asAnyString(br["supplier_id"]),
-		MainSuppName: asAnyString(br["supplier_name"]),
-		// SrcSheet 暂存 category(原有 model 字段复用)
-		SrcSheet: asAnyString(br["category"]),
-		StockQty: asAnyFloat(br["stock_qty"]),
-	}
-	return r
-}
 
 func asAnyString(v any) string {
 	if v == nil {
@@ -890,89 +1365,20 @@ func asAnyString(v any) string {
 	return fmt.Sprintf("%v", v)
 }
 
-func asAnyFloat(v any) *float64 {
-	if v == nil {
-		return nil
-	}
-	var f float64
-	switch x := v.(type) {
-	case float64:
-		f = x
-	case float32:
-		f = float64(x)
-	case int:
-		f = float64(x)
-	case int64:
-		f = float64(x)
-	case string:
-		if _, err := fmt.Sscanf(x, "%f", &f); err != nil {
-			return nil
-		}
-	default:
-		if _, err := fmt.Sscanf(fmt.Sprintf("%v", v), "%f", &f); err != nil {
-			return nil
-		}
-	}
-	return &f
-}
-
-// splitAndTrim 按多个分隔符切字符串并去重 trim
-func splitAndTrim(s string, seps string) []string {
-	parts := strings.FieldsFunc(s, func(r rune) bool {
-		for _, s := range seps {
-			if r == s {
-				return true
-			}
-		}
-		return false
-	})
-	seen := make(map[string]struct{})
-	out := make([]string, 0, len(parts))
-	for _, p := range parts {
-		p = strings.TrimSpace(p)
-		if p == "" {
-			continue
-		}
-		if _, ok := seen[p]; ok {
-			continue
-		}
-		seen[p] = struct{}{}
-		out = append(out, p)
-	}
-	return out
-}
-
 // ============== 业务 API(供前端直接调用) ==============
 
-// ListDatasources GET /api/v1/datasources
-//   返回 collect-ai 当前支持的所有 (entity, datasource) 组合
-//   供前端做数据源选择下拉
-func (h *Handler) ListDatasources(c *gin.Context) {
-	if h.BusinessReg == nil {
-		c.JSON(500, gin.H{"error": "business registry not configured"})
-		return
-	}
-	out := []gin.H{}
-	for _, entName := range h.BusinessReg.List() {
-		ent, _ := h.BusinessReg.Get(entName)
-		dsList := h.BusinessReg.AvailableDataSources(entName)
-		fields := h.BusinessReg.AvailableFields(entName)
-		out = append(out, gin.H{
-			"entity":        entName,
-			"description":   ent.Description,
-			"datasources":   dsList,
-			"fields":        fields,
-		})
-	}
-	c.JSON(200, gin.H{
-		"entities":      out,
-		"current_ds":    h.Agent.GetDataSource(),
-	})
-}
-
-// SearchProducts GET /api/v1/products/search?datasource=xxx&supplier=xxx&limit=100
-//   业务字段查询(前端直接调)
-//   业务字段:barcode/product_name/supplier_id/supplier_name/category/brand/stock_qty
+// SearchProducts GET /api/v1/products/search?supplier=xxx&limit=100
+//
+//	数据源启动后即固定(2026-08-31),不再接受 ?datasource= 覆盖
+//	业务字段:barcode/product_name/supplier_id/supplier_name/category/brand/stock_qty/unit
+//	业务字段查询(前端直接调)
+//
+// 权限隔离 (2026-09-01 库存 + 2026-09-03 供应商 + 单位):
+//   - stock_qty       需 inventory:view perm (无 → 不查不返回)
+//   - supplier_id /
+//     supplier_name   需 supplier:view  perm (无 → 不查不返回)
+//   - unit            不做权限控制(所有用户都能看商品计量单位)
+//   - meta.inv_viewable / meta.supplier_viewable 告诉前端哪些字段被权限过滤
 func (h *Handler) SearchProducts(c *gin.Context) {
 	if err := h.Agent.Ping(); err != nil {
 		c.JSON(503, gin.H{"error": "agent 不可达: " + err.Error()})
@@ -982,11 +1388,11 @@ func (h *Handler) SearchProducts(c *gin.Context) {
 		c.JSON(500, gin.H{"error": "business registry not configured"})
 		return
 	}
-	ds := c.Query("datasource")
-	if ds == "" {
-		ds = h.Agent.GetDataSource()
-	}
+	// 数据源启动后即固定(2026-08-31),不再接受 ?datasource= 覆盖
+	ds := h.Agent.GetDataSource()
 	supplier := c.Query("supplier")
+	barcode := strings.TrimSpace(c.Query("barcode")) // 2026-08-31: 扫码查商品
+	itemNo := strings.TrimSpace(c.Query("item_no"))  // 别名, 跟 barcode 等价 (HBPoS 用 item_no 当 barcode)
 	limit, _ := strconv.Atoi(c.Query("limit"))
 	if limit == 0 {
 		limit = 100
@@ -1008,45 +1414,198 @@ func (h *Handler) SearchProducts(c *gin.Context) {
 		return
 	}
 
+	// 2026-09-01: 权限隔离 — 无 inventory:view 则不查不返回 stock_qty
+	// 2026-09-03: 加 supplier:view 隔离 (跟 restock 模块 permSupplierView 一致)
+	role := auth.RoleFromCtx(c)
+	invViewable := auth.HasPerm(role, "inventory:view")
+	supplierViewable := auth.HasPerm(role, "supplier:view")
+
 	// 默认拉所有可用业务字段
-	bizFields := []string{"barcode", "product_name", "supplier_id", "supplier_name", "category", "brand", "stock_qty"}
-	measures := []string{}
-	dimensions := []string{}
-	for _, bf := range bizFields {
-		ref, ok := src.FieldRefs[bf]
-		if !ok || ref == "" {
-			continue
+	// 2026-09-03: 加 unit 字段 (mapping.go:332 已定义 → t_bd_item_info.unit_no)
+	bizFields := []string{"barcode", "product_name", "supplier_id", "supplier_name", "category", "brand", "stock_qty", "unit", "price"}
+	if !invViewable || !supplierViewable {
+		// 过滤掉无 perm 的敏感字段: 既不进 query measures/dimensions 也不进 response
+		filtered := bizFields[:0]
+		for _, bf := range bizFields {
+			if !invViewable && bf == "stock_qty" {
+				continue
+			}
+			if !supplierViewable && (bf == "supplier_id" || bf == "supplier_name") {
+				continue
+			}
+			filtered = append(filtered, bf)
 		}
-		if ent.Fields[bf].Type == business.FieldTypeMeasure {
-			measures = append(measures, ref)
-		} else {
-			dimensions = append(dimensions, ref)
-		}
+		bizFields = filtered
 	}
-	filters := []map[string]any{}
+
+	// 2026-09-02: 翻译/Execute/翻回收编到 Executor.Query
+	//   handler 只负责"业务字段 filter 拼装 + permission 切字段"
+	bizFilters := []business.BusinessFilter{}
 	if supplier != "" {
-		supplierNameRef := src.FieldRefs["supplier_name"]
-		if supplierNameRef != "" {
-			filters = append(filters, map[string]any{
-				"member": supplierNameRef, "operator": "contains", "values": []string{supplier},
-			})
+		bizFilters = append(bizFilters, business.BusinessFilter{
+			Field: "supplier_name", Op: "contains", Values: []any{supplier},
+		})
+	}
+	// 2026-08-31: barcode / item_no 过滤 (扫码查商品, 返回 1 条精准结果)
+	barcodeQuery := barcode
+	if barcodeQuery == "" {
+		barcodeQuery = itemNo
+	}
+	if barcodeQuery != "" {
+		bizFilters = append(bizFilters, business.BusinessFilter{
+			Field: "barcode", Op: "equals", Values: []any{barcodeQuery},
+		})
+		// 精准查询: 限定 1 条
+		if limit > 1 {
+			limit = 1
 		}
 	}
 
-	rows, err := h.Agent.Execute(src.Cube, measures, dimensions, filters, []string{"sup_only"}, limit)
+	bizRows, err := h.BizExecutor.Query("products", bizFields, bizFilters, limit)
 	if err != nil {
-		c.JSON(500, gin.H{"error": "agent query: " + err.Error()})
-		return
-	}
-	bizRows, err := h.BusinessReg.ToBusinessResponse("products", ds, rows, bizFields)
-	if err != nil {
-		c.JSON(500, gin.H{"error": "translate response: " + err.Error()})
+		c.JSON(500, gin.H{"error": "query: " + err.Error()})
 		return
 	}
 	c.JSON(200, gin.H{
 		"products":   bizRows,
 		"count":      len(bizRows),
 		"datasource": ds,
-		"cube":       src.Cube,
+		"cube":       h.BizExecutor.CubeOf("products"),
+		"meta": gin.H{
+			"inv_viewable":      invViewable,
+			"supplier_viewable": supplierViewable,
+		},
 	})
+}
+
+// ============== POP 打印用: 查商品当前生效促销 (2026-09-07) ==============
+//
+//	GET /api/v1/products/promo?barcode=xxx
+//	数据源: cube promotion_active_price (hbpos, t_pub_plan_flow, 1:1 barcode 查)
+//	权限: session:read (跟 SearchProducts 同)
+//	返回: { promo: null } | { promo: { price, orig_price, begin, end, plan_no } }
+//
+//	设计:
+//	- 走 h.Agent.Execute 直调 cube (promotion 是业务专用 cube, 不走 mapping registry)
+//	- min_promo_price 拿最低 (多 plan 同一 item 时取最便宜)
+//	- 7 天内窗口 (cube 内部 WHERE 限定, POP 打印用 7 天足够)
+//	- time dim begin_date / end_date: 给前端展示活动期
+//	- 失败容错: agent 不可达 / cube 不存在 → 返 { promo: null } (前端降级走手动切特价)
+func (h *Handler) SearchProductPromo(c *gin.Context) {
+	barcode := strings.TrimSpace(c.Query("barcode"))
+	if barcode == "" {
+		c.JSON(400, gin.H{"error": "missing barcode"})
+		return
+	}
+	if err := h.Agent.Ping(); err != nil {
+		// agent 不可达时静默降级 (POP 打印主流程不依赖 promo, 手动切特价兜底)
+		c.JSON(200, gin.H{"promo": nil, "reason": "agent unreachable"})
+		return
+	}
+	rows, err := h.Agent.Execute(
+		"promotion_active_price",
+		[]string{"promotion_active_price.min_promo_price"},
+		[]string{
+			"promotion_active_price.item_no",
+			"promotion_active_price.plan_no",
+			"promotion_active_price.orig_price",
+			"promotion_active_price.promo_price",
+			"promotion_active_price.begin_date",
+			"promotion_active_price.end_date",
+		},
+		[]map[string]any{
+			{"member": "promotion_active_price.item_no", "operator": "equals", "values": []any{barcode}},
+		},
+		nil,
+		20, // 多 plan 同一 item 拿全, 前端取 min
+	)
+	if err != nil {
+		// cube 不存在 / SQL 错 → 降级返 null
+		c.JSON(200, gin.H{"promo": nil, "reason": "query failed: " + err.Error()})
+		return
+	}
+	if len(rows) == 0 {
+		c.JSON(200, gin.H{"promo": nil})
+		return
+	}
+	// 多 plan 时挑 min_promo_price 最低
+	var best map[string]any
+	minPrice := 1e18
+	for _, r := range rows {
+		// 兼容裸名 / 带 cube. 前缀 两种 key 形式 (agent client 实际行为: 不带前缀, 只带 measure 后缀)
+		v := promoFloat(r["min_promo_price"])
+		if v == 0 {
+			v = promoFloat(r["promotion_active_price.min_promo_price"])
+		}
+		if v > 0 && v < minPrice {
+			minPrice = v
+			best = r
+		}
+	}
+	// 2026-09-07: debug log — 看实际 map 长啥样 (keys + types)
+	if best != nil {
+		log.Printf("[promo] best keys=%v", mapKeys(best))
+		for k, v := range best {
+			log.Printf("[promo]   %s = %T %v", k, v, v)
+		}
+	}
+	if best == nil {
+		c.JSON(200, gin.H{"promo": nil})
+		return
+	}
+	// 时间格式兼容: cube 可能返 string ("2025-11-01T00:00:00Z") 或 time.Time
+	// 统一截前 10 位 yyyy-mm-dd
+	parseDate := func(v any) string {
+		if v == nil {
+			return ""
+		}
+		s := fmt.Sprint(v)
+		if len(s) >= 10 {
+			return s[:10]
+		}
+		return s
+	}
+	// 2026-09-07 fix: cube /v1/load 返的 row key 是 "promotion_active_price.orig_price" (带 cube 前缀),
+	//   裸名 key 拿不到. 用 helper 兼容两种 key
+	get := func(key string) any {
+		if v, ok := best[key]; ok { return v }
+		if v, ok := best["promotion_active_price."+key]; ok { return v }
+		return nil
+	}
+	c.JSON(200, gin.H{
+		"promo": gin.H{
+			"price":      minPrice,
+			"orig_price": promoFloat(get("orig_price")),
+			"begin":      parseDate(get("begin_date")),
+			"end":        parseDate(get("end_date")),
+			"plan_no":    get("plan_no"),
+		},
+	})
+}
+
+// promoFloat 安全转 any → float64 (cube 返回数字可能是 float64 / int / string)
+func promoFloat(v any) float64 {
+	switch x := v.(type) {
+	case float64:
+		return x
+	case float32:
+		return float64(x)
+	case int:
+		return float64(x)
+	case int64:
+		return float64(x)
+	case string:
+		f, _ := strconv.ParseFloat(x, 64)
+		return f
+	}
+	return 0
+}
+
+// 2026-09-07: debug helper — 取 map 的所有 key
+func mapKeys(m map[string]any) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	return keys
 }

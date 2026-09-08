@@ -2,14 +2,12 @@
 //
 // 供 handler / parser 调用的高层 API
 //   不暴露物理字段名,只接受业务字段名
-//   内部用 agent.Client + business.Registry 翻译
+//   内部用 CubeClient + business.Registry 翻译
 package business
 
 import (
 	"fmt"
 	"strings"
-
-	"github.com/tinkler/collect-ai/internal/parser/agent"
 )
 
 // supplierSegments 默认传给 cube-agent-server 的 segments
@@ -19,14 +17,26 @@ var supplierSegments = []string{"sup_only"}
 
 // Executor 业务查询执行器
 //   封装 "业务字段名 → 物理 query → agent → 物理响应 → 业务响应" 完整链路
+//
+// 2026-09-02 重构:
+//   改持 CubeClient interface(原 *agent.Client)
+//   作用: 单测可注入 mock + 跟 Gateway 用同一个 client 避免双重连接
+//   新 Executor 推荐通过 NewExecutorFromGateway 构造
 type Executor struct {
-	agent  *agent.Client
+	client CubeClient
 	mapper *Registry
 }
 
 // NewExecutor 构造执行器
-func NewExecutor(ac *agent.Client, reg *Registry) *Executor {
-	return &Executor{agent: ac, mapper: reg}
+//   接受 CubeClient interface (实参 *agent.Client,或单测 mock)
+func NewExecutor(c CubeClient, reg *Registry) *Executor {
+	return &Executor{client: c, mapper: reg}
+}
+
+// NewExecutorFromGateway 从 Gateway 构造 Executor(推荐)
+//   复用 Gateway 的 client,避免双重连接
+func NewExecutorFromGateway(g *Gateway) *Executor {
+	return &Executor{client: g.client, mapper: g.mapper}
 }
 
 // SearchProducts 按业务字段名搜索商品
@@ -34,7 +44,7 @@ func NewExecutor(ac *agent.Client, reg *Registry) *Executor {
 //   limit: 上限
 //   返回业务字段名 (barcode / product_name / ...) 的 map 列表
 func (e *Executor) SearchProducts(supplierKeyword string, limit int) ([]map[string]any, error) {
-	return e.searchProducts(supplierKeyword, limit, e.agent.GetDataSource())
+	return e.searchProducts(supplierKeyword, limit, e.client.GetDataSource())
 }
 
 // SearchProductsByDS 同上,显式指定数据源(用于单请求不同 ds)
@@ -51,37 +61,24 @@ func (e *Executor) searchProducts(supplierKeyword string, limit int, ds string) 
 	if !ok {
 		return nil, fmt.Errorf("business: products %s not configured", ds)
 	}
-	bizFields := []string{"barcode", "product_name", "supplier_id", "supplier_name", "category", "brand", "stock_qty"}
-	pq, err := e.mapper.ToPhysicalQuery("products", ds, bizFields, nil, 0)
-	if err != nil {
-		return nil, err
-	}
-	measures := pq.Measures
-	dimensions := pq.Dimensions
+	// 2026-09-03: 加 unit 字段 (mapping 已定义 → t_bd_item_info.unit_no)
+	//   跟 SearchProducts handler 字段列表保持一致
+	bizFields := []string{"barcode", "product_name", "supplier_id", "supplier_name", "category", "brand", "stock_qty", "unit"}
 
-	// filter
-	supplierNameRef := src.FieldRefs["supplier_name"]
+	// 2026-09-02 重构: filter 翻译走 Registry,不再手拼 ref
 	keywords := splitAndTrim(supplierKeyword, ";,\n\r\t ")
 	if len(keywords) == 0 {
 		// 不带 filter,直接拉
-		rows, err := e.agent.Execute(src.Cube, measures, dimensions, nil, supplierSegments, limit)
-		if err != nil {
-			return nil, err
-		}
-		return e.mapper.ToBusinessResponse("products", ds, rows, bizFields)
+		return e.query("products", ds, bizFields, nil, limit)
 	}
 
 	seen := make(map[string]struct{})
 	var merged []map[string]any
 	for _, kw := range keywords {
-		filters := []map[string]any{
-			{"member": supplierNameRef, "operator": "contains", "values": []string{kw}},
+		filters := []BusinessFilter{
+			{Field: "supplier_name", Op: "contains", Values: []any{kw}},
 		}
-		rows, err := e.agent.Execute(src.Cube, measures, dimensions, filters, supplierSegments, limit)
-		if err != nil {
-			return nil, err
-		}
-		bizRows, err := e.mapper.ToBusinessResponse("products", ds, rows, bizFields)
+		bizRows, err := e.query("products", ds, bizFields, filters, limit)
 		if err != nil {
 			return nil, err
 		}
@@ -103,12 +100,16 @@ func (e *Executor) searchProducts(supplierKeyword string, limit int, ds string) 
 			}
 		}
 	}
+	_ = src // 保留 src 引用以备后续加 ds 校验
 	return merged, nil
 }
 
 // DistinctSuppliers 拉所有 distinct 供应商
+//   ds-specific 行为(原 hardcode 保留):
+//     hbpos: suppliers cube 用 "suppliers.count" measure
+//     erp:   products cube,measures 留空(原代码就这样,无 measure 也跑)
 func (e *Executor) DistinctSuppliers(scanLimit int) ([]string, error) {
-	ds := e.agent.GetDataSource()
+	ds := e.client.GetDataSource()
 	ent, ok := e.mapper.Get("suppliers")
 	if !ok {
 		return nil, fmt.Errorf("business: suppliers entity not found")
@@ -121,15 +122,15 @@ func (e *Executor) DistinctSuppliers(scanLimit int) ([]string, error) {
 	if supplierNameRef == "" {
 		return nil, fmt.Errorf("business: suppliers %s has no supplier_name mapping", ds)
 	}
+
+	// ds-specific measures (cube.js 至少要 1 个 measure)
 	measures := []string{}
-	if ds == "erp" {
-		if r, ok := src.FieldRefs["stock_qty"]; ok && r != "" {
-			measures = []string{r}
-		}
-	} else {
+	if ds == "hbpos" {
 		measures = []string{"suppliers.count"}
 	}
-	rows, err := e.agent.Execute(src.Cube, measures, []string{supplierNameRef}, nil, supplierSegments, scanLimit)
+	// erp: measures 留空,原 hardcode 行为
+
+	rows, err := e.client.Execute(src.Cube, measures, []string{supplierNameRef}, nil, supplierSegments, scanLimit)
 	if err != nil {
 		return nil, err
 	}
@@ -151,6 +152,165 @@ func (e *Executor) DistinctSuppliers(scanLimit int) ([]string, error) {
 		out = append(out, k)
 	}
 	return out, nil
+}
+
+// SearchProductsByBrand 按品牌(产品名 contains)反查商品,返回 product × supplier 行
+//   2026-09-02 加,替代 handler.ListSuppliersByBrand 重复的翻译/调用/翻回部分
+//   handler 端再做"按 supplier 聚合 distinct product count"业务聚合
+//   返回: 业务字段名 map 列表,含 product_name + supplier_name
+//   注: brand 字段常空,实际语义是"商品名包含关键词的产品归属于哪些供应商"
+func (e *Executor) SearchProductsByBrand(brand string, limit int) ([]map[string]any, error) {
+	ds := e.client.GetDataSource()
+	if _, ok := e.mapper.Get("products"); !ok {
+		return nil, fmt.Errorf("business: products entity not found")
+	}
+	bizFields := []string{"product_name", "supplier_name"}
+	filters := []BusinessFilter{
+		{Field: "product_name", Op: "contains", Values: []any{brand}},
+	}
+	return e.query("products", ds, bizFields, filters, limit)
+}
+
+// Query 通用业务字段名查询 (2026-09-02 公开)
+//   handler 通用 cube 调用入口,所有业务名 + filter 翻译由 Registry 处理
+//   调用方:handler / parser / 未来 trpc-agent-go tools
+//   返回: 业务字段名 map 列表
+func (e *Executor) Query(
+	entity string,
+	bizFields []string,
+	filters []BusinessFilter,
+	limit int,
+) ([]map[string]any, error) {
+	ds := e.client.GetDataSource()
+	return e.query(entity, ds, bizFields, filters, limit)
+}
+
+// CubeOf 返回 entity 当前 ds 用的物理 cube 名
+//   2026-09-02 加,handler 返回给前端 meta.cube 用
+func (e *Executor) CubeOf(entity string) string {
+	ds := e.client.GetDataSource()
+	ent, ok := e.mapper.Get(entity)
+	if !ok {
+		return ""
+	}
+	src, ok := ent.Sources[ds]
+	if !ok {
+		return ""
+	}
+	return src.Cube
+}
+
+// ReturnOrder 退货单业务响应 (W4.4, 2026-09-04)
+//   业务字段名 (跟 mapping.yaml entities.returns.fields 对齐)
+//   严禁包含物理 cube 字段名 (AGENTS.md §12.2)
+type ReturnOrder struct {
+	BillNo      string    `json:"bill_no"`             // 退货单号
+	SupplierID  string    `json:"supplier_id"`         // 供应商编号
+	Supplier    string    `json:"supplier_name"`       // 供应商名
+	Status      string    `json:"status"`              // 业务状态: pending|approved
+	ReturnMoney float64   `json:"return_money"`        // 退货金额
+	CreateDate  string    `json:"create_date"`         // 制单时间 (ISO 8601)
+	BranchNo    string    `json:"branch_no,omitempty"` // 门店编号
+}
+
+// SearchReturnsBySupplier 查某 supplier 的退货单 (W4.4, purchase-alert rule 8 用)
+//   supplier: 供应商名 (HBPoS sup_name, 业务字段名)
+//   status: 业务状态值 ("pending" / "approved" / "" 全部), 空=不按状态过滤
+//   days: 时间窗口天数 (近 N 天), 0=不限 (但 cube 端 SQL 自带近 1 年过滤, 实测够用)
+//   limit: 上限 (默认 100, 防单 supplier 退货单爆量)
+//
+// 走 e.query() 私有方法:
+//   - status 业务值经 mapping ValueMap 翻译为物理值 (pending→"0" HBPoS approve_flag)
+//   - supplier_name 业务字段 → sup_name 物理字段 (cube SQL 已 LEFT JOIN t_bd_supcust_info)
+//   - return_money measure / create_date time 字段类型由 mapping 框架处理
+//
+// 错误处理:
+//   - 当前 ds 没配 returns mapping → 返回 "未配置" error, caller (Fn) 转 not_available=true
+//   - cube 调用失败 → 透传 error, caller 降级
+func (e *Executor) SearchReturnsBySupplier(supplier, status string, days, limit int) ([]ReturnOrder, error) {
+	if limit <= 0 {
+		limit = 100
+	}
+	bizFields := []string{"bill_no", "supplier_id", "supplier_name", "status", "return_money", "create_date", "branch_no"}
+
+	// filter 1: supplier_name 必填 (cube SQL 自己 LIKE 匹配, 业务字段名)
+	filters := []BusinessFilter{
+		{Field: "supplier_name", Op: "contains", Values: []any{supplier}},
+	}
+	// filter 2: status 可选 (ValueMap 翻译 pending→"0")
+	if status != "" {
+		filters = append(filters, BusinessFilter{Field: "status", Op: "equals", Values: []any{status}})
+	}
+
+	rows, err := e.query("returns", e.client.GetDataSource(), bizFields, filters, limit)
+	if err != nil {
+		return nil, err
+	}
+
+	// 业务响应 → ReturnOrder struct
+	// days 过滤: e.query() 不支持 time filter (cube 端 SQL 自带近 1 年过滤)
+	//   真实需要 days 时, 在调用方 (Fn) 二次过滤 create_date
+	out := make([]ReturnOrder, 0, len(rows))
+	for _, r := range rows {
+		ro := ReturnOrder{
+			BillNo:     stringField(r, "bill_no"),
+			SupplierID: stringField(r, "supplier_id"),
+			Supplier:   stringField(r, "supplier_name"),
+			Status:     stringField(r, "status"),
+			BranchNo:   stringField(r, "branch_no"),
+		}
+		ro.ReturnMoney = floatField(r, "return_money")
+		ro.CreateDate = stringField(r, "create_date")
+		out = append(out, ro)
+	}
+	return out, nil
+}
+
+// stringField / floatField 工具: 从 map 里安全取字段, 缺字段返零值
+func stringField(m map[string]any, key string) string {
+	if v, ok := m[key]; ok {
+		if s, ok := v.(string); ok {
+			return s
+		}
+	}
+	return ""
+}
+
+func floatField(m map[string]any, key string) float64 {
+	if v, ok := m[key]; ok {
+		switch x := v.(type) {
+		case float64:
+			return x
+		case float32:
+			return float64(x)
+		case int:
+			return float64(x)
+		case int64:
+			return float64(x)
+		}
+	}
+	return 0
+}
+
+// query 内部统一:Registry 翻译 + 调 agent + 翻回
+func (e *Executor) query(
+	entity, ds string,
+	bizFields []string,
+	filters []BusinessFilter,
+	limit int,
+) ([]map[string]any, error) {
+	pq, err := e.mapper.ToPhysicalQuery(entity, ds, bizFields, filters, limit)
+	if err != nil {
+		return nil, err
+	}
+	if pq.Cube == "" {
+		return nil, fmt.Errorf("business: entity %q datasource %q has no cube", entity, ds)
+	}
+	rows, err := e.client.Execute(pq.Cube, pq.Measures, pq.Dimensions, toAgentFilters(pq.Filters), supplierSegments, limit)
+	if err != nil {
+		return nil, err
+	}
+	return e.mapper.ToBusinessResponse(entity, ds, rows, bizFields)
 }
 
 // splitAndTrim 按多个分隔符切字符串并去重 trim

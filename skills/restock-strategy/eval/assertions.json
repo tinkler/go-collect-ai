@@ -1,0 +1,62 @@
+{
+  "skill": "restock-strategy",
+  "version": "1.0.0",
+  "assertions": [
+    {
+      "id": "assert-001",
+      "case_id": "case-001",
+      "type": "json_field",
+      "check": "priority",
+      "value": "P0"
+    },
+    {
+      "id": "assert-002",
+      "case_id": "case-001",
+      "type": "contains",
+      "check": "rationale",
+      "value": "0.17"
+    },
+    {
+      "id": "assert-003",
+      "case_id": "case-002",
+      "type": "json_field",
+      "check": "final_qty",
+      "value": 276
+    },
+    {
+      "id": "assert-004",
+      "case_id": "case-002",
+      "type": "json_field",
+      "check": "fill_rate_adjusted",
+      "value": 268.42
+    },
+    {
+      "id": "assert-005",
+      "case_id": "case-002",
+      "type": "contains",
+      "check": "rationale",
+      "value": "0.95"
+    },
+    {
+      "id": "assert-006",
+      "case_id": "case-004",
+      "type": "json_field",
+      "check": "fill_rate",
+      "value": 0.92
+    },
+    {
+      "id": "assert-007",
+      "case_id": "case-004",
+      "type": "json_field",
+      "check": "tier",
+      "value": "fair"
+    },
+    {
+      "id": "assert-008",
+      "case_id": "case-004",
+      "type": "json_field",
+      "check": "adjustment_factor",
+      "value": 1.11
+    }
+  ]
+}

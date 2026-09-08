@@ -30,6 +30,13 @@ type Config struct {
 	MaxUploadMB   int    `mapstructure:"MAX_UPLOAD_MB"`
 	PublicBaseURL string `mapstructure:"PUBLIC_BASE_URL"` // 用于生成图片 URL, 飞书 H5 用
 
+	// 2026-09-07: POP 打印页 LOGO 配置
+	//   - PopLogoName: 商超名 (e.g. "小商超"), 出现在 POP 模板顶部
+	//   - PopLogoFile: 静态 LOGO 文件名 (放在 UploadDir 下, e.g. "pop-logo.png")
+	//                 存在则前端用图片, 不存在则只用文字名
+	PopLogoName string `mapstructure:"POP_LOGO_NAME"`
+	PopLogoFile string `mapstructure:"POP_LOGO_FILE"`
+
 	// PostgreSQL
 	PGHost     string `mapstructure:"PG_HOST"`
 	PGPort     int    `mapstructure:"PG_PORT"`
@@ -42,6 +49,11 @@ type Config struct {
 	BigModelBase   string `mapstructure:"BIGMODEL_BASE"`
 	OCRModel       string `mapstructure:"OCR_MODEL"` // hand_write / layout_parsing
 	LLMModel       string `mapstructure:"LLM_MODEL"` // glm-4-flash
+
+	// DeepSeek (2026-09-04 双引擎: 引擎2 视觉模型解析供货单)
+	DeepseekAPIKey      string `mapstructure:"DEEPSEEK_API_KEY"`
+	DeepseekBase        string `mapstructure:"DEEPSEEK_BASE"`
+	DeepseekVisionModel string `mapstructure:"DEEPSEEK_VISION_MODEL"`
 
 	// cube-agent-server
 	AgentURL   string `mapstructure:"AGENT_URL"`
@@ -60,6 +72,46 @@ type Config struct {
 	// 并发限流
 	MaxConcurrentParse int `mapstructure:"MAX_CONCURRENT_PARSE"` // 解析并发上限 (0=不限流, 默认 4)
 	RateLimitWaitSec   int `mapstructure:"RATE_LIMIT_WAIT_SEC"`  // 客户端等待 semaphore 超时 (默认 30)
+
+	// ============== 补货模块 (restock, 2026-09-02 精简) ==============
+	RestockBranchNo string `mapstructure:"RESTOCK_BRANCH_NO"`
+
+	// 3 次 cron 表达式 (HH:MM)
+	DisplayRestockCronEve  string `mapstructure:"DISPLAY_RESTOCK_CRON_EVE"`
+	DisplayRestockCronMorn string `mapstructure:"DISPLAY_RESTOCK_CRON_MORN"`
+	DisplayRestockCronAft  string `mapstructure:"DISPLAY_RESTOCK_CRON_AFT"`
+	DisplayRestockCubeName string `mapstructure:"DISPLAY_RESTOCK_CUBE_NAME"`
+	DisplayRestockRetryMax int    `mapstructure:"DISPLAY_RESTOCK_RETRY_MAX"`
+	DisplayRestockMaxPush  int    `mapstructure:"DISPLAY_RESTOCK_MAX_PUSH"`
+
+	// 企微智能机器人 (长连接模式)
+	WeComBotID     string `mapstructure:"WECOM_BOT_ID"`
+	WeComBotSecret string `mapstructure:"WECOM_BOT_SECRET"`
+	WeComWSURL     string `mapstructure:"WECOM_WS_URL"`
+	WeComBindFile  string `mapstructure:"WECOM_BIND_FILE"`
+
+	// ============== 鉴权 (2026-08-29) ==============
+	// JWT
+	JWTSecret          string `mapstructure:"JWT_SECRET"`
+	AccessTokenTTLSec  int    `mapstructure:"ACCESS_TOKEN_TTL_SEC"`
+	RefreshTokenTTLSec int    `mapstructure:"REFRESH_TOKEN_TTL_SEC"`
+
+	// Dev 模式开关 (启用 /auth/dev-login)
+	DevMode bool `mapstructure:"DEV_MODE"`
+
+	// 企微 OAuth (H5 免登) — corpSecret 严禁进前端
+	WeComCorpID     string `mapstructure:"WECOM_CORP_ID"`
+	WeComAgentID    string `mapstructure:"WECOM_AGENT_ID"`
+	WeComCorpSecret string `mapstructure:"WECOM_CORP_SECRET"`
+
+	// Refresh cookie
+	CookieDomain string `mapstructure:"COOKIE_DOMAIN"`
+	CookieSecure bool   `mapstructure:"COOKIE_SECURE"`
+
+	// ============== 业务字段映射 (2026-09-02 配置化) ==============
+	//   YAML 路径,空 = 用 NewDefaultRegistry() 硬编码 fallback
+	//   推荐: configs/mappings.yaml (项目根目录相对路径)
+	MappingFile string `mapstructure:"MAPPING_FILE"`
 }
 
 // leaves 列出所有需要 BindEnv 的叶子 key
@@ -67,11 +119,29 @@ type Config struct {
 // (按字段名直接 match env var, 不加前缀以保持向后兼容)
 var leaves = []string{
 	"PORT", "UPLOAD_DIR", "MAX_UPLOAD_MB", "PUBLIC_BASE_URL",
+	"POP_LOGO_NAME", "POP_LOGO_FILE",  // 2026-09-07: POP 打印页 LOGO 配置
 	"PG_HOST", "PG_PORT", "PG_USER", "PG_PASSWORD", "PG_DATABASE",
 	"BIGMODEL_API_KEY", "BIGMODEL_BASE", "OCR_MODEL", "LLM_MODEL",
+	// 双引擎引擎2 (2026-09-04): DeepSeek 视觉模型, 必须 BindEnv 否则 SetDefault("") 会压住 OS env
+	"DEEPSEEK_API_KEY", "DEEPSEEK_BASE", "DEEPSEEK_VISION_MODEL",
 	"AGENT_URL", "AGENT_TOKEN", "DATA_SOURCE",
 	"OCR_TIMEOUT_SEC", "LLM_TIMEOUT_SEC", "USE_LLM", "FUZZY_DISTANCE",
 	"MAX_CONCURRENT_PARSE", "RATE_LIMIT_WAIT_SEC",
+
+	// restock (2026-09-02 精简后)
+	"RESTOCK_BRANCH_NO",
+	"DISPLAY_RESTOCK_CRON_EVE", "DISPLAY_RESTOCK_CRON_MORN", "DISPLAY_RESTOCK_CRON_AFT",
+	"DISPLAY_RESTOCK_CUBE_NAME", "DISPLAY_RESTOCK_RETRY_MAX", "DISPLAY_RESTOCK_MAX_PUSH",
+	"WECOM_BOT_ID", "WECOM_BOT_SECRET", "WECOM_WS_URL", "WECOM_BIND_FILE",
+
+	// auth
+	"JWT_SECRET", "ACCESS_TOKEN_TTL_SEC", "REFRESH_TOKEN_TTL_SEC",
+	"DEV_MODE",
+	"WECOM_CORP_ID", "WECOM_AGENT_ID", "WECOM_CORP_SECRET",
+	"COOKIE_DOMAIN", "COOKIE_SECURE",
+
+	// 业务字段映射配置 (2026-09-02)
+	"MAPPING_FILE",
 }
 
 // Load 加载配置
@@ -125,6 +195,9 @@ func Load() (*Config, error) {
 	v.SetDefault("UPLOAD_DIR", "./uploads")
 	v.SetDefault("MAX_UPLOAD_MB", 16)
 	v.SetDefault("PUBLIC_BASE_URL", "")
+	// 2026-09-07: POP 打印 LOGO 默认值 (用户用环境变量覆盖, 或把图片放到 uploads/pop-logo.png)
+	v.SetDefault("POP_LOGO_NAME", "小商超")
+	v.SetDefault("POP_LOGO_FILE", "pop-logo.png")
 
 	v.SetDefault("PG_HOST", "127.0.0.1")
 	v.SetDefault("PG_PORT", 5432)
@@ -137,8 +210,15 @@ func Load() (*Config, error) {
 	v.SetDefault("OCR_MODEL", "hand_write")
 	v.SetDefault("LLM_MODEL", "glm-4-flash")
 
+	// DeepSeek (2026-09-04 双引擎)
+	v.SetDefault("DEEPSEEK_API_KEY", "")
+	v.SetDefault("DEEPSEEK_BASE", "https://api.deepseek.com")
+	v.SetDefault("DEEPSEEK_VISION_MODEL", "deepseek-v4-flash-vision-exp")
+
 	v.SetDefault("AGENT_URL", "http://127.0.0.1:8088")
 	v.SetDefault("AGENT_TOKEN", "")
+	// 数据源(2026-08-31 简化):启动后即固定,不可运行时切换,默认 hbpos(用户当前部署)
+	v.SetDefault("DATA_SOURCE", "hbpos")
 
 	v.SetDefault("OCR_TIMEOUT_SEC", 60)
 	v.SetDefault("LLM_TIMEOUT_SEC", 60)
@@ -148,6 +228,52 @@ func Load() (*Config, error) {
 	v.SetDefault("MAX_CONCURRENT_PARSE", 4)
 	v.SetDefault("RATE_LIMIT_WAIT_SEC", 30)
 
+	// restock 默认值
+	v.SetDefault("RESTOCK_BRANCH_NO", "")
+	v.SetDefault("RESTOCK_ROP_FACTOR", 1.5)
+	v.SetDefault("RESTOCK_OUT_DAYS", 7)
+	v.SetDefault("RESTOCK_OUT_PROMO_BOOST", 1.3)
+	v.SetDefault("RESTOCK_SAFETY_MIN", 5)
+	v.SetDefault("RESTOCK_DAILY_AVG_W_OLD", 0.4)
+	v.SetDefault("RESTOCK_DAILY_AVG_W_7D", 0.4)
+	v.SetDefault("RESTOCK_DAILY_AVG_W_30D", 0.2)
+	v.SetDefault("RESTOCK_PUSH_FLOOR_MIN_INTERVAL_MIN", 30)
+	v.SetDefault("RESTOCK_PUSH_OFFICE_P0_MIN_MIN", 15)
+	v.SetDefault("RESTOCK_PUSH_OFFICE_P1_MIN_MIN", 60)
+	v.SetDefault("RESTOCK_PUSH_OFFICE_P2_MIN_MIN", 360)
+	v.SetDefault("RESTOCK_MAX_PUSH_PER_TICK", 20)
+	v.SetDefault("RESTOCK_ESCALATE_P2_TO_P1_HOURS", 24)
+	v.SetDefault("RESTOCK_ESCALATE_P1_TO_P0_HOURS", 12)
+	v.SetDefault("RESTOCK_CRON_HOURLY", "0 7-21 * * *")
+	v.SetDefault("RESTOCK_CRON_AGGREGATE", "0 30 21 * * *")
+	v.SetDefault("RESTOCK_CRON_LLM_PLAN", "0 0 1,7,13,19 * * *")
+
+	// 陈列补货新版 (2026-08-30 起)
+	//   cron 是 5 字段 "分 时 日 月 周",parseHHMM 拿 parts[0]=mm, parts[1]=hh
+	v.SetDefault("DISPLAY_RESTOCK_CRON_EVE", "07:00")  // 07:00 tick
+	v.SetDefault("DISPLAY_RESTOCK_CRON_MORN", "12:00") // 12:00 tick
+	v.SetDefault("DISPLAY_RESTOCK_CRON_AFT", "20:30")  // 20:30 tick
+	v.SetDefault("DISPLAY_RESTOCK_CUBE_NAME", "display_restock_window")
+	v.SetDefault("DISPLAY_RESTOCK_RETRY_MAX", 3)
+	v.SetDefault("DISPLAY_RESTOCK_MAX_PUSH", 30)
+	v.SetDefault("WECOM_BOT_ID", "")
+	v.SetDefault("WECOM_BOT_SECRET", "")
+	v.SetDefault("WECOM_WS_URL", "wss://openws.work.weixin.qq.com")
+	v.SetDefault("WECOM_BIND_FILE", "./wecom_bindings.yaml")
+
+	// auth 默认
+	//   JWT_SECRET 故意给一个明显 dev 值, 启动时 main 会校验
+	//   强制 ≥32 字符, 满足 HS256 最低要求
+	v.SetDefault("JWT_SECRET", "dev-secret-change-me-in-prod-32chars")
+	v.SetDefault("ACCESS_TOKEN_TTL_SEC", 900)     // 15 min
+	v.SetDefault("REFRESH_TOKEN_TTL_SEC", 604800) // 7 days
+	v.SetDefault("DEV_MODE", true)                // 默认开 dev-login, 生产手动关
+	v.SetDefault("WECOM_CORP_ID", "")
+	v.SetDefault("WECOM_AGENT_ID", "")
+	v.SetDefault("WECOM_CORP_SECRET", "")
+	v.SetDefault("COOKIE_DOMAIN", "127.0.0.1")
+	v.SetDefault("COOKIE_SECURE", false)
+
 	cfg := &Config{}
 	if err := v.Unmarshal(cfg); err != nil {
 		return nil, fmt.Errorf("unmarshal config: %w", err)
@@ -156,6 +282,8 @@ func Load() (*Config, error) {
 	// 兜底: bool 字段如果 yaml / .env 写了 "true"/"false" 字符串,
 	// viper 应该自动转,但保险起见手动处理
 	cfg.UseLlm = parseBoolEnv("USE_LLM", cfg.UseLlm)
+	cfg.DevMode = parseBoolEnv("DEV_MODE", cfg.DevMode)
+	cfg.CookieSecure = parseBoolEnv("COOKIE_SECURE", cfg.CookieSecure)
 
 	return cfg, nil
 }

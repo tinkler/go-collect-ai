@@ -100,6 +100,298 @@ func Migrate(ctx context.Context, pool *pgxpool.Pool) error {
 		`ALTER TABLE template DROP COLUMN IF EXISTS use_glm_ocr`,
 		`CREATE INDEX IF NOT EXISTS idx_template_supplier ON template(supplier_name)`,
 		`CREATE INDEX IF NOT EXISTS idx_template_default ON template(is_default)`,
+
+		// ============================================================
+		// 智能采购模块 (W1, 2026-09-01) — agent-purchase-plan.md §6
+		// 依赖 trpc-agent-go; 工具/Agent 入口: internal/agent/
+		// ============================================================
+
+		// 供应商政策 (A 模块) — 一家供应商同一 key 唯一
+		`CREATE TABLE IF NOT EXISTS supplier_policy (
+			id              BIGSERIAL PRIMARY KEY,
+			supplier_name   TEXT NOT NULL,
+			key             TEXT NOT NULL,
+			value           JSONB NOT NULL,
+			source          TEXT NOT NULL,
+			chat_id         TEXT NOT NULL DEFAULT '',
+			message_id      TEXT NOT NULL DEFAULT '',
+			created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+			updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+			UNIQUE (supplier_name, key)
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_supplier_policy_supplier ON supplier_policy(supplier_name)`,
+		`CREATE INDEX IF NOT EXISTS idx_supplier_policy_key ON supplier_policy(key)`,
+
+		// 特殊日历 (A 模块) — 节假日/促销/季节 决策辅助
+		`CREATE TABLE IF NOT EXISTS special_calendar (
+			id              BIGSERIAL PRIMARY KEY,
+			date            DATE NOT NULL,
+			type            TEXT NOT NULL,    -- 'holiday' | 'promo' | 'blackout' | 'season_start' | 'season_end'
+			name            TEXT NOT NULL,
+			lead_days       INT NOT NULL DEFAULT 0,
+			note            TEXT NOT NULL DEFAULT '',
+			source          TEXT NOT NULL,
+			created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+			UNIQUE (date, type, name)
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_special_calendar_date ON special_calendar(date)`,
+		`CREATE INDEX IF NOT EXISTS idx_special_calendar_type ON special_calendar(type, date)`,
+
+		// 促销费用 (A 模块) — 堆头/端架/陈列/DM
+		`CREATE TABLE IF NOT EXISTS promotion_fee (
+			id              BIGSERIAL PRIMARY KEY,
+			supplier_name   TEXT NOT NULL,
+			kind            TEXT NOT NULL,    -- '堆头' | '端架' | '陈列' | 'DM' | '条码费'
+			amount          NUMERIC(12,2) NOT NULL,
+			period_start    DATE NOT NULL,
+			period_end      DATE NOT NULL,
+			note            TEXT NOT NULL DEFAULT '',
+			source          TEXT NOT NULL,
+			created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_promotion_fee_supplier ON promotion_fee(supplier_name, period_end DESC)`,
+		`CREATE INDEX IF NOT EXISTS idx_promotion_fee_period ON promotion_fee(period_start, period_end)`,
+
+		// ============================================================
+		// 采购订单智能提醒 (W3.2, 2026-09-01) — agent-purchase-plan.md §4
+		// 规则引擎产出: 限入场 / 季节不匹配 / 节假日 lead_days
+		// ============================================================
+		`CREATE TABLE IF NOT EXISTS purchase_session_alert (
+			id              BIGSERIAL PRIMARY KEY,
+			session_id      UUID NOT NULL REFERENCES parse_session(id) ON DELETE CASCADE,
+			row_id          BIGINT REFERENCES parse_row(id) ON DELETE CASCADE,
+			rule            TEXT NOT NULL,    -- 'block_entry' | 'no_return' | 'offseason' | 'holiday_lead'
+			severity        TEXT NOT NULL,    -- 'block' | 'warn' | 'info'
+			message         TEXT NOT NULL,
+			acked_at        TIMESTAMPTZ,
+			acked_by        TEXT NOT NULL DEFAULT '',
+			created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_psalert_session ON purchase_session_alert(session_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_psalert_rule ON purchase_session_alert(rule, severity)`,
+		`CREATE INDEX IF NOT EXISTS idx_psalert_pending ON purchase_session_alert(session_id) WHERE acked_at IS NULL`,
+
+		// ============================================================
+		// 现金日报 + 供应商结算 (W4, 2026-09-01) — agent-purchase-plan.md §5
+		// D 模块数据源: cash_balance (短期手动 / 中期 RPA / 长期 cube)
+		// ============================================================
+		`CREATE TABLE IF NOT EXISTS cash_balance (
+			id              BIGSERIAL PRIMARY KEY,
+			balance_date    DATE NOT NULL UNIQUE,
+			amount          NUMERIC(14,2) NOT NULL,
+			source          TEXT NOT NULL,    -- 'manual' | 'rpa' | 'cube'
+			note            TEXT NOT NULL DEFAULT '',
+			created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_cash_balance_date ON cash_balance(balance_date DESC)`,
+
+		// 供应商结算建议 (W4)
+		`CREATE TABLE IF NOT EXISTS supplier_forecast (
+			id              BIGSERIAL PRIMARY KEY,
+			supplier_name   TEXT NOT NULL,
+			forecast_date   DATE NOT NULL,
+			horizon_days    INT NOT NULL,    -- 7 / 30 / 90
+			amount          NUMERIC(12,2) NOT NULL,
+			basis           TEXT NOT NULL DEFAULT '',
+			created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_supplier_forecast_supplier ON supplier_forecast(supplier_name, created_at DESC)`,
+
+		`CREATE TABLE IF NOT EXISTS supplier_payment_suggestion (
+			id                    BIGSERIAL PRIMARY KEY,
+			supplier_name         TEXT NOT NULL,
+			period_days           INT NOT NULL,
+			base_forecast         NUMERIC(12,2) NOT NULL,
+			investment_weight     NUMERIC(4,2) NOT NULL,
+			promo_weight          NUMERIC(4,2) NOT NULL,
+			sellthrough_weight    NUMERIC(4,2) NOT NULL,
+			payment_cycle_days    INT NOT NULL,
+			amount                NUMERIC(12,2) NOT NULL,
+			basis                 JSONB NOT NULL DEFAULT '{}'::jsonb,
+			status                TEXT NOT NULL DEFAULT 'pending',
+			acked_by              TEXT NOT NULL DEFAULT '',
+			acked_at              TIMESTAMPTZ,
+			created_at            TIMESTAMPTZ NOT NULL DEFAULT NOW()
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_sps_supplier ON supplier_payment_suggestion(supplier_name, created_at DESC)`,
+		`CREATE INDEX IF NOT EXISTS idx_sps_status ON supplier_payment_suggestion(status) WHERE status = 'pending'`,
+
+		`CREATE TABLE IF NOT EXISTS promotion_fee_share (
+			id              BIGSERIAL PRIMARY KEY,
+			supplier_name   TEXT NOT NULL,
+			share_month     DATE NOT NULL,    -- 月初, e.g. 2026-09-01
+			kind            TEXT NOT NULL,    -- 堆头/端架/陈列/DM/条码费
+			amount          NUMERIC(12,2) NOT NULL,
+			period_start    DATE NOT NULL,
+			period_end      DATE NOT NULL,
+			days_in_month   INT NOT NULL,    -- 当月在 period 内的天数 (按月分摊)
+			note            TEXT NOT NULL DEFAULT '',
+			created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_pfs_supplier ON promotion_fee_share(supplier_name, share_month DESC)`,
+
+		// ============== restock 模块 (2026-09-02 重构后精简) ==============
+		// 保留 4 张表:
+		//   restock_display_suggest  陈列补货建议
+		//   restock_short_state      短补锁定
+		//   restock_need_purchase    采购计划单
+		//   restock_tick_log         tick 执行日志
+		`CREATE TABLE IF NOT EXISTS restock_display_suggest (
+			branch_no      TEXT NOT NULL,
+			item_no        TEXT NOT NULL,
+			period_date    DATE NOT NULL,
+			suggest_qty    INT NOT NULL DEFAULT 0,
+			inv_snapshot   INT NOT NULL DEFAULT 0,
+			last_period    TEXT NOT NULL DEFAULT '',
+			last_sale_at   TIMESTAMPTZ,
+			last_update_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+			item_name      TEXT NOT NULL DEFAULT '',
+			PRIMARY KEY (branch_no, item_no, period_date)
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_rds_suggest ON restock_display_suggest(branch_no, period_date DESC)`,
+		`CREATE INDEX IF NOT EXISTS idx_rds_item ON restock_display_suggest(item_no)`,
+
+		`CREATE TABLE IF NOT EXISTS restock_short_state (
+			branch_no  TEXT NOT NULL,
+			item_no    TEXT NOT NULL,
+			is_short   BOOLEAN NOT NULL DEFAULT FALSE,
+			short_at   TIMESTAMPTZ,
+			short_user TEXT NOT NULL DEFAULT '',
+			PRIMARY KEY (branch_no, item_no)
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_rss_short ON restock_short_state(branch_no) WHERE is_short = TRUE`,
+
+		`CREATE TABLE IF NOT EXISTS restock_need_purchase (
+			id              BIGSERIAL PRIMARY KEY,
+			branch_no       TEXT NOT NULL,
+			item_no         TEXT NOT NULL,
+			item_name       TEXT NOT NULL DEFAULT '',
+			barcode         TEXT NOT NULL DEFAULT '',
+			supplier_name   TEXT NOT NULL DEFAULT '',
+			suggest_qty     INT NOT NULL DEFAULT 0,
+			trigger_kind    TEXT NOT NULL,
+			trigger_task_id TEXT NOT NULL DEFAULT '',
+			status          TEXT NOT NULL DEFAULT 'pending',
+			created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+			updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+			exported_at     TIMESTAMPTZ
+		)`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS uq_rnp_branch_item_pending
+			ON restock_need_purchase(branch_no, item_no) WHERE status = 'pending'`,
+		`CREATE INDEX IF NOT EXISTS idx_rnp_status ON restock_need_purchase(branch_no, status)`,
+		`CREATE INDEX IF NOT EXISTS idx_rnp_supplier ON restock_need_purchase(supplier_name, created_at DESC)`,
+
+		`CREATE TABLE IF NOT EXISTS restock_tick_log (
+			id           BIGSERIAL PRIMARY KEY,
+			branch_no    TEXT NOT NULL,
+			period       TEXT NOT NULL,
+			tick_at      TIMESTAMPTZ NOT NULL,
+			window_from  TIMESTAMPTZ NOT NULL,
+			window_to    TIMESTAMPTZ NOT NULL,
+			status       TEXT NOT NULL,
+			error_msg    TEXT,
+			items_count  INT NOT NULL DEFAULT 0,
+			created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_rtl_branch_status ON restock_tick_log(branch_no, status, created_at DESC)`,
+
+		// 2026-09-02 重构: 删 4 张旧表
+		//   - restock_task           旧 ROP 触发 task 体系
+		//   - restock_feedback       旧反馈审计 (新版不再需要, 写 display_suggest.last_update_at 已能体现)
+		//   - restock_sales_watch    旧 R2/R2b 24h 销售观测
+		//   - supplier_reliability   旧 LLM 调量用 fill_rate
+		`DROP TABLE IF EXISTS restock_task CASCADE`,
+		`DROP TABLE IF EXISTS restock_feedback CASCADE`,
+		`DROP TABLE IF EXISTS restock_sales_watch CASCADE`,
+		`DROP TABLE IF EXISTS supplier_reliability CASCADE`,
+
+		// ============================================================
+		// OCR 解析供应商特定策略 (Phase A, 2026-09-02) — docs/ocr-purchase-skill-architecture.md
+		// 每家供应商一条;is_handwrite=true 走纯启发式不开 LLM
+		// 通用解析累计 5 次触发自动建策略;edit_count>=3 触发自优化 (Phase B)
+		// ============================================================
+		`CREATE TABLE IF NOT EXISTS supplier_parse_strategy (
+			supplier_name        TEXT PRIMARY KEY,
+			is_handwrite         BOOLEAN NOT NULL DEFAULT FALSE,
+			enabled              BOOLEAN NOT NULL DEFAULT TRUE,
+			body                 TEXT NOT NULL DEFAULT '',
+			sku_hints            JSONB NOT NULL DEFAULT '{}'::jsonb,
+			llm_prompt_overlay   TEXT NOT NULL DEFAULT '',
+			strategy_version     INT  NOT NULL DEFAULT 0,
+			generic_apply_count  INT  NOT NULL DEFAULT 0,
+			edit_count           INT  NOT NULL DEFAULT 0,
+			created_at           TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+			last_edited_at       TIMESTAMPTZ,
+			last_auto_optimized_at TIMESTAMPTZ,
+			last_applied_at      TIMESTAMPTZ,
+			note                 TEXT NOT NULL DEFAULT ''
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_sps_handwrite ON supplier_parse_strategy(is_handwrite) WHERE is_handwrite = TRUE`,
+		`CREATE INDEX IF NOT EXISTS idx_sps_needs_build ON supplier_parse_strategy(generic_apply_count) WHERE body = '' OR enabled = FALSE`,
+
+		// 2026-09-02: parse_session 加 strategy_version (Phase A 新增, 替代 template_id)
+		//   - 落库时记本次解析用的 strategy 版本(0 = 通用解析)
+		`ALTER TABLE parse_session ADD COLUMN IF NOT EXISTS strategy_version INT NOT NULL DEFAULT 0`,
+
+		// 2026-09-02 Phase A: 删旧 template 表 / parse_session.template_id / parse_session.template_name
+		//   - 旧 schema 残留 2 个 NOT NULL 列, drop 掉让 Phase A 的 INSERT 能跑
+		//   - CASCADE 防止有 FK 引用(虽然 phase A 已经不引用了)
+		`ALTER TABLE parse_session DROP COLUMN IF EXISTS template_id CASCADE`,
+		`ALTER TABLE parse_session DROP COLUMN IF EXISTS template_name CASCADE`,
+		`DROP TABLE IF EXISTS template CASCADE`,
+
+		// ============================================================
+		// 2026-09-03: 重复图去重 + 异步策略分析 (W4.1)
+		// 需求:
+		//   1) 上传重复图不重复处理 (image_hashes 数组 + image_index)
+		//   2) 解析后不等策略分析 (analysis_status: pending|running|done|failed)
+		//   3) 总结栏 + 行内图标 (alert.category)
+		// ============================================================
+
+		// parse_session: 加 image_hashes (JSONB 数组, 元素 = sha256 hex)
+		`ALTER TABLE parse_session ADD COLUMN IF NOT EXISTS image_hashes JSONB NOT NULL DEFAULT '[]'::jsonb`,
+		// parse_session: 加 analysis_status (分析状态)
+		`ALTER TABLE parse_session ADD COLUMN IF NOT EXISTS analysis_status TEXT NOT NULL DEFAULT 'pending'`,
+		// parse_session: 加 analysis_at (最近完成时间)
+		`ALTER TABLE parse_session ADD COLUMN IF NOT EXISTS analysis_at TIMESTAMPTZ`,
+		// parse_session: 加 analysis_error (失败原因)
+		`ALTER TABLE parse_session ADD COLUMN IF NOT EXISTS analysis_error TEXT NOT NULL DEFAULT ''`,
+		// GIN 索引: image_hashes 数组包含查询 (@>)
+		`CREATE INDEX IF NOT EXISTS idx_session_image_hashes ON parse_session USING GIN (image_hashes)`,
+		// 状态索引: 找 pending/running 的 session (cron 重试用)
+		`CREATE INDEX IF NOT EXISTS idx_session_analysis_status ON parse_session(analysis_status) WHERE analysis_status IN ('pending', 'running')`,
+
+		// parse_row: 加 image_index (属于第几张图, 0-based)
+		`ALTER TABLE parse_row ADD COLUMN IF NOT EXISTS image_index INT NOT NULL DEFAULT 0`,
+		// 索引: 按 image_index 查 (append 后回查用)
+		`CREATE INDEX IF NOT EXISTS idx_row_session_image ON parse_row(session_id, image_index)`,
+
+		// purchase_session_alert: 加 category (决定前端 icon 段位)
+		//   block            → 红色感叹号 (限入场)
+		//   warn             → 橙色感叹号 (高库存/不允许退货)
+		//   info             → 灰普通感叹号 (难消化/反季/节假日)
+		//   highlight_dui    → 绿色"贴切"标志 (堆头陈列)
+		//   highlight_others → 绿色"其它"标志 (快讯/端架/特殊活动)
+		`ALTER TABLE purchase_session_alert ADD COLUMN IF NOT EXISTS category TEXT NOT NULL DEFAULT 'info'`,
+		`CREATE INDEX IF NOT EXISTS idx_psalert_category ON purchase_session_alert(session_id, category)`,
+
+		// app_settings: 阈值配置 (K-V, 替换 Go 端硬编码)
+		//   - high_stock_threshold: 库存数 > 阈值 → 高库存
+		//   - low_movement_threshold: 30/60/90 天销量 < 阈值 → 难消化
+		//   - duitou_kinds: 算"堆头陈列"的 kind 集合 (JSON 数组)
+		//   - others_kinds: 算"快讯/其它活动"的 kind 集合
+		`CREATE TABLE IF NOT EXISTS app_settings (
+			key             TEXT PRIMARY KEY,
+			value           JSONB NOT NULL,
+			updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+		)`,
+		// 默认值: 阈值放数据, Go 端 0 业务判断
+		`INSERT INTO app_settings (key, value) VALUES
+			('high_stock_threshold', '50'::jsonb),
+			('low_movement_threshold_30d', '3'::jsonb),
+			('duitou_kinds', '["堆头"]'::jsonb),
+			('others_kinds', '["端架", "快讯", "DM", "特价", "海报"]'::jsonb)
+		ON CONFLICT (key) DO NOTHING`,
 	}
 	for _, s := range stmts {
 		if _, err := pool.Exec(ctx, s); err != nil {

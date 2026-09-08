@@ -10,6 +10,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/tinkler/collect-ai/internal/business"
 )
 
 // Client cube-agent-server /v1/load 客户端
@@ -30,6 +32,11 @@ type Client struct {
 	mu        sync.RWMutex
 	datasource string // 当前数据源(er / hbpos),供业务层使用
 }
+
+// Compile-time check: *Client 实现 business.CubeClient (4 个方法)
+//   实际 interface 在 internal/business/gateway.go 定义
+//   这里只 import 检查会循环(business 依赖 agent),所以直接断言
+var _ business.CubeClient = (*Client)(nil)
 
 // NewClient 构造 agent client
 //   dataSource 初始数据源(空字符串 = erp,默认)
@@ -119,6 +126,38 @@ func (c *Client) Execute(cube string, measures, dimensions []string, filters []m
 		Limit:      limit,
 	}
 	return c.load(cube, q)
+}
+
+// ExecuteWithTime 同 Execute,但额外支持 timeDimensions(时间窗过滤)
+//   用于 restock 等需要"动态时间窗"的场景(7:00 跨天 / 12:00 / 20:30)
+//   timeDimensions 元素形如 map[string]any{"dimension": "cube.oper_date", "dateRange": [from, to]}
+//   segments 前缀规则同 Execute
+func (c *Client) ExecuteWithTime(cube string, measures, dimensions []string, filters []map[string]any, segments []string, limit int, timeDimensions []map[string]any) ([]map[string]any, error) {
+	prefixed := make([]string, len(segments))
+	for i, s := range segments {
+		if strings.Contains(s, ".") {
+			prefixed[i] = s
+		} else {
+			prefixed[i] = cube + "." + s
+		}
+	}
+	q := Query{
+		Measures:       measures,
+		Dimensions:     dimensions,
+		Filters:        filters,
+		Segments:       prefixed,
+		TimeDimensions: toAnySlice(timeDimensions),
+		Limit:          limit,
+	}
+	return c.load(cube, q)
+}
+
+func toAnySlice(in []map[string]any) []any {
+	out := make([]any, len(in))
+	for i, m := range in {
+		out[i] = m
+	}
+	return out
 }
 
 func (c *Client) load(cube string, q Query) ([]map[string]any, error) {

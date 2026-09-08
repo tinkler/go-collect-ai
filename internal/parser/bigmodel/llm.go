@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"regexp"
 	"strconv"
@@ -46,7 +47,8 @@ func resolveLlmModel(model string) string {
 }
 
 // ChatCompletion 调 LLM, 返回 choices[0].message.content
-//   model: "glm-4-flash" / "glm-4-plus" / "" (回退 glm-4-flash)
+//
+//	model: "glm-4-flash" / "glm-4-plus" / "" (回退 glm-4-flash)
 func (c *LlmClient) ChatCompletion(sysPrompt, userPrompt, model string) (string, error) {
 	payload := map[string]any{
 		"model": resolveLlmModel(model),
@@ -54,9 +56,9 @@ func (c *LlmClient) ChatCompletion(sysPrompt, userPrompt, model string) (string,
 			{"role": "system", "content": sysPrompt},
 			{"role": "user", "content": userPrompt},
 		},
-		"temperature":    0.1,
-		"top_p":          0.7,
-		"max_tokens":     8192,
+		"temperature":     0.1,
+		"top_p":           0.7,
+		"max_tokens":      8192,
 		"response_format": map[string]string{"type": "json_object"},
 	}
 	bs, _ := json.Marshal(payload)
@@ -99,140 +101,29 @@ func (c *LlmClient) ChatCompletion(sysPrompt, userPrompt, model string) (string,
 	return parsed.Choices[0].Message.Content, nil
 }
 
-// DefaultSystemPrompt 按模式分派
-func DefaultSystemPrompt(mode model.TemplateMode) string {
-	if mode == model.ModePurchase {
-		return DefaultPurchasePrompt()
-	}
-	return DefaultInventoryPrompt()
-}
-
-func DefaultInventoryPrompt() string {
-	return `你是商超盘点单 OCR 结果的结构化解析助手。
-
-# 典型盘点单结构 (8 列)
-盘点单通常有 8 列:
-  1. 行号 (序号 1, 2, 3, ...)
-  2. 条码 (商品条码, 6-14 位纯数字, 例如 6923644254230)
-  3. 商品名称 (中文, 含品牌+型号+口味, 如 '蒙牛纯牛奶全脂灭菌乳康美菌条装200mlx12')
-  4. 规格 (包装规格, 如 '1*5*4*2' / '200ml×1' / '1*20' / '125ml' / '250ml*1*1')
-  5. 单位 (件 / 排 / 箱 / 盒 / 袋 / 桶)
-  6. 盘点数 (实际库存数, 必填, OCR 识别的核心目标)
-  7. 抽盘数 (抽样盘点数, 部分行有, 是次要参考值)
-  8. 进价 (单价, 部分行有, 不是数量)
-
-# 任务
-从 OCR 文本行提取真实商品行, 输出 JSON 数组 { rows: [{ barcode, name, qty, type }, ...] }。
-
-# 步骤 1: 行类型判定 (type) — 严格, 错杀从严
-每行 OCR 文本先判定 type. **判定标准按以下优先级, 一旦命中即 skip**:
-- 'skip' (跳过):
-  1. **表头/列头行** (硬规则): 同时含 2 个以上列名关键词 (行号/条码/商品名称/规格/单位/盘点数/抽盘数/进价/数量/抽盘/进价/单价/金额)
-     - 即使后续跟着数据, 表头整行也跳
-  2. **标题/小标题/分类**: 2-6 字含品牌/区域
-     - 例: '蒙牛堆头' / '堆' / '饮料区' / '粮油类' / '酒水类' / '日化区' / '堆头' / '蒙牛'
-     - **特别注意**: 单词如 '蒙牛堆头' 或 '堆' 都跳, 不论后面是否跟数字
-  3. 页脚/合计: 合计/小计/总计/共, 或单独数字带 元
-  4. 签名/日期/空白行: 初盘人/复盘人/抽盘人/签名/日期, 或纯空白
-  5. 孤立单位/单位词: 单独 件/排/箱/盒
-  6. 纯符号行: - / = / ==
-- 'data' (保留): 含 13 位 barcode 或商品名称 (含中文字符)
-
-# 步骤 1.5: ★★★ 多 SKU 合并行拆分 (必读) ★★★
-OCR 经常把多行内容合并到 1 行 (top 错位 / 文字粘连), 表现是 **单行文本内出现 2+ 个 13 位纯数字**。
-**必须**按 13 位 barcode 切分为多行, 每个 barcode 对应 1 行 data:
-  示例原文: '1 6977222020243 220ml吾尚AD钙 件 3  2 6977222021264 220ml吾尚AD奶草莓味 件 5  3 6977222020403 100ml吾尚AD奶胡萝卜味 1*5 排 78'
-  → 必须切出 3 行:
-    { barcode:'6977222020243', name:'220ml吾尚AD钙', qty:3, type:'data' }
-    { barcode:'6977222021264', name:'220ml吾尚AD奶草莓味', qty:5, type:'data' }
-    { barcode:'6977222020403', name:'100ml吾尚AD奶胡萝卜味', qty:78, type:'data' }
-  → 注意每个 barcode 前的 1-3 位数字是行号 (1, 2, 3), 归到上一行 (算行号) 或忽略
-  → 数量取每个 SKU 自己的盘点数 (不是合并后总和)
-
-# 步骤 2: 数量 (qty) 判定 (重要!)
-**盘点数 > 抽盘数** (主数量 vs 抽样数量)
-- **盘点数总是行的最右列** (8 列结构, 盘点数在第 6 列; 抽盘数在第 7 列; 进价在第 8 列)
-- 优先取 **盘点数 (主数量)**: 行内 **最右** 的非零纯数字 (排除规格和单位)
-- 盘点数为空/0时, fallback 到 **抽盘数** (在盘点数左边一列)
-- **关键**: 单位列 OCR 可能误识别单位字为数字 (如 '排'→15, '件'→3), 这是干扰, 不是数量
-- 进价列一定不是数量 (但可能跟盘点数长得很像, 小数点位置是关键)
-- 范围 0.01 ~ 9999
-
-# 步骤 3: 关键陷阱 (规格 vs 数量)
-以下 **永远不是数量**:
-  - '1*5' / '1*20' / '1*4*6' / '1*5*4*2' (纯 *-数字 形式, 无单位)
-  - '200ml*1' / '250ml*1*1' / '200ml×12' (含 ml/L/g/kg + *-数字)
-  - '125ml' / '200ml' / '250ml' (纯 ml/L/g/kg 数字)
-  - '1x24' / '1x12' (x 形式, 注意是字母 x 不是星号 *)
-例:
-  - '220ml吾尚AD钙 ... 件 3' → qty=3
-  - '100ml吾尚AD奶胡萝卜味 ... 1*5 排 78 78' → qty=78 (盘点数 78, 1*5 是规格)
-  - '蒙牛纯牛奶 200mlx12 200ml×1 件 47' → qty=47 (200ml*1 是规格)
-  - '蒙牛酸乳原味250ml*24 1*24 件 20 20' → qty=20 (抽盘数 20 与盘点数 20 一致)
-  - '龙骨 1*15 件 8' → qty=8 (1*15 规格)
-
-# 步骤 4: 拆列
-- 条码(barcode): 6-14 位纯数字, 通常是行内最长的数字 (13 位)
-- 名称(name): 去掉条码 + 规格 + 数量 后的中文文本 (保留 'ml' 'L' 'g' 'kg' 等单位)
-- qty: 数字 (整数优先, 0.5 / 1.5 也接受)
-
-# 步骤 5: 复杂情况
-- 多数字同行 (单 SKU 内): 选 **最右且最大** 的非零纯数字 (排除规格含 * / x / ml / L / g / kg)
-  例: '100ml吾尚AD 15 1*5*4*2 排 排 49' → qty=49 (最右最大, 1*5*4*2 是规格, 15 是干扰)
-- OCR 数字识别错 (8→12, 0→6): 上下文合理化
-- 底部手写补充行: 仍是 data
-- 同一表格有印刷行 + 手写行: 都解析
-- 顶部水杯/杂物遮挡的字符: 容忍, 只要有 barcode 或 name 仍判 data
-
-# 输出格式
-{
-  rows: [
-    { barcode: '6977222020243', name: '220ml吾尚AD钙', qty: 3, type: 'data' },
-    { barcode: '6977222020403', name: '100ml吾尚AD奶胡萝卜味', qty: 78, type: 'data' },
-    { barcode: null, name: '', qty: null, type: 'skip' }
-  ]
-}
-
-只输出 JSON, 不要解释. 如果整张图都是表头/页脚/小标题, 返回 { rows: [] }.`
-}
-
-func DefaultPurchasePrompt() string {
-	return `你是商超采购入库单 OCR 结果的结构化解析助手。
-
-# 任务
-从 OCR 文本行提取真实商品行, 输出 JSON 数组 { rows: [{ barcode, name, qty, type }, ...] }。
-
-# 步骤 1: 行类型判定
-每行OCR文本先判定 type:
-- 'skip': 表头/列头(行号/条码/商品名称/规格/单位/数量/进价/金额多个列名), 标题/小标题, 页脚/合计, 签名/空白, 孤立单位(件/包/箱), 纯符号
-- 'data': 含条码或商品名称
-
-# 步骤 2: 数量 (qty)
-OCR 识别的数字 = 采购数量, 直接取行内最右或最大的非零纯数字
-范围 0.01 ~ 9999
-
-# 步骤 3: 规格 vs 数量
-以下不是数量: 1*5/1*20/200ml*1/125ml/1x24
-例:
-  - '可口可乐 330ml*24 12' → qty=12
-  - '加多宝 1.5L 24' → qty=24
-  - '龙骨 1*15 件 8' → qty=8
-
-# 步骤 4: 拆列
-- barcode: 6-14位纯数字
-- name: 去掉条码和数量后 (保留 ml/L/g)
-- qty: 数字
-
-只输出 JSON. 整张是表头/页脚时返回 { rows: [] }.`
-}
+// ErrTruncated 响应被截断 (max_tokens 不够),ParseLlmJson 无法挽救。
+// caller 应该: 切更小图重试 / 换 glm-4v-plus / 调低单图密度
+var ErrTruncated = fmt.Errorf("LLM 响应被截断 (max_tokens 触顶)")
 
 // ParseLlmJson 解析 LLM 返回, 跳过 type=skip, 客户端二次过滤
+//
+// Phase A (2026-09-02): 旧的 DefaultSystemPrompt / DefaultInventoryPrompt / DefaultPurchasePrompt
+// 全部删掉,迁到 skills/ocr-purchase/SKILL.md 由 ParserOrchestrator 渲染调用。
+//
+// 2026-09-04: 增加截断检测。被截断时(fence 闭合缺 + 没有 ] 收尾),
+//   - 尝试截断到最后一个 `}` 之前,挽救部分 rows
+//   - 挽救失败则返回 ErrTruncated(让 caller 知道是 token 上限,不是格式问题)
 func ParseLlmJson(msg string) ([]model.ParsedOcrRow, error) {
 	msg = strings.TrimSpace(msg)
 	fence := regexp.MustCompile("```(?:json)?\\s*(.*?)\\s*```")
 	if m := fence.FindStringSubmatch(msg); m != nil {
 		msg = m[1]
 	}
+	msg = strings.TrimSpace(msg)
+
+	// 2026-09-04 截断检测: 没有闭合 ] 通常是 max_tokens 触顶
+	//   正常 JSON 一定以 } 或 ] 结尾,否则就是被截断
+	looksTruncated := !strings.HasSuffix(msg, "}") && !strings.HasSuffix(msg, "]")
 
 	var token any
 	if err := json.Unmarshal([]byte(msg), &token); err != nil {
@@ -240,10 +131,23 @@ func ParseLlmJson(msg string) ([]model.ParsedOcrRow, error) {
 		start := strings.Index(msg, "[")
 		end := strings.LastIndex(msg, "]")
 		if start < 0 || end <= start {
+			// 截断场景:尝试截到最后一个 } 之前,挽救完整行
+			if looksTruncated {
+				if recovered, ok := recoverTruncatedRows(msg); ok {
+					log.Printf("[ParseLlmJson] 截断响应挽救成功, 恢复 %d 行", len(recovered))
+					return recovered, nil
+				}
+			}
+			if looksTruncated {
+				return nil, fmt.Errorf("%w: %s", ErrTruncated, truncate(msg, 200))
+			}
 			return nil, fmt.Errorf("LLM 返回非 JSON: %s", truncate(msg, 200))
 		}
 		token = nil
 		if err2 := json.Unmarshal([]byte(msg[start:end+1]), &token); err2 != nil {
+			if looksTruncated {
+				return nil, fmt.Errorf("%w: %s; inner_err=%v", ErrTruncated, truncate(msg, 200), err2)
+			}
 			return nil, fmt.Errorf("LLM JSON parse 失败: %w; body=%s", err2, truncate(msg, 200))
 		}
 	}
@@ -275,53 +179,7 @@ func ParseLlmJson(msg string) ([]model.ParsedOcrRow, error) {
 		return nil, fmt.Errorf("LLM JSON 没有数组字段: %s", truncate(msg, 200))
 	}
 
-	out := make([]model.ParsedOcrRow, 0, len(arr))
-	for _, o := range arr {
-		typ, _ := o["type"].(string)
-		if strings.ToLower(typ) == "skip" {
-			continue
-		}
-		barcode, _ := o["barcode"].(string)
-		name, _ := o["name"].(string)
-		// qty 可能是 number (LLM) 或 string (兼容)
-		var qtyRaw string
-		switch v := o["qty"].(type) {
-		case float64:
-			qtyRaw = strconv.Itoa(int(v))
-		case string:
-			qtyRaw = v
-		}
-		if name == "" {
-			name = ""
-		}
-		var qty *int
-		if qtyRaw != "" {
-			if v, ok := parseQty(qtyRaw); ok {
-				qty = &v
-			}
-		}
-		// 客户端二次过滤
-		if looksLikeHeader(name) {
-			continue
-		}
-		if looksLikeIsolatedUnit(name) {
-			continue
-		}
-		if looksLikeSubtitle(name) {
-			continue
-		}
-		if looksLikeSignature(name) {
-			continue
-		}
-		if containsMultipleBarcodes(name, barcode) {
-			continue
-		}
-		if name == "" && barcode == "" && qty == nil {
-			continue
-		}
-		out = append(out, model.ParsedOcrRow{Barcode: barcode, Name: name, QtyRaw: qtyRaw, Qty: qty})
-	}
-	return out, nil
+	return parseRowsArray(arr), nil
 }
 
 // parseQty 解析 "12" / "12.0" / "12件" / "3.5" -> int
@@ -420,4 +278,194 @@ func containsMultipleBarcodes(name, barcode string) bool {
 	text := barcode + " " + name
 	matches := regexp.MustCompile(`\b\d{13}\b`).FindAllString(text, -1)
 	return len(matches) >= 2
+}
+
+// recoverTruncatedRows 截断响应挽救:用 brace 深度匹配找出所有完整 row
+//   - 典型场景: VLM 在某个 row 中途被 max_tokens 截断,前面的 row 完整
+//   - 策略: 从 array 起点 `[` 开始扫描,逐字符追踪 `{`/`}` 嵌套深度
+//     深度回到 0 时,得到一个完整 row,单独 parse 后累积
+//   - 限制: 只能挽救"已闭合"的 row;被截断的最后一 row 必然丢
+func recoverTruncatedRows(msg string) ([]model.ParsedOcrRow, bool) {
+	// 找 array 起点(优先 ["rows": [ 之后,否则就第一个 [)
+	arrayStart := -1
+	if i := strings.Index(msg, `"rows"`); i >= 0 {
+		j := strings.Index(msg[i:], "[")
+		if j >= 0 {
+			arrayStart = i + j
+		}
+	}
+	if arrayStart < 0 {
+		arrayStart = strings.Index(msg, "[")
+	}
+	if arrayStart < 0 {
+		return nil, false
+	}
+
+	// brace 深度匹配,收集所有完整 row
+	depth := 0
+	rowStart := -1
+	var rows []map[string]any
+	for i := arrayStart; i < len(msg); i++ {
+		c := msg[i]
+		if c == '{' {
+			if depth == 0 {
+				rowStart = i
+			}
+			depth++
+		} else if c == '}' {
+			depth--
+			if depth == 0 && rowStart >= 0 {
+				rowJSON := msg[rowStart : i+1]
+				var row map[string]any
+				if err := json.Unmarshal([]byte(rowJSON), &row); err == nil {
+					rows = append(rows, row)
+				}
+				rowStart = -1
+			}
+		} else if depth < 0 {
+			// array 闭合 ] 已经过了,后面都是 wrapper 闭合
+			break
+		}
+	}
+	if len(rows) == 0 {
+		return nil, false
+	}
+	// 复用正常解析流程(过滤 type=skip / header / subtitle 等)
+	return parseRowsArray(rows), true
+}
+
+// parseRowsArray 把 arr 转成 ParsedOcrRow(供 recoverTruncatedRows 复用)
+//
+// 2026-09-04 强化:
+//   - barcode 不强制 13 位, 支持 6-14 位 (8/10/12/13/14 都常见)
+//   - qty 允许小数 (0.5/1.5/2.5 等), 不再过滤 0 (0 是合法采购数 0)
+//   - 客户端兜底: 去 barcode 里的非数字字符 (空格/横线/引号/字母)
+func parseRowsArray(arr []map[string]any) []model.ParsedOcrRow {
+	out := make([]model.ParsedOcrRow, 0, len(arr))
+	for _, o := range arr {
+		typ, _ := o["type"].(string)
+		if strings.ToLower(typ) == "skip" {
+			continue
+		}
+		barcode, _ := o["barcode"].(string)
+		name, _ := o["name"].(string)
+		// 2026-09-04 修复: GLM-4V 偶发把 barcode 输出成脏格式
+		//   - "1234 5678 9012" (含空格) → "123456789012"
+		//   - "1234-5678-9012" (含横线) → "123456789012"
+		//   - "0 1234567890123" (前缀 0 + 空格) → "0123456789012"
+		//   - 任意位数 (8/10/12/13/14) 都保留, 不强制 13 位
+		//   - 长度 < 6 或 > 14 → 返空 (无效, 跳过)
+		barcode = normalizeBarcode(barcode)
+		var qtyRaw string
+		switch v := o["qty"].(type) {
+		case float64:
+			// 2026-09-04: 保留小数, 12.5 写成 "12.5" 而不是 int(12.5) = 12
+			qtyRaw = formatFloatQty(v)
+		case string:
+			qtyRaw = v
+		}
+		// 2026-09-04 修复: qty 可以是 0 / 小数 / 负数 (parseQty 已经能 parse)
+		//   之前过滤 0 是错的 (0 是合法采购数 0, 商家偶尔会写)
+		//   之前只支持整数, 现在 parseQty 走 string 分支也支持小数
+		var qty *int
+		if qtyRaw != "" {
+			if v, ok := parseQty(qtyRaw); ok {
+				qty = &v
+			}
+		}
+		// 2026-09-04 双引擎: price 单价 (DeepSeek 视觉 items[].price)
+		//   兼容 price / unit_price 两种 key; 0 是合法单价 (赠品)
+		var price *float64
+		if v, ok := parsePrice(o["price"]); ok {
+			price = &v
+		} else if v, ok := parsePrice(o["unit_price"]); ok {
+			price = &v
+		}
+		// 客户端硬过滤(同 ParseLlmJson)
+		if looksLikeHeader(name) {
+			continue
+		}
+		if looksLikeIsolatedUnit(name) {
+			continue
+		}
+		if looksLikeSubtitle(name) {
+			continue
+		}
+		if looksLikeSignature(name) {
+			continue
+		}
+		if containsMultipleBarcodes(name, barcode) {
+			continue
+		}
+		if name == "" && barcode == "" && qty == nil {
+			continue
+		}
+		out = append(out, model.ParsedOcrRow{Barcode: barcode, Name: name, QtyRaw: qtyRaw, Qty: qty, Price: price})
+	}
+	return out
+}
+
+// parsePrice 解析单价字段: 12.5 (float) / "12.5" / "¥12.5" / "12.50元"
+//
+//	双引擎 2026-09-04: DeepSeek 视觉输出 items[].price, 数值或字符串都可能
+//	非数字(含 "null" 字符串等)返 false
+func parsePrice(v any) (float64, bool) {
+	switch t := v.(type) {
+	case float64:
+		return t, true
+	case string:
+		s := strings.TrimSpace(t)
+		s = strings.TrimPrefix(s, "¥")
+		s = strings.TrimPrefix(s, "￥")
+		s = strings.TrimPrefix(s, "$")
+		s = strings.TrimSuffix(s, "元")
+		s = strings.TrimSpace(s)
+		if s == "" {
+			return 0, false
+		}
+		f, err := strconv.ParseFloat(s, 64)
+		if err != nil {
+			return 0, false
+		}
+		return f, true
+	}
+	return 0, false
+}
+
+// formatFloatQty 把 float64 格式化为最短合理字符串
+//   - 12.0 → "12"
+//   - 12.5 → "12.5"
+//   - 0.5 → "0.5"
+func formatFloatQty(v float64) string {
+	if v == float64(int(v)) {
+		return strconv.Itoa(int(v))
+	}
+	return strconv.FormatFloat(v, 'f', -1, 64)
+}
+
+// normalizeBarcode 客户端兜底:把脏 barcode 清洗成 6-14 位纯数字
+//
+//	规则:
+//	  1) trim
+//	  2) 去所有非数字字符 (空格/横线/字母/小数点/引号/中文逗号 等)
+//	  3) 长度 6-14 → 返清洗后字符串
+//	  4) 其他长度 → 返空 (无效, matcher 走 L2/L3)
+//
+//	不强制 13 位, 商超供货单常见 8/10/12/13/14 位
+func normalizeBarcode(s string) string {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return ""
+	}
+	cleaned := make([]byte, 0, len(s))
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c >= '0' && c <= '9' {
+			cleaned = append(cleaned, c)
+		}
+	}
+	if len(cleaned) < 6 || len(cleaned) > 14 {
+		return ""
+	}
+	return string(cleaned)
 }
