@@ -392,6 +392,314 @@ func Migrate(ctx context.Context, pool *pgxpool.Pool) error {
 			('duitou_kinds', '["堆头"]'::jsonb),
 			('others_kinds', '["端架", "快讯", "DM", "特价", "海报"]'::jsonb)
 		ON CONFLICT (key) DO NOTHING`,
+
+		// ============================================================
+		// freshcheck 生鲜免日盘管理 (W1, 2026-09-09)
+		// 需求: docs/生鲜免日盘管理扩展子系统设计需求文档.md v1.0
+		// 设计: docs/freshcheck-{architecture,data-model,settlement}.md
+		// 13 张表: 5 配置 + 2 人工 + 6 派生
+		// 业务阈值/损耗率/品类轨道走表, 改阈值免 build
+		// 派生表: 只 INSERT 不 UPDATE (重算走"先清后写")
+		// ============================================================
+
+		// ----- 1. freshcheck_sku_map (配置: 生鲜SKU映射) -----
+		`CREATE TABLE IF NOT EXISTS freshcheck_sku_map (
+			id                BIGSERIAL PRIMARY KEY,
+			branch_no         TEXT NOT NULL DEFAULT '0001',
+			item_no           TEXT NOT NULL,
+			item_name         TEXT NOT NULL DEFAULT '',
+			fresh_category    TEXT NOT NULL,
+			turnover_class    TEXT NOT NULL CHECK (turnover_class IN ('fast','slow')),
+			shelf_life_days   INT  NOT NULL DEFAULT 7,
+			default_pool_code TEXT,
+			is_active         BOOLEAN NOT NULL DEFAULT TRUE,
+			created_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+			updated_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+			UNIQUE (branch_no, item_no)
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_fcsm_category ON freshcheck_sku_map(branch_no, fresh_category) WHERE is_active`,
+		`CREATE INDEX IF NOT EXISTS idx_fcsm_pool ON freshcheck_sku_map(branch_no, default_pool_code) WHERE default_pool_code IS NOT NULL`,
+
+		// ----- 2. freshcheck_pool_code (配置: 特价码定义) -----
+		`CREATE TABLE IF NOT EXISTS freshcheck_pool_code (
+			id              BIGSERIAL PRIMARY KEY,
+			branch_no       TEXT NOT NULL DEFAULT '0001',
+			pool_code       TEXT NOT NULL,
+			pool_name       TEXT NOT NULL,
+			pricing_mode    TEXT NOT NULL CHECK (pricing_mode IN ('weight','piece')),
+			unit_price      NUMERIC(10,2) NOT NULL,
+			piece_weight    NUMERIC(10,4),
+			priority_rank   INT NOT NULL DEFAULT 0,
+			is_active       BOOLEAN NOT NULL DEFAULT TRUE,
+			created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+			updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+			UNIQUE (branch_no, pool_code)
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_fcpc_priority ON freshcheck_pool_code(branch_no, priority_rank) WHERE is_active`,
+
+		// ----- 3. freshcheck_loss_rate (配置: 损耗率规则) -----
+		`CREATE TABLE IF NOT EXISTS freshcheck_loss_rate (
+			id                  BIGSERIAL PRIMARY KEY,
+			fresh_category      TEXT NOT NULL,
+			turnover_class      TEXT NOT NULL CHECK (turnover_class IN ('fast','slow')),
+			loss_type           TEXT NOT NULL CHECK (loss_type IN ('natural','spoilage','process')),
+			daily_rate          NUMERIC(8,6) NOT NULL,
+			effective_from      DATE NOT NULL DEFAULT CURRENT_DATE,
+			effective_to        DATE,
+			is_calibrated       BOOLEAN NOT NULL DEFAULT FALSE,
+			last_calibrate_at   TIMESTAMPTZ,
+			last_calibrate_by   TEXT NOT NULL DEFAULT '',
+			created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+			UNIQUE (fresh_category, turnover_class, loss_type, effective_from)
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_fclr_active ON freshcheck_loss_rate(fresh_category, turnover_class, loss_type) WHERE effective_to IS NULL`,
+
+		// ----- 4. freshcheck_threshold (配置: 业务阈值 K-V) -----
+		`CREATE TABLE IF NOT EXISTS freshcheck_threshold (
+			key             TEXT PRIMARY KEY,
+			value           NUMERIC(10,4) NOT NULL,
+			unit            TEXT NOT NULL DEFAULT '',
+			description     TEXT NOT NULL DEFAULT '',
+			updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+			updated_by      TEXT NOT NULL DEFAULT ''
+		)`,
+
+		// ----- 5. freshcheck_pool_event (人工: 入框/出框事件) -----
+		`CREATE TABLE IF NOT EXISTS freshcheck_pool_event (
+			id              BIGSERIAL PRIMARY KEY,
+			branch_no       TEXT NOT NULL DEFAULT '0001',
+			pool_code       TEXT NOT NULL,
+			item_no         TEXT NOT NULL,
+			event_kind      TEXT NOT NULL CHECK (event_kind IN ('in','out')),
+			event_time      TIMESTAMPTZ NOT NULL,
+			recorded_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+			weight_kg       NUMERIC(12,4) NOT NULL DEFAULT 0,
+			piece_count     INT NOT NULL DEFAULT 0,
+			out_destination TEXT CHECK (out_destination IN ('sold_out','spoiled','return_to_shelf','downgrade')),
+			downgrade_to    TEXT,
+			operator        TEXT NOT NULL,
+			confidence      TEXT NOT NULL DEFAULT 'high' CHECK (confidence IN ('high','low')),
+			source          TEXT NOT NULL DEFAULT 'h5' CHECK (source IN ('h5','admin','import')),
+			note            TEXT NOT NULL DEFAULT '',
+			UNIQUE (branch_no, pool_code, item_no, event_kind, event_time)
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_fcpe_pool_time ON freshcheck_pool_event(branch_no, pool_code, event_time DESC)`,
+		`CREATE INDEX IF NOT EXISTS idx_fcpe_item_time ON freshcheck_pool_event(branch_no, item_no, event_time DESC)`,
+		`CREATE INDEX IF NOT EXISTS idx_fcpe_low_conf ON freshcheck_pool_event(confidence) WHERE confidence = 'low'`,
+
+		// ----- 6. freshcheck_period_stock (人工: 周期盘点) -----
+		`CREATE TABLE IF NOT EXISTS freshcheck_period_stock (
+			id              BIGSERIAL PRIMARY KEY,
+			branch_no       TEXT NOT NULL DEFAULT '0001',
+			period_id       BIGINT NOT NULL,
+			item_no         TEXT NOT NULL,
+			item_name       TEXT NOT NULL DEFAULT '',
+			qty             NUMERIC(12,4) NOT NULL,
+			unit            TEXT NOT NULL DEFAULT '',
+			stock_time      TIMESTAMPTZ NOT NULL,
+			operator        TEXT NOT NULL,
+			confidence      TEXT NOT NULL DEFAULT 'high' CHECK (confidence IN ('high','low')),
+			source          TEXT NOT NULL DEFAULT 'h5' CHECK (source IN ('h5','admin','import')),
+			note            TEXT NOT NULL DEFAULT '',
+			created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+			UNIQUE (period_id, item_no)
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_fcps_period ON freshcheck_period_stock(period_id)`,
+
+		// ----- 7. freshcheck_category_track (配置: 品类结算轨道) -----
+		`CREATE TABLE IF NOT EXISTS freshcheck_category_track (
+			id                    BIGSERIAL PRIMARY KEY,
+			fresh_category        TEXT NOT NULL,
+			branch_no             TEXT NOT NULL DEFAULT '0001',
+			track_code            TEXT NOT NULL,
+			period_lock_days      INT  NOT NULL,
+			stock_freq            TEXT NOT NULL CHECK (stock_freq IN ('daily','weekly','monthly','none')),
+			require_stock         BOOLEAN NOT NULL DEFAULT TRUE,
+			last_settle_at        TIMESTAMPTZ,
+			next_settle_deadline  TIMESTAMPTZ,
+			is_active             BOOLEAN NOT NULL DEFAULT TRUE,
+			created_at            TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+			updated_at            TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+			UNIQUE (branch_no, fresh_category)
+		)`,
+
+		// ----- 8. freshcheck_settlement (派生: R1 周期单品毛利) -----
+		`CREATE TABLE IF NOT EXISTS freshcheck_settlement (
+			id                    BIGSERIAL PRIMARY KEY,
+			branch_no             TEXT NOT NULL DEFAULT '0001',
+			period_id             BIGINT NOT NULL,
+			track_code            TEXT NOT NULL,
+			fresh_category        TEXT NOT NULL,
+			item_no               TEXT NOT NULL,
+			item_name             TEXT NOT NULL DEFAULT '',
+			begin_qty             NUMERIC(12,4) NOT NULL DEFAULT 0,
+			purchase_qty          NUMERIC(12,4) NOT NULL DEFAULT 0,
+			normal_sale_qty       NUMERIC(12,4) NOT NULL DEFAULT 0,
+			normal_sale_amt       NUMERIC(12,2) NOT NULL DEFAULT 0,
+			pool_alloc_qty        NUMERIC(12,4) NOT NULL DEFAULT 0,
+			pool_alloc_amt        NUMERIC(12,2) NOT NULL DEFAULT 0,
+			end_qty               NUMERIC(12,4) NOT NULL DEFAULT 0,
+			backflush_qty         NUMERIC(12,4) NOT NULL DEFAULT 0,
+			loss_qty              NUMERIC(12,4) NOT NULL DEFAULT 0,
+			box_loss_qty          NUMERIC(12,4) NOT NULL DEFAULT 0,
+			avg_cost              NUMERIC(12,4) NOT NULL,
+			sale_cost             NUMERIC(12,2) NOT NULL DEFAULT 0,
+			total_revenue         NUMERIC(12,2) NOT NULL DEFAULT 0,
+			gross_profit          NUMERIC(12,2) NOT NULL DEFAULT 0,
+			gross_profit_rate     NUMERIC(8,4),
+			confidence            TEXT NOT NULL DEFAULT 'high',
+			is_overridden         BOOLEAN NOT NULL DEFAULT FALSE,
+			override_reason       TEXT NOT NULL DEFAULT '',
+			window_start          TIMESTAMPTZ NOT NULL,
+			window_end            TIMESTAMPTZ NOT NULL,
+			window_days           INT  NOT NULL,
+			status                TEXT NOT NULL DEFAULT 'finalized' CHECK (status IN ('finalized','recalculating','overridden','voided')),
+			settled_at            TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+			settled_by            TEXT NOT NULL,
+			conservation_ok       BOOLEAN NOT NULL DEFAULT TRUE,
+			conservation_msg      TEXT NOT NULL DEFAULT '',
+			idempotency_key       TEXT NOT NULL,
+			UNIQUE (idempotency_key)
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_fcs_period ON freshcheck_settlement(period_id, item_no)`,
+		`CREATE INDEX IF NOT EXISTS idx_fcs_track ON freshcheck_settlement(track_code, window_end DESC)`,
+		`CREATE INDEX IF NOT EXISTS idx_fcs_item ON freshcheck_settlement(branch_no, item_no, window_end DESC)`,
+
+		// ----- 9. freshcheck_alloc (派生: R2 特价归因明细) -----
+		`CREATE TABLE IF NOT EXISTS freshcheck_alloc (
+			id                  BIGSERIAL PRIMARY KEY,
+			period_id           BIGINT NOT NULL,
+			pool_code           TEXT NOT NULL,
+			segment_start       TIMESTAMPTZ NOT NULL,
+			segment_end         TIMESTAMPTZ NOT NULL,
+			item_no             TEXT NOT NULL,
+			in_weight_kg        NUMERIC(12,4) NOT NULL DEFAULT 0,
+			out_weight_kg       NUMERIC(12,4) NOT NULL DEFAULT 0,
+			spoiled_weight_kg   NUMERIC(12,4) NOT NULL DEFAULT 0,
+			weight_diff_kg      NUMERIC(12,4) NOT NULL DEFAULT 0,
+			pool_pos_qty        NUMERIC(12,4) NOT NULL DEFAULT 0,
+			pool_pos_amt        NUMERIC(12,2) NOT NULL DEFAULT 0,
+			share_weight        NUMERIC(8,6) NOT NULL DEFAULT 0,
+			confidence_factor   NUMERIC(4,2) NOT NULL DEFAULT 1.00,
+			alloc_qty           NUMERIC(12,4) NOT NULL DEFAULT 0,
+			alloc_amt           NUMERIC(12,2) NOT NULL DEFAULT 0,
+			backflush_alloc_qty NUMERIC(12,4) NOT NULL DEFAULT 0,
+			deviation_qty       NUMERIC(12,4) NOT NULL DEFAULT 0,
+			deviation_rate      NUMERIC(8,4),
+			needs_review        BOOLEAN NOT NULL DEFAULT FALSE,
+			created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+			UNIQUE (period_id, pool_code, segment_start, item_no)
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_fca_pool ON freshcheck_alloc(period_id, pool_code)`,
+
+		// ----- 10. freshcheck_box_recon (派生: R3 框内对账) -----
+		`CREATE TABLE IF NOT EXISTS freshcheck_box_recon (
+			id                  BIGSERIAL PRIMARY KEY,
+			period_id           BIGINT NOT NULL,
+			branch_no           TEXT NOT NULL DEFAULT '0001',
+			pool_code           TEXT NOT NULL,
+			segment_start       TIMESTAMPTZ NOT NULL,
+			segment_end         TIMESTAMPTZ NOT NULL,
+			in_total_kg         NUMERIC(12,4) NOT NULL DEFAULT 0,
+			out_total_kg        NUMERIC(12,4) NOT NULL DEFAULT 0,
+			out_sold_out_kg     NUMERIC(12,4) NOT NULL DEFAULT 0,
+			out_spoiled_kg      NUMERIC(12,4) NOT NULL DEFAULT 0,
+			out_return_kg       NUMERIC(12,4) NOT NULL DEFAULT 0,
+			out_downgrade_kg    NUMERIC(12,4) NOT NULL DEFAULT 0,
+			pos_total_kg        NUMERIC(12,4) NOT NULL DEFAULT 0,
+			box_loss_kg         NUMERIC(12,4) NOT NULL DEFAULT 0,
+			box_loss_amt        NUMERIC(12,2) NOT NULL DEFAULT 0,
+			responsible_user    TEXT NOT NULL DEFAULT '',
+			responsible_at      TIMESTAMPTZ,
+			needs_investigate   BOOLEAN NOT NULL DEFAULT FALSE,
+			investigate_note    TEXT NOT NULL DEFAULT '',
+			created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+			UNIQUE (period_id, pool_code, segment_start)
+		)`,
+
+		// ----- 11. freshcheck_alert (派生: C1-C8 告警日志) -----
+		`CREATE TABLE IF NOT EXISTS freshcheck_alert (
+			id              BIGSERIAL PRIMARY KEY,
+			branch_no       TEXT NOT NULL DEFAULT '0001',
+			period_id       BIGINT,
+			rule_code       TEXT NOT NULL,
+			severity        TEXT NOT NULL CHECK (severity IN ('info','warn','block')),
+			entity_type     TEXT NOT NULL,
+			entity_id       TEXT NOT NULL,
+			message         TEXT NOT NULL,
+			payload         JSONB NOT NULL DEFAULT '{}'::jsonb,
+			status          TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open','overridden','fixed','ignored')),
+			override_by     TEXT NOT NULL DEFAULT '',
+			override_reason TEXT NOT NULL DEFAULT '',
+			override_at     TIMESTAMPTZ,
+			created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_fca_status ON freshcheck_alert(branch_no, status, created_at DESC) WHERE status = 'open'`,
+		`CREATE INDEX IF NOT EXISTS idx_fca_period ON freshcheck_alert(period_id) WHERE period_id IS NOT NULL`,
+
+		// ----- 12. freshcheck_loss_calibrate (派生+人工: 损耗率校准) -----
+		`CREATE TABLE IF NOT EXISTS freshcheck_loss_calibrate (
+			id                  BIGSERIAL PRIMARY KEY,
+			branch_no           TEXT NOT NULL DEFAULT '0001',
+			fresh_category      TEXT NOT NULL,
+			turnover_class      TEXT NOT NULL,
+			period_window_start DATE NOT NULL,
+			period_window_end   DATE NOT NULL,
+			measured_loss_qty   NUMERIC(12,4) NOT NULL,
+			measured_throughput NUMERIC(12,4) NOT NULL,
+			measured_rate       NUMERIC(8,6) NOT NULL,
+			preset_rate         NUMERIC(8,6) NOT NULL,
+			deviation_pct       NUMERIC(8,4) NOT NULL,
+			action              TEXT NOT NULL DEFAULT 'pending' CHECK (action IN ('pending','update_preset','investigate','discard')),
+			action_by           TEXT NOT NULL DEFAULT '',
+			action_at           TIMESTAMPTZ,
+			action_note         TEXT NOT NULL DEFAULT '',
+			created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+			UNIQUE (branch_no, fresh_category, turnover_class, period_window_end)
+		)`,
+
+		// ----- 13. freshcheck_config_snap (审计: 配置变更快照) -----
+		`CREATE TABLE IF NOT EXISTS freshcheck_config_snap (
+			id              BIGSERIAL PRIMARY KEY,
+			table_name      TEXT NOT NULL,
+			row_pk          TEXT NOT NULL,
+			action          TEXT NOT NULL CHECK (action IN ('create','update','delete')),
+			old_value       JSONB,
+			new_value       JSONB,
+			changed_by      TEXT NOT NULL,
+			changed_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+			rollback_to     TIMESTAMPTZ,
+			rollback_by     TEXT NOT NULL DEFAULT ''
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_fcs_snap ON freshcheck_config_snap(table_name, row_pk, changed_at DESC)`,
+
+		// ----- seed: 业务阈值 12 行默认值 -----
+		// 改阈值只需 UPDATE freshcheck_threshold, 不需要 build
+		`INSERT INTO freshcheck_threshold (key, value, unit, description) VALUES
+			('c1_pool_saturation_pct', 15.00, 'pct', 'C1 池内饱和度容差 (|sum_alloc - pos_qty| / pos_qty)'),
+			('c2_leakage_multiplier_weekly', 2.00, 'multiplier', 'C2 周结池外泄漏倍数 (backflush > loss*k 告警)'),
+			('c2_leakage_multiplier_long', 1.80, 'multiplier', 'C2 月结/长窗口池外泄漏倍数'),
+			('c6_period_lock_leaf_days', 7, 'days', 'C6 叶菜周期锁 (最长不结算天数)'),
+			('c6_period_lock_root_days', 30, 'days', 'C6 根茎周期锁'),
+			('c6_period_lock_aquatic_days', 14, 'days', 'C6 水产周期锁'),
+			('c6_period_lock_meat_days', 14, 'days', 'C6 肉类周期锁'),
+			('c6_period_lock_frozen_days', 30, 'days', 'C6 冻品周期锁'),
+			('c7_sync_diff_pct', 0.01, 'pct', 'C7 cube 同步差异告警'),
+			('c8_period_stock_coverage_pct', 100.00, 'pct', 'C8 盘点覆盖率 (生鲜 SKU 期末盘点必须 100%)'),
+			('loss_calibrate_deviation_pct', 20.00, 'pct', '损耗率校准偏差阈值 (实测 vs 预设)'),
+			('low_confidence_weight', 0.50, 'factor', '低置信度事件分摊权重 (1.0 - confidence_factor)')
+		ON CONFLICT (key) DO NOTHING`,
+
+		// ----- seed: 5 个品类结算轨道 -----
+		// period_lock_days 默认从 freshcheck_threshold 读; 这里只填 track_code + stock_freq
+		// last_settle_at = NULL (首次结算由首次盘点触发)
+		`INSERT INTO freshcheck_category_track (fresh_category, branch_no, track_code, period_lock_days, stock_freq, require_stock) VALUES
+			('leaf',    '0001', 'leaf-weekly',     7,  'weekly',  TRUE),
+			('root',    '0001', 'root-monthly',    30, 'monthly', TRUE),
+			('aquatic', '0001', 'aquatic-biweekly',14, 'weekly',  TRUE),
+			('meat',    '0001', 'meat-biweekly',   14, 'weekly',  TRUE),
+			('frozen',  '0001', 'frozen-monthly',  30, 'monthly', TRUE)
+		ON CONFLICT (branch_no, fresh_category) DO NOTHING`,
 	}
 	for _, s := range stmts {
 		if _, err := pool.Exec(ctx, s); err != nil {
