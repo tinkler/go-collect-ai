@@ -591,3 +591,55 @@ type PeriodStockCoverage struct {
 	MeetsC8      bool    `json:"meets_c8"`     // coverage_pct >= 阈值
 }
 
+// ============== W3.2 倒挤 + 报损剥离 ==============
+
+// BackflushItem 单 SKU 倒挤结果 (W3.2 Step 3 + Step 4)
+//   公式: backflush = begin + purchase - normal_sale - end
+//         loss       = fast: purchase × daily × min(life, days)
+//                      slow: avg_stock × daily × days
+//         pool_adj   = max(backflush - loss, 0)  // 可归因到特价池的量
+//
+//   业务:
+//     - normal_sale 已扣退货 (sales_with_refund.is_refund=0 净销售)
+//     - end_qty 缺则该 SKU 跳过 (C8 阻断在更高层处理, 这里只标 missing_end=true)
+//     - negative backflush 提示销售异常, 不阻断 (W3.5 校验告警)
+type BackflushItem struct {
+	ItemNo         string  `json:"item_no"`
+	ItemName       string  `json:"item_name"`
+	FreshCategory  string  `json:"fresh_category"`
+	TurnoverClass  string  `json:"turnover_class"`
+	ShelfLifeDays  int     `json:"shelf_life_days"`
+	BeginQty       float64 `json:"begin_qty"`
+	PurchaseQty    float64 `json:"purchase_qty"`
+	NormalSaleQty  float64 `json:"normal_sale_qty"`
+	EndQty         float64 `json:"end_qty"`
+	Backflush      float64 `json:"backflush"`       // 倒挤量 (可为负)
+	ExpectedLoss   float64 `json:"expected_loss"`   // 期望损耗
+	PoolAdjustable float64 `json:"pool_adjustable"` // max(backflush - loss, 0)
+	MissingEnd     bool    `json:"missing_end"`     // 缺期末盘点 (C8 阻断)
+	MissingLossRate bool   `json:"missing_loss_rate"` // 缺损耗率配置
+	WindowDays     int     `json:"window_days"`
+}
+
+// BackflushResult 整期倒挤结果
+type BackflushResult struct {
+	BranchNo   string           `json:"branch_no"`
+	PeriodID   int64            `json:"period_id"`
+	WindowFrom time.Time        `json:"window_from"`
+	WindowTo   time.Time        `json:"window_to"`
+	WindowDays int              `json:"window_days"`
+	Items      []*BackflushItem `json:"items"`
+	Summary    BackflushSummary `json:"summary"`
+}
+
+// BackflushSummary 整期汇总
+type BackflushSummary struct {
+	SKUsCount         int     `json:"skus_count"`
+	TotalBackflush    float64 `json:"total_backflush"`
+	TotalExpectedLoss float64 `json:"total_expected_loss"`
+	TotalPoolAdjustable float64 `json:"total_pool_adjustable"`
+	MissingEndCount   int     `json:"missing_end_count"`     // C8 阻断计数
+	MissingLossCount  int     `json:"missing_loss_rate_count"`
+}
+
+

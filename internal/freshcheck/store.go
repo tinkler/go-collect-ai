@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strconv"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -1187,6 +1188,56 @@ func nullableString(s string) any {
 		return nil
 	}
 	return s
+}
+
+// toFloat 安全把 any 转 float64 (cube 行字段可能 float64/int/string/bool)
+//   nil/缺 → 0
+//   float64/32 → 原值
+//   int/8/16/32/64 → 转 float64
+//   string → strconv.ParseFloat (失败 → 0)
+//   bool   → true=1, false=0
+func toFloat(v any) float64 {
+	switch x := v.(type) {
+	case nil:
+		return 0
+	case float64:
+		return x
+	case float32:
+		return float64(x)
+	case int:
+		return float64(x)
+	case int8:
+		return float64(x)
+	case int16:
+		return float64(x)
+	case int32:
+		return float64(x)
+	case int64:
+		return float64(x)
+	case bool:
+		if x {
+			return 1
+		}
+		return 0
+	case string:
+		f, _ := strconv.ParseFloat(x, 64)
+		return f
+	}
+	return 0
+}
+
+// toString 安全把 any 转 string
+//   nil → ""
+//   string → 原值
+//   其他 → fmt.Sprint
+func toString(v any) string {
+	switch x := v.(type) {
+	case nil:
+		return ""
+	case string:
+		return x
+	}
+	return fmt.Sprint(v)
 }
 
 func isUniqueViolation(err error) bool {
