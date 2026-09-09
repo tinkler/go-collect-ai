@@ -642,11 +642,15 @@ func (s *Store) ListTracks(ctx context.Context, branchNo string) ([]*CategoryTra
 
 // UpdateLastSettleAt 结算完成后更新轨道结算时间
 //   重新计算 next_settle_deadline = last_settle_at + period_lock_days
+//   2026-09-09 fix SQLSTATE 42P08: 用子查询从同表取 period_lock_days, 避免 $1 在 timestamptz + interval 两处出现
+//     原写法 `$1 + (period_lock_days || ' days')::interval` 让 pgx 无法推断 $1 类型
 func (s *Store) UpdateLastSettleAt(ctx context.Context, id int64, t time.Time) error {
 	_, err := s.pool.Exec(ctx, `
 		UPDATE freshcheck_category_track
 		SET last_settle_at = $1,
-		    next_settle_deadline = $1 + (period_lock_days || ' days')::interval,
+		    next_settle_deadline = $1::timestamptz + (
+		        SELECT period_lock_days FROM freshcheck_category_track WHERE id = $2
+		    ) * interval '1 day',
 		    updated_at = NOW()
 		WHERE id = $2
 	`, t, id)

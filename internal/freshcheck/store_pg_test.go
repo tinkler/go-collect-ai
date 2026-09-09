@@ -150,8 +150,8 @@ func TestSkuMap_InvalidInput(t *testing.T) {
 	if err := s.UpsertSkuMap(ctx(), m); err == nil {
 		t.Error("item_no 为空应报错")
 	}
-	// fresh_category 为空
-	m.ItemNo = "TEST_NO_CAT"
+	// fresh_category 为空 (注意: 第二个 m 复用 m,必须显式清 fresh_category)
+	m = &SkuMap{BranchNo: "TEST", ItemNo: "TEST_NO_CAT", TurnoverClass: "fast"}
 	if err := s.UpsertSkuMap(ctx(), m); err == nil {
 		t.Error("fresh_category 为空应报错")
 	}
@@ -264,8 +264,9 @@ func TestThreshold_GetListUpdate(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(all) < 12 {
-		t.Errorf("ListThresholds len = %d, want >= 12", len(all))
+	// 2026-09-09 W1.7 撤 c7_sync_diff_pct 后剩 11 行
+	if len(all) < 11 {
+		t.Errorf("ListThresholds len = %d, want >= 11", len(all))
 	}
 
 	// Update
