@@ -61,8 +61,11 @@ func (s *Store) HTTPRecordPoolEventIn(c *gin.Context) {
 	}
 
 	// 重建当前在框集合 (响应需要)
+	// ListPoolEventsByPool 是 [from, to) 区间,刚 insert 的 event 自身需要包含,
+	// 所以 to 加 1ms 容差,避免 rebuilt state 漏掉当前 event
 	from := ev.EventTime.Add(-24 * time.Hour)
-	events, _ := s.ListPoolEventsByPool(c.Request.Context(), branchNo, ev.PoolCode, from, ev.EventTime)
+	to := ev.EventTime.Add(time.Millisecond)
+	events, _ := s.ListPoolEventsByPool(c.Request.Context(), branchNo, ev.PoolCode, from, to)
 	state := RebuildPoolState(ev.PoolCode, "", ev.EventTime, events)
 
 	c.JSON(201, PoolInResponse{

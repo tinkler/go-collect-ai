@@ -184,6 +184,75 @@ Test-Case "4.1 run 12 store_pg_test" {
     }
 }
 
+# ============== [5] W2 池事件端到端 ==============
+Write-Host ""
+Write-Host "=== [5] W2 pool events (PG required) ===" -ForegroundColor Yellow
+
+# 5.1 seed W2 测试数据 (pool + sku)
+Test-Case "5.1 seed W2 pool + sku" {
+    Push-Location (Split-Path $PSScriptRoot)
+    $out = go run ./scripts/tmp/seed_w2_smoke.go 2>&1 | Out-String
+    Pop-Location
+    if ($out -notmatch "seed OK") {
+        throw "seed failed: $out"
+    }
+}
+
+Test-Case "5.2 POST /pool/events/in 201" {
+    $r = Invoke-RestMethod -Method POST -Headers @{Authorization="Bearer $Script:ownerToken"} `
+        -ContentType "application/json" `
+        -Body '{"pool_code":"W2TEST1","item_no":"W2SKU1","weight_kg":1.5,"operator":"u_floor"}' `
+        "$collectAIBase/freshcheck/pool/events/in"
+    if ($r.id -le 0) { throw "id should be set, got $($r.id)" }
+    if ($r.pool_state_after.in_total_kg -lt 1.0) { throw "in_total_kg should >= 1.0" }
+}
+
+Test-Case "5.3 GET /pool/state 200" {
+    $r = Invoke-RestMethod -Headers @{Authorization="Bearer $Script:ownerToken"} `
+        "$collectAIBase/freshcheck/pool/state?pool_code=W2TEST1"
+    if ($r.items.Count -lt 1) { throw "items count should >= 1" }
+}
+
+Test-Case "5.4 POST /pool/events/out 触发 missing_in" {
+    # W2SKU2 之前没录 in, 现在录 out → missing
+    $body = '{"pool_code":"W2TEST1","operator":"u_floor","items":[{"item_no":"W2SKU2","weight_kg":0.3,"out_destination":"sold_out"}]}'
+    $r = Invoke-RestMethod -Method POST -Headers @{Authorization="Bearer $Script:ownerToken"} `
+        -ContentType "application/json" -Body $body `
+        "$collectAIBase/freshcheck/pool/events/out"
+    if ($r.events_created -ne 1) { throw "events_created should 1" }
+    if ($r.missing_in_records.Count -ne 1) { throw "missing_in should detect W2SKU2" }
+    if ($r.missing_in_records[0].item_no -ne "W2SKU2") { throw "missing item should W2SKU2" }
+}
+
+Test-Case "5.5 GET /pool/diff 算 box_loss" {
+    $r = Invoke-RestMethod -Headers @{Authorization="Bearer $Script:ownerToken"} `
+        "$collectAIBase/freshcheck/pool/diff?pool_code=W2TEST1&pos_sales_kg=1.0"
+    if ($r.in_total_kg -lt 1.0) { throw "in_total_kg should >= 1.0" }
+}
+
+Test-Case "5.6 RBAC: u_cashier 录池事件 403" {
+    $body = '{"pool_code":"W2TEST1","item_no":"W2SKU1","weight_kg":0.1,"operator":"u_cashier"}' | ConvertTo-Json
+    try {
+        Invoke-RestMethod -Method POST -Headers @{Authorization="Bearer $Script:cashierToken"} `
+            -ContentType "application/json" -Body $body `
+            "$collectAIBase/freshcheck/pool/events/in" | Out-Null
+        throw "u_cashier should not have freshcheck:pool:write perm"
+    } catch {
+        if ($_.Exception.Response.StatusCode -ne 403) {
+            throw "expect 403, got $($_.Exception.Response.StatusCode)"
+        }
+    }
+}
+
+Test-Case "5.7 cleanup W2 seed data" {
+    Push-Location (Split-Path $PSScriptRoot)
+    $out = go run ./scripts/tmp/seed_w2_smoke.go -cleanup 2>&1 | Out-String
+    Pop-Location
+    if ($out -notmatch "cleanup OK") {
+        throw "cleanup failed: $out"
+    }
+}
+
 # Summary
 Write-Host ""
 Write-Host "================================================" -ForegroundColor Cyan
