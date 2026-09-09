@@ -123,6 +123,9 @@ func main() {
 	restockSvc := restock.NewService(restockCfg, pool, restockCube)
 	// freshcheck 生鲜免日盘 (W1.4, 2026-09-09) — 纯 PG store, 无 cron
 	freshcheckStore := freshcheck.NewStore(pool)
+	// W3.4 6 步编排: freshcheck Service (依赖 Store + CubeQuerier)
+	freshcheckCube := freshcheck.NewCubeQuerier(gateway, freshcheckStore)
+	freshcheckService := freshcheck.NewService(freshcheckStore, freshcheckCube)
 	if missing, err := freshcheckStore.VerifyTablesExist(context.Background()); err != nil {
 		log.Printf("[main] freshcheck VerifyTablesExist: %v (W1.1 迁移未跑? 启动后表会建)", err)
 	} else if len(missing) > 0 {
@@ -393,7 +396,7 @@ func main() {
 	wxSvc := wxsign.New(cfg.WeComCorpID, cfg.WeComAgentID, cfg.WeComCorpSecret)
 	log.Printf("[main] wxsign: configured=%v (corp_id=%q agent_id=%q)", wxSvc.IsConfigured(), cfg.WeComCorpID, cfg.WeComAgentID)
 
-	r := api.NewRouter(h, cfg, restockSvc, authSvc, authSign, rbacStore, wxSvc, freshcheckStore)
+	r := api.NewRouter(h, cfg, restockSvc, authSvc, authSign, rbacStore, wxSvc, freshcheckStore, freshcheckService)
 	log.Printf("[main] 限流: max_concurrent_parse=%d, wait_sec=%d", cfg.MaxConcurrentParse, cfg.RateLimitWaitSec)
 	log.Printf("[main] auth: dev_mode=%v, cookie_domain=%s, cookie_secure=%v, access_ttl=%ds, refresh_ttl=%ds",
 		cfg.DevMode, cfg.CookieDomain, cfg.CookieSecure, cfg.AccessTokenTTLSec, cfg.RefreshTokenTTLSec)

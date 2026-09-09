@@ -23,7 +23,7 @@ import (
 // Gin 路由中间件顺序约定: 中间件在前, handler 在最后
 //   r.GET("/x", AuthMiddleware(), RequirePerm("p"), handler)
 //   → AuthMiddleware → RequirePerm → handler
-func NewRouter(h *handler.Handler, cfg *config.Config, restockSvc *restock.Service, authSvc *auth.Service, authSign *auth.Signer, rbacStore *rbac.Store, wxSvc *wxsign.Service, freshcheckStore *freshcheck.Store) *gin.Engine {
+func NewRouter(h *handler.Handler, cfg *config.Config, restockSvc *restock.Service, authSvc *auth.Service, authSign *auth.Signer, rbacStore *rbac.Store, wxSvc *wxsign.Service, freshcheckStore *freshcheck.Store, freshcheckService *freshcheck.Service) *gin.Engine {
 	r := gin.New()
 	r.Use(gin.Recovery(), gin.Logger())
 
@@ -194,6 +194,8 @@ func NewRouter(h *handler.Handler, cfg *config.Config, restockSvc *restock.Servi
 			authed.GET("/freshcheck/period/stock/:id", auth.RequirePerm("freshcheck:settle:read"), fc.HTTPGetPeriodStock)
 			authed.PUT("/freshcheck/period/stock/:id", auth.RequirePerm("freshcheck:pool:write"), fc.HTTPUpdatePeriodStock)
 			authed.DELETE("/freshcheck/period/stock/:id", auth.RequirePerm("freshcheck:pool:write"), fc.HTTPDeletePeriodStock)
+			// W3.4 6 步流程编排
+			authed.POST("/freshcheck/settle/run", auth.RequirePerm("freshcheck:settle:run"), freshcheckService.HTTPRunSettlement)
 
 			// ============== Admin 权限管理 (2026-08-30) ==============
 			rbacH := rbac.NewHandler(rbacStore)

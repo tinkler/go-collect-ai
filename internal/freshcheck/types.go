@@ -462,9 +462,10 @@ type PoolState struct {
 // SettleRequest 触发结算请求
 type SettleRequest struct {
 	BranchNo       string             `json:"branch_no"`
+	PeriodID       int64              `json:"period_id"`       // W3.4: 本期 ID (e.g. 202609)
 	TrackCode      string             `json:"track_code"`
 	PeriodEnd      time.Time          `json:"period_end"`
-	PeriodStock    []PeriodStockInput `json:"period_stock"`
+	PeriodStock    []PeriodStockInput `json:"period_stock"`     // 本期 end_qty 输入 (从 W3.1 period_stock 读)
 	Operator       string             `json:"operator"`
 	Override       bool               `json:"override"`
 	OverrideReason string             `json:"override_reason"`

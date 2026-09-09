@@ -429,3 +429,42 @@ func (s *Store) HTTPDeletePeriodStock(c *gin.Context) {
 	}
 	c.JSON(200, gin.H{"ok": true, "id": id})
 }
+
+
+// ============== W3.4 POST /settle/run ==============
+//
+// 6 步流程编排 (settle.go Service.RunSettlement)
+//   权限: freshcheck:settle:run
+//   幂等: hash(branch+track+period+operator) UNIQUE, 重复返已有
+//
+// 业务: caller 传 PeriodStock (end_qty 列表), Service 拉 cube+PG 走完 6 步
+//   Step 1: 窗口确定
+//   Step 2: 流水切窗 (cube sales/purchase + 本地 period_stock + pool_event)
+//   Step 3+4: 倒挤 + 报损
+//   Step 5: 多筐串联分摊
+//   Step 6: 毛利 + 写 freshcheck_settlement/alloc 表
+
+// HTTPRunSettlement POST /freshcheck/settle/run
+//   body: SettleRequest (period_id, track_code, period_end, period_stock 列表, operator)
+//   响应: SettleResult (含 summary)
+func (s *Service) HTTPRunSettlement(c *gin.Context) {
+	var req SettleRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(400, gin.H{"error": "bad json: " + err.Error()})
+		return
+	}
+	if req.PeriodID <= 0 {
+		c.JSON(400, gin.H{"error": "period_id required"})
+		return
+	}
+	if req.Operator == "" {
+		req.Operator = operatorFromCtx(c)
+	}
+	res, err := s.RunSettlement(c.Request.Context(), req)
+	if err != nil {
+		c.JSON(500, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(200, res)
+}
+

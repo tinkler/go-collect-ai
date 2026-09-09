@@ -114,6 +114,76 @@ type PurchaseRow struct {
 	OperDate  time.Time
 }
 
+// ============== 2b. PoolSalesInWindow (W3.4 Step 5 分摊) ==============
+//
+// 拉窗口内"按特价码货号卖的 POS 量" (sales_with_refund.item_no = pool_code)
+//   业务: pool_pos_qty/amt 进 alloc (R2 报表)
+//   含退货: is_refund=1 减扣
+//   返回: map[pool_code] -> {qty, amt}
+//
+// 性能: 单 pool 1 年约 1 万行, 秒级
+
+// PoolSalesRow 单特价码窗口汇总
+type PoolSalesRow struct {
+	PoolCode string
+	Qty      float64
+	Amt      float64
+}
+
+// PoolSalesInWindow 拉窗口内"按特价码货号"的 POS 销量
+//   - item_no = pool_code 视为"特价码" (W1 spec: 特价码本身是货号, 进 sales 流)
+//   - is_refund=0 计销售, is_refund=1 减扣
+//   - 按 pool_code 聚合
+func (q *CubeQuerier) PoolSalesInWindow(ctx context.Context, branchNo string, from, to time.Time) (map[string]*PoolSalesRow, error) {
+	timeDims := []map[string]any{
+		{
+			"dimension": SalesWithRefundCube + ".oper_date",
+			"dateRange": []string{
+				from.Format(mssqlTimeFmt),
+				to.Format(mssqlTimeFmt),
+			},
+		},
+	}
+	rows, err := q.Gateway.RawQueryWithTime(SalesWithRefundCube,
+		[]string{SalesWithRefundCube + ".count"},
+		[]string{
+			SalesWithRefundCube + ".item_no",
+			SalesWithRefundCube + ".is_refund",
+			SalesWithRefundCube + ".sale_qnty",
+			SalesWithRefundCube + ".sale_money",
+		},
+		[]map[string]any{
+			{"member": SalesWithRefundCube + ".branch_no", "operator": "equals", "values": []string{branchNo}},
+		},
+		nil, 50000, timeDims)
+	if err != nil {
+		return nil, fmt.Errorf("cube %s PoolSalesInWindow: %w", SalesWithRefundCube, err)
+	}
+	out := map[string]*PoolSalesRow{}
+	for _, row := range rows {
+		poolCode := toString(row[SalesWithRefundCube+".item_no"])
+		if poolCode == "" {
+			continue
+		}
+		isRefund := toFloat(row[SalesWithRefundCube+".is_refund"]) != 0
+		qnty := toFloat(row[SalesWithRefundCube+".sale_qnty"])
+		amt := toFloat(row[SalesWithRefundCube+".sale_money"])
+		r, ok := out[poolCode]
+		if !ok {
+			r = &PoolSalesRow{PoolCode: poolCode}
+			out[poolCode] = r
+		}
+		if isRefund {
+			r.Qty -= qnty
+			r.Amt -= amt
+		} else {
+			r.Qty += qnty
+			r.Amt += amt
+		}
+	}
+	return out, nil
+}
+
 // PurchasesInWindow 拉窗口内采购入库 (用于 Step 3 倒挤公式的 purchase_qty)
 func (q *CubeQuerier) PurchasesInWindow(ctx context.Context, branchNo string, from, to time.Time) ([]*PurchaseRow, error) {
 	timeDims := []map[string]any{

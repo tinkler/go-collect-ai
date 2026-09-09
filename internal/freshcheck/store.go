@@ -1164,6 +1164,77 @@ func (s *Store) CheckPeriodStockCoverage(ctx context.Context, branchNo string, p
 	}, nil
 }
 
+// ============== W3.4 派生表 Insert (settlement / alloc / box_recon) ==============
+
+// InsertSettlement 写 freshcheck_settlement (R1 周期单品毛利)
+//   由 Service.RunSettlement 调用 (W3.4)
+//   错误: UNIQUE 冲突 (idempotency_key) → ErrDuplicateKey
+func (s *Store) InsertSettlement(ctx context.Context, st *Settlement) error {
+	var id int64
+	var settledAt time.Time
+	err := s.pool.QueryRow(ctx, `
+		INSERT INTO freshcheck_settlement
+			(branch_no, period_id, track_code, fresh_category, item_no, item_name,
+			 begin_qty, purchase_qty, normal_sale_qty, normal_sale_amt,
+			 pool_alloc_qty, pool_alloc_amt,
+			 end_qty, backflush_qty, loss_qty, box_loss_qty,
+			 avg_cost, sale_cost, total_revenue, gross_profit, gross_profit_rate,
+			 confidence, is_overridden, override_reason,
+			 window_start, window_end, window_days,
+			 status, settled_by, conservation_ok, conservation_msg, idempotency_key)
+		VALUES ($1,$2,$3,$4,$5,$6, $7,$8,$9,$10, $11,$12, $13,$14,$15,$16,
+		        $17,$18,$19,$20,$21, $22,$23,$24, $25,$26,$27,
+		        $28,$29,$30,$31,$32)
+		RETURNING id, settled_at
+	`, st.BranchNo, st.PeriodID, st.TrackCode, st.FreshCategory, st.ItemNo, st.ItemName,
+		st.BeginQty, st.PurchaseQty, st.NormalSaleQty, st.NormalSaleAmt,
+		st.PoolAllocQty, st.PoolAllocAmt,
+		st.EndQty, st.BackflushQty, st.LossQty, st.BoxLossQty,
+		st.AvgCost, st.SaleCost, st.TotalRevenue, st.GrossProfit, st.GrossProfitRate,
+		st.Confidence, st.IsOverridden, st.OverrideReason,
+		st.WindowStart, st.WindowEnd, st.WindowDays,
+		st.Status, st.SettledBy, st.ConservationOK, st.ConservationMsg, st.IdempotencyKey,
+	).Scan(&id, &settledAt)
+	if err != nil {
+		if isUniqueViolation(err) {
+			return ErrDuplicateKey
+		}
+		return fmt.Errorf("insert settlement: %w", err)
+	}
+	st.ID = id
+	st.SettledAt = settledAt
+	return nil
+}
+
+// InsertAlloc 写 freshcheck_alloc (R2 分摊明细)
+//   错误: UNIQUE 冲突 (period+pool+seg+item) → ErrDuplicateKey
+func (s *Store) InsertAlloc(ctx context.Context, a *Alloc) error {
+	var id int64
+	err := s.pool.QueryRow(ctx, `
+		INSERT INTO freshcheck_alloc
+			(period_id, pool_code, segment_start, segment_end, item_no,
+			 in_weight_kg, out_weight_kg, spoiled_weight_kg, weight_diff_kg,
+			 pool_pos_qty, pool_pos_amt, share_weight, confidence_factor,
+			 alloc_qty, alloc_amt, backflush_alloc_qty,
+			 deviation_qty, deviation_rate, needs_review)
+		VALUES ($1,$2,$3,$4,$5, $6,$7,$8,$9, $10,$11,$12,$13, $14,$15,$16, $17,$18,$19)
+		RETURNING id
+	`, a.PeriodID, a.PoolCode, a.SegmentStart, a.SegmentEnd, a.ItemNo,
+		a.InWeightKg, a.OutWeightKg, a.SpoiledWeightKg, a.WeightDiffKg,
+		a.PoolPosQty, a.PoolPosAmt, a.ShareWeight, a.ConfidenceFactor,
+		a.AllocQty, a.AllocAmt, a.BackflushAllocQty,
+		a.DeviationQty, a.DeviationRate, a.NeedsReview,
+	).Scan(&id)
+	if err != nil {
+		if isUniqueViolation(err) {
+			return ErrDuplicateKey
+		}
+		return fmt.Errorf("insert alloc: %w", err)
+	}
+	a.ID = id
+	return nil
+}
+
 // ============== helpers (W2.1) ==============
 
 func scanPoolEvents(rows pgx.Rows) ([]*PoolEvent, error) {
