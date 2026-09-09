@@ -642,4 +642,78 @@ type BackflushSummary struct {
 	MissingLossCount  int     `json:"missing_loss_rate_count"`
 }
 
+// ============== W3.3 多筐串联分摊 (Step 5) ==============
+
+// PoolSegment 单特价框的某段时间段 (5 步子算法的最小单位)
+//   业务: 一框一窗口内可能有多个段 (活动闭口/重启切分), 每段独立分摊
+//   数据来源: PoolState.RebuildPoolState 的 segment 化 (W3.3 暂用全窗口单段简化)
+type PoolSegment struct {
+	PoolCode    string                 // 特价码
+	SegmentStart time.Time             // 段起点
+	SegmentEnd   time.Time             // 段终点
+	PoolPosQty  float64                // 该段内 POS 卖特价 (sales_with_refund.item_no = pool_code)
+	PoolPosAmt  float64                // 对应金额 (用于后续毛利)
+	Items       []*PoolSegmentItem     // 该段内 SKU 活动详情
+}
+
+// PoolSegmentItem 单 SKU 在某 pool 某 segment 的状态
+//   业务: 来自 pool_event in/out, 累计 in - out - spoiled = "在框量" 推算
+//   ConfidenceFactor: 实时=1.0, 补录=ThrLowConfidenceWeight (默认 0.5)
+type PoolSegmentItem struct {
+	ItemNo           string
+	ItemName         string
+	InWeightKg       float64
+	OutWeightKg      float64
+	SpoiledWeightKg  float64
+	ConfidenceFactor float64
+}
+
+// AllocateInput 分摊算法输入
+//   串联顺序: Pools (已按 unit_price DESC 排序, 高价先)
+//   物理约束: 每 SKU 总分摊 ≤ remainingBackflush[itemNo]
+type AllocateInput struct {
+	BranchNo          string
+	PeriodID          int64
+	Pools             []*PoolCode          // active 特价码 (调用方按 unit_price DESC 排好)
+	PoolSegments      []*PoolSegment       // 框-段 一一对应 (跟 Pools 顺序一致)
+	BackflushItems    []*BackflushItem     // 来自 ComputeBackflush (含 pool_adjustable)
+	MaxIterations     int                  // 物理约束重分配上限, 默认 5
+}
+
+// AllocateResult 分摊结果
+//   写到 freshcheck_alloc 表 (W3.4 编排阶段写, W3.3 只算不算)
+type AllocateResult struct {
+	BranchNo    string
+	PeriodID    int64
+	Allocs      []*AllocItem
+	Summary     AllocateSummary
+}
+
+// AllocItem 单 SKU 在某 pool 某 segment 的分摊结果
+type AllocItem struct {
+	PoolCode     string
+	SegmentStart time.Time
+	SegmentEnd   time.Time
+	ItemNo       string
+	ItemName     string
+	AllocQty     float64
+	AllocAmt     float64
+	Method       string  // "box_diff" (主) | "backflush_fallback" (备)
+	Confidence   float64
+	NeedsReview  bool    // 偏差超阈值 (W3.5 C1 校验)
+}
+
+// AllocateSummary 分摊汇总
+type AllocateSummary struct {
+	PoolsCount      int     `json:"pools_count"`
+	SegmentsCount   int     `json:"segments_count"`
+	AllocsCount     int     `json:"allocs_count"`
+	TotalAllocQty   float64 `json:"total_alloc_qty"`
+	TotalPosQty     float64 `json:"total_pos_qty"`
+	SaturationPct   float64 `json:"saturation_pct"` // abs(total_alloc - total_pos) / total_pos
+	MeetsC1         bool    `json:"meets_c1"`       // saturation <= c1_pool_saturation_pct 阈值
+	NeedsReviewCount int    `json:"needs_review_count"`
+}
+
+
 
