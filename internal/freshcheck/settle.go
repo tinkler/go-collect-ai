@@ -141,6 +141,7 @@ func determineWindow(req SettleRequest) (time.Time, time.Time, int) {
 //   - 每 pool 一段 (W3.4 简化: 全窗口 1 段)
 //   - 从 poolSales 取 pos_qty/amt
 //   - 从 pool_event 拉框内 in/out/spoiled (W2 ListPoolEventsByPool + RebuildPoolState)
+//   - W4.1: 跨筐降级 — 拉全门店 downgrade 事件, 给目标 pool 加虚拟入 (confidence=high)
 func buildAllocateInput(
 	branchNo string,
 	periodID int64,
@@ -151,6 +152,10 @@ func buildAllocateInput(
 	s *Service,
 ) AllocateInput {
 	segs := []*PoolSegment{}
+
+	// W4.1: 拉全门店 downgrade 事件 (按 target_pool_code 分组)
+	downgrades, _ := s.Store.ListDowngradeEventsInWindow(context.Background(), branchNo, windowStart, windowEnd)
+
 	for _, pool := range pools {
 		ps, ok := poolSales[pool.PoolCode]
 		posQty := 0.0
@@ -163,19 +168,48 @@ func buildAllocateInput(
 		events, _ := s.Store.ListPoolEventsByPool(context.Background(), branchNo, pool.PoolCode, windowStart, windowEnd)
 		state := RebuildPoolState(pool.PoolCode, pool.PoolName, windowEnd, events)
 		items := []*PoolSegmentItem{}
+		// 用 map 跟踪 item_no (跨筐降级虚拟入会按 item_no 累加)
+		itemByNo := map[string]*PoolSegmentItem{}
 		for _, it := range state.Items {
 			if it.CurrentWeightKg <= 0 {
 				continue
 			}
-			items = append(items, &PoolSegmentItem{
+			psi := &PoolSegmentItem{
 				ItemNo:           it.ItemNo,
 				ItemName:         it.ItemName,
 				InWeightKg:       it.InWeightKg,
 				OutWeightKg:      it.OutWeightKg,
 				SpoiledWeightKg:  it.SpoiledWeightKg,
 				ConfidenceFactor: 1.0, // 简化
-			})
+			}
+			items = append(items, psi)
+			itemByNo[it.ItemNo] = psi
 		}
+
+		// W4.1: 跨筐降级虚拟入 — 给本 pool 加其他 pool downgrade 过来的"虚拟入"
+		for _, dg := range downgrades[pool.PoolCode] {
+			existing, ok := itemByNo[dg.ItemNo]
+			if !ok {
+				// 目标 pool 之前没这个 SKU, 新建一个 (只有 in_weight, confidence=high)
+				psi := &PoolSegmentItem{
+					ItemNo:           dg.ItemNo,
+					ItemName:         "", // 跨筐降级时 ItemName 拿不到 (PoolEvent 没存), 留空
+					InWeightKg:       dg.WeightKg,
+					OutWeightKg:      0,
+					SpoiledWeightKg:  0,
+					ConfidenceFactor: 1.0, // 虚拟入, confidence=high
+				}
+				items = append(items, psi)
+				itemByNo[dg.ItemNo] = psi
+			} else {
+				// 已有, 累加 in_weight, confidence 提升到 1.0
+				existing.InWeightKg += dg.WeightKg
+				if existing.ConfidenceFactor < 1.0 {
+					existing.ConfidenceFactor = 1.0
+				}
+			}
+		}
+
 		segs = append(segs, &PoolSegment{
 			PoolCode:     pool.PoolCode,
 			SegmentStart: windowStart,

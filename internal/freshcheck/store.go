@@ -898,6 +898,45 @@ func (s *Store) ListPoolEventsByPool(ctx context.Context, branchNo, poolCode str
 	return scanPoolEvents(rows)
 }
 
+// ListDowngradeEventsInWindow W4.1 跨筐降级: 拉某门店窗口内所有 destination=downgrade 的事件
+//   用于 buildAllocateInput 给目标 pool 加虚拟入框
+//   返回: 按 pool_code (downgrade_to) 分组, 同一 SKU 多次降级会累加
+func (s *Store) ListDowngradeEventsInWindow(ctx context.Context, branchNo string, from, to time.Time) (map[string][]*PoolEvent, error) {
+	rows, err := s.pool.Query(ctx, `
+		SELECT id, branch_no, pool_code, item_no, event_kind, event_time, recorded_at,
+		       weight_kg, piece_count, out_destination, downgrade_to,
+		       operator, confidence, source, note
+		FROM freshcheck_pool_event
+		WHERE branch_no = $1
+		  AND event_kind = 'out'
+		  AND out_destination = 'downgrade'
+		  AND event_time >= $2 AND event_time < $3
+		  AND downgrade_to IS NOT NULL AND downgrade_to <> ''
+		ORDER BY event_time
+	`, branchNo, from, to)
+	if err != nil {
+		return nil, fmt.Errorf("query downgrade events: %w", err)
+	}
+	defer rows.Close()
+	out := map[string][]*PoolEvent{}
+	for rows.Next() {
+		ev := &PoolEvent{}
+		var outDest, downgradeTo *string
+		if err := rows.Scan(&ev.ID, &ev.BranchNo, &ev.PoolCode, &ev.ItemNo, &ev.EventKind, &ev.EventTime, &ev.RecordedAt,
+			&ev.WeightKg, &ev.PieceCount, &outDest, &downgradeTo,
+			&ev.Operator, &ev.Confidence, &ev.Source, &ev.Note); err != nil {
+			return nil, err
+		}
+		ev.OutDestination = outDest
+		ev.DowngradeTo = downgradeTo
+		if ev.DowngradeTo == nil || *ev.DowngradeTo == "" {
+			continue
+		}
+		out[*ev.DowngradeTo] = append(out[*ev.DowngradeTo], ev)
+	}
+	return out, rows.Err()
+}
+
 // GetLastEventForItem 查某 SKU 在某框最近一次事件 (任意 kind)
 func (s *Store) GetLastEventForItem(ctx context.Context, branchNo, poolCode, itemNo string) (*PoolEvent, error) {
 	row := s.pool.QueryRow(ctx, `
