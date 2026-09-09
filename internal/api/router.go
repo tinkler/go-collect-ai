@@ -196,6 +196,11 @@ func NewRouter(h *handler.Handler, cfg *config.Config, restockSvc *restock.Servi
 			authed.DELETE("/freshcheck/period/stock/:id", auth.RequirePerm("freshcheck:pool:write"), fc.HTTPDeletePeriodStock)
 			// W3.4 6 步流程编排
 			authed.POST("/freshcheck/settle/run", auth.RequirePerm("freshcheck:settle:run"), freshcheckService.HTTPRunSettlement)
+			// W3.7 R1-R4 报表 (R5 在下面 W3.5)
+			authed.GET("/freshcheck/settle/periods/:id", auth.RequirePerm("freshcheck:settle:read"), freshcheckService.HTTPListSettlements)
+			authed.GET("/freshcheck/settle/periods/:id/alloc", auth.RequirePerm("freshcheck:settle:read"), freshcheckService.HTTPListAllocs)
+			authed.GET("/freshcheck/settle/periods/:id/box", auth.RequirePerm("freshcheck:settle:read"), freshcheckService.HTTPListBoxRecon)
+			authed.GET("/freshcheck/settle/loss-trend", auth.RequirePerm("freshcheck:settle:read"), freshcheckService.HTTPListLossTrend)
 			// W3.5 R5 异常清单 (alerts 报表)
 			authed.GET("/freshcheck/settle/periods/:id/alerts", auth.RequirePerm("freshcheck:settle:read"), freshcheckService.HTTPListAlerts)
 

@@ -101,6 +101,12 @@ func (s *Service) RunSettlement(ctx context.Context, req SettleRequest) (*Settle
 	vr, _ := s.RunValidation(ctx, req, allocRes, bfResult)
 	_ = vr // 即使 block 也不中断返回 (W3.4 编排)
 
+	// W3.6 双轨互验 + R3 框内对账
+	if err := s.RunReconciliation(ctx, req, allocRes, bfResult, allocIn.PoolSegments); err != nil {
+		// reconcile 失败不中断 (W3.9 验收再关注)
+		fmt.Printf("[RunSettlement] RunReconciliation err: %v\n", err)
+	}
+
 	// 汇总
 	return &SettleResult{
 		PeriodID:    req.PeriodID,

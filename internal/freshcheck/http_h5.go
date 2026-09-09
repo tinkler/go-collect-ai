@@ -495,3 +495,137 @@ func (s *Service) HTTPListAlerts(c *gin.Context) {
 	})
 }
 
+
+
+// ============== W3.7 R1-R4 报表端点 ==============
+//
+//   GET /freshcheck/settle/periods/:id          R1 周期单品毛利
+//   GET /freshcheck/settle/periods/:id/alloc    R2 特价归因明细
+//   GET /freshcheck/settle/periods/:id/box      R3 框内对账
+//   GET /freshcheck/settle/loss-trend?days=30   R4 损耗趋势 (R4 简化为 loss_calibrate 列表)
+//   GET /freshcheck/settle/periods/:id/alerts   R5 异常清单 (W3.5 已建)
+
+// HTTPListSettlements GET /freshcheck/settle/periods/:id  (R1)
+func (s *Service) HTTPListSettlements(c *gin.Context) {
+	branchNo := c.DefaultQuery("branch_no", "0001")
+	periodID, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil || periodID <= 0 {
+		c.JSON(400, gin.H{"error": "id must be positive int"})
+		return
+	}
+	items, err := s.Store.ListSettlementsByPeriod(c.Request.Context(), branchNo, periodID)
+	if err != nil {
+		c.JSON(500, gin.H{"error": err.Error()})
+		return
+	}
+	// 汇总
+	var totalSaleAmt, totalAllocAmt, totalLoss, totalGP float64
+	consFail := 0
+	for _, st := range items {
+		totalSaleAmt += st.NormalSaleAmt
+		totalAllocAmt += st.PoolAllocAmt
+		totalLoss += st.LossQty * st.AvgCost
+		totalGP += st.GrossProfit
+		if !st.ConservationOK {
+			consFail++
+		}
+	}
+	c.JSON(200, gin.H{
+		"branch_no":            branchNo,
+		"period_id":            periodID,
+		"items":                items,
+		"count":                len(items),
+		"total_normal_sale_amt": totalSaleAmt,
+		"total_pool_alloc_amt": totalAllocAmt,
+		"total_loss_amt":       totalLoss,
+		"total_gross_profit":   totalGP,
+		"conservation_fail":    consFail,
+	})
+}
+
+// HTTPListAllocs GET /freshcheck/settle/periods/:id/alloc  (R2)
+func (s *Service) HTTPListAllocs(c *gin.Context) {
+	periodID, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil || periodID <= 0 {
+		c.JSON(400, gin.H{"error": "id must be positive int"})
+		return
+	}
+	items, err := s.Store.ListAllocsByPeriod(c.Request.Context(), periodID)
+	if err != nil {
+		c.JSON(500, gin.H{"error": err.Error()})
+		return
+	}
+	needsReview := 0
+	for _, a := range items {
+		if a.NeedsReview {
+			needsReview++
+		}
+	}
+	c.JSON(200, gin.H{
+		"period_id":       periodID,
+		"items":           items,
+		"count":           len(items),
+		"needs_review":    needsReview,
+	})
+}
+
+// HTTPListBoxRecon GET /freshcheck/settle/periods/:id/box  (R3)
+func (s *Service) HTTPListBoxRecon(c *gin.Context) {
+	branchNo := c.DefaultQuery("branch_no", "0001")
+	periodID, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil || periodID <= 0 {
+		c.JSON(400, gin.H{"error": "id must be positive int"})
+		return
+	}
+	items, err := s.Store.ListBoxReconByPeriod(c.Request.Context(), branchNo, periodID)
+	if err != nil {
+		c.JSON(500, gin.H{"error": err.Error()})
+		return
+	}
+	var totalLossKg, totalLossAmt float64
+	needsInv := 0
+	for _, br := range items {
+		totalLossKg += br.BoxLossKg
+		totalLossAmt += br.BoxLossAmt
+		if br.NeedsInvestigate {
+			needsInv++
+		}
+	}
+	c.JSON(200, gin.H{
+		"branch_no":              branchNo,
+		"period_id":              periodID,
+		"items":                  items,
+		"count":                  len(items),
+		"total_box_loss_kg":      totalLossKg,
+		"total_box_loss_amt":     totalLossAmt,
+		"needs_investigate":      needsInv,
+	})
+}
+
+// HTTPListLossTrend GET /freshcheck/settle/loss-trend  (R4)
+//   query: fresh_category, turnover_class, days (default 30)
+func (s *Service) HTTPListLossTrend(c *gin.Context) {
+	freshCategory := c.Query("fresh_category")
+	turnoverClass := c.Query("turnover_class")
+	if freshCategory == "" || turnoverClass == "" {
+		c.JSON(400, gin.H{"error": "fresh_category + turnover_class required"})
+		return
+	}
+	days, _ := strconv.Atoi(c.DefaultQuery("days", "30"))
+	if days <= 0 {
+		days = 30
+	}
+	items, err := s.Store.ListLossCalibrateByWindow(c.Request.Context(), freshCategory, turnoverClass, days)
+	if err != nil {
+		c.JSON(500, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(200, gin.H{
+		"fresh_category": freshCategory,
+		"turnover_class": turnoverClass,
+		"days":           days,
+		"items":          items,
+		"count":          len(items),
+	})
+}
+

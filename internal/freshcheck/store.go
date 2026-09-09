@@ -1235,6 +1235,175 @@ func (s *Store) InsertAlloc(ctx context.Context, a *Alloc) error {
 	return nil
 }
 
+// UpdateAllocDeviation W3.6 双轨互验: 更新 alloc 行的 deviation 字段
+func (s *Store) UpdateAllocDeviation(ctx context.Context, periodID int64, poolCode string, segmentStart time.Time, itemNo string, devQty float64, devRate *float64, needsReview bool) error {
+	_, err := s.pool.Exec(ctx, `
+		UPDATE freshcheck_alloc
+		SET deviation_qty = $5, deviation_rate = $6, needs_review = $7
+		WHERE period_id = $1 AND pool_code = $2 AND segment_start = $3 AND item_no = $4
+	`, periodID, poolCode, segmentStart, itemNo, devQty, devRate, needsReview)
+	if err != nil {
+		return fmt.Errorf("update alloc deviation: %w", err)
+	}
+	return nil
+}
+
+// InsertBoxRecon W3.6 写 freshcheck_box_recon (R3 框内对账)
+func (s *Store) InsertBoxRecon(ctx context.Context, br *BoxRecon) error {
+	var id int64
+	var createdAt time.Time
+	err := s.pool.QueryRow(ctx, `
+		INSERT INTO freshcheck_box_recon
+			(period_id, branch_no, pool_code, segment_start, segment_end,
+			 in_total_kg, out_total_kg, out_sold_out_kg, out_spoiled_kg, out_return_kg, out_downgrade_kg,
+			 pos_total_kg, box_loss_kg, box_loss_amt, responsible_user, needs_investigate, investigate_note)
+		VALUES ($1,$2,$3,$4,$5, $6,$7,$8,$9,$10,$11, $12,$13,$14,$15,$16,$17)
+		RETURNING id, created_at
+	`, br.PeriodID, br.BranchNo, br.PoolCode, br.SegmentStart, br.SegmentEnd,
+		br.InTotalKg, br.OutTotalKg, br.OutSoldOutKg, br.OutSpoiledKg, br.OutReturnKg, br.OutDowngradeKg,
+		br.PosTotalKg, br.BoxLossKg, br.BoxLossAmt, br.ResponsibleUser, br.NeedsInvestigate, br.InvestigateNote,
+	).Scan(&id, &createdAt)
+	if err != nil {
+		if isUniqueViolation(err) {
+			return ErrDuplicateKey
+		}
+		return fmt.Errorf("insert box_recon: %w", err)
+	}
+	br.ID = id
+	br.CreatedAt = createdAt
+	return nil
+}
+
+// ListSettlementsByPeriod 查某期所有 settlement (R1 报表)
+func (s *Store) ListSettlementsByPeriod(ctx context.Context, branchNo string, periodID int64) ([]*Settlement, error) {
+	rows, err := s.pool.Query(ctx, `
+		SELECT id, branch_no, period_id, track_code, fresh_category, item_no, item_name,
+		       begin_qty, purchase_qty, normal_sale_qty, normal_sale_amt,
+		       pool_alloc_qty, pool_alloc_amt,
+		       end_qty, backflush_qty, loss_qty, box_loss_qty,
+		       avg_cost, sale_cost, total_revenue, gross_profit, gross_profit_rate,
+		       confidence, is_overridden, override_reason,
+		       window_start, window_end, window_days,
+		       status, settled_at, settled_by, conservation_ok, conservation_msg, idempotency_key
+		FROM freshcheck_settlement
+		WHERE branch_no = $1 AND period_id = $2
+		ORDER BY item_no
+	`, branchNo, periodID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []*Settlement{}
+	for rows.Next() {
+		st := &Settlement{}
+		var rate *float64
+		if err := rows.Scan(&st.ID, &st.BranchNo, &st.PeriodID, &st.TrackCode, &st.FreshCategory, &st.ItemNo, &st.ItemName,
+			&st.BeginQty, &st.PurchaseQty, &st.NormalSaleQty, &st.NormalSaleAmt,
+			&st.PoolAllocQty, &st.PoolAllocAmt,
+			&st.EndQty, &st.BackflushQty, &st.LossQty, &st.BoxLossQty,
+			&st.AvgCost, &st.SaleCost, &st.TotalRevenue, &st.GrossProfit, &rate,
+			&st.Confidence, &st.IsOverridden, &st.OverrideReason,
+			&st.WindowStart, &st.WindowEnd, &st.WindowDays,
+			&st.Status, &st.SettledAt, &st.SettledBy, &st.ConservationOK, &st.ConservationMsg, &st.IdempotencyKey,
+		); err != nil {
+			return nil, err
+		}
+		st.GrossProfitRate = rate
+		out = append(out, st)
+	}
+	return out, rows.Err()
+}
+
+// ListAllocsByPeriod 查某期所有 alloc (R2 报表)
+func (s *Store) ListAllocsByPeriod(ctx context.Context, periodID int64) ([]*Alloc, error) {
+	rows, err := s.pool.Query(ctx, `
+		SELECT id, period_id, pool_code, segment_start, segment_end, item_no,
+		       in_weight_kg, out_weight_kg, spoiled_weight_kg, weight_diff_kg,
+		       pool_pos_qty, pool_pos_amt, share_weight, confidence_factor,
+		       alloc_qty, alloc_amt, backflush_alloc_qty,
+		       deviation_qty, deviation_rate, needs_review, created_at
+		FROM freshcheck_alloc
+		WHERE period_id = $1
+		ORDER BY pool_code, segment_start, item_no
+	`, periodID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []*Alloc{}
+	for rows.Next() {
+		a := &Alloc{}
+		var rate *float64
+		if err := rows.Scan(&a.ID, &a.PeriodID, &a.PoolCode, &a.SegmentStart, &a.SegmentEnd, &a.ItemNo,
+			&a.InWeightKg, &a.OutWeightKg, &a.SpoiledWeightKg, &a.WeightDiffKg,
+			&a.PoolPosQty, &a.PoolPosAmt, &a.ShareWeight, &a.ConfidenceFactor,
+			&a.AllocQty, &a.AllocAmt, &a.BackflushAllocQty,
+			&a.DeviationQty, &rate, &a.NeedsReview, &a.CreatedAt,
+		); err != nil {
+			return nil, err
+		}
+		a.DeviationRate = rate
+		out = append(out, a)
+	}
+	return out, rows.Err()
+}
+
+// ListLossCalibrateByWindow 查某品类某周转的损耗校准历史 (R4 趋势)
+func (s *Store) ListLossCalibrateByWindow(ctx context.Context, freshCategory, turnoverClass string, days int) ([]*LossCalibrate, error) {
+	rows, err := s.pool.Query(ctx, `
+		SELECT id, branch_no, fresh_category, turnover_class, period_window_start, period_window_end,
+		       measured_loss_qty, measured_throughput, measured_rate, preset_rate, deviation_pct,
+		       action, action_by, action_at, action_note, created_at
+		FROM freshcheck_loss_calibrate
+		WHERE fresh_category = $1 AND turnover_class = $2
+		  AND created_at >= NOW() - ($3::int || ' days')::interval
+		ORDER BY created_at DESC
+	`, freshCategory, turnoverClass, days)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []*LossCalibrate{}
+	for rows.Next() {
+		lc := &LossCalibrate{}
+		if err := rows.Scan(&lc.ID, &lc.BranchNo, &lc.FreshCategory, &lc.TurnoverClass, &lc.PeriodWindowStart, &lc.PeriodWindowEnd,
+			&lc.MeasuredLossQty, &lc.MeasuredThroughput, &lc.MeasuredRate, &lc.PresetRate, &lc.DeviationPct,
+			&lc.Action, &lc.ActionBy, &lc.ActionAt, &lc.ActionNote, &lc.CreatedAt,
+		); err != nil {
+			return nil, err
+		}
+		out = append(out, lc)
+	}
+	return out, rows.Err()
+}
+
+// ListBoxReconByPeriod 查某期所有 box_recon (R3 报表)
+func (s *Store) ListBoxReconByPeriod(ctx context.Context, branchNo string, periodID int64) ([]*BoxRecon, error) {
+	rows, err := s.pool.Query(ctx, `
+		SELECT id, period_id, branch_no, pool_code, segment_start, segment_end,
+		       in_total_kg, out_total_kg, out_sold_out_kg, out_spoiled_kg, out_return_kg, out_downgrade_kg,
+		       pos_total_kg, box_loss_kg, box_loss_amt, responsible_user, needs_investigate, investigate_note, created_at
+		FROM freshcheck_box_recon
+		WHERE branch_no = $1 AND period_id = $2
+		ORDER BY pool_code, segment_start
+	`, branchNo, periodID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []*BoxRecon{}
+	for rows.Next() {
+		br := &BoxRecon{}
+		if err := rows.Scan(&br.ID, &br.PeriodID, &br.BranchNo, &br.PoolCode, &br.SegmentStart, &br.SegmentEnd,
+			&br.InTotalKg, &br.OutTotalKg, &br.OutSoldOutKg, &br.OutSpoiledKg, &br.OutReturnKg, &br.OutDowngradeKg,
+			&br.PosTotalKg, &br.BoxLossKg, &br.BoxLossAmt, &br.ResponsibleUser, &br.NeedsInvestigate, &br.InvestigateNote, &br.CreatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, br)
+	}
+	return out, rows.Err()
+}
+
 // InsertAlert 写 freshcheck_alert (R5 异常清单, C1-C8 校验结果)
 //   payload 序列化为 JSON (handler 端读为 string 存)
 func (s *Store) InsertAlert(ctx context.Context, al *Alert) error {
