@@ -44,9 +44,9 @@ Test-Case "1.1 /api/v1/freshcheck/health 13 张表齐" {
     if ($r.count -ne 13) { throw "count=$($r.count), want 13" }
 }
 
-Test-Case "1.2 thresholds 列表 (期望 12 行)" {
+Test-Case "1.2 thresholds 列表 (期望 11 行)" {
     $r = Invoke-RestMethod "$collectAIBase/freshcheck/config/thresholds"
-    if ($r.count -lt 12) { throw "count=$($r.count), want >= 12" }
+    if ($r.count -lt 11) { throw "count=$($r.count), want >= 11" }
 }
 
 Test-Case "1.3 category-tracks 列表 (期望 5 行)" {
@@ -84,7 +84,7 @@ Test-Case "2.2 dev-login u_floor" {
 
 Test-Case "2.3 u_owner 读 thresholds OK" {
     $r = Invoke-RestMethod -Headers @{Authorization="Bearer $Script:ownerToken"} "$collectAIBase/freshcheck/config/thresholds"
-    if ($r.count -lt 12) { throw "count=$($r.count)" }
+    if ($r.count -lt 11) { throw "count=$($r.count)" }
 }
 
 Test-Case "2.4 u_floor 读 thresholds 应该 403" {
@@ -166,38 +166,11 @@ Test-Case "3.7 PUT 阈值还原 c1=15.00 (snap 审计)" {
         "$collectAIBase/freshcheck/config/thresholds/c1_pool_saturation_pct" | Out-Null
 }
 
-# ============== 4. C7 同步校验 ==============
+# ============== 4. 集成测试 (W1.7) ==============
 Write-Host ""
-Write-Host "=== [4] C7 同步校验 ===" -ForegroundColor Yellow
+Write-Host "=== [4] 集成测试 (需 PG 在线) ===" -ForegroundColor Yellow
 
-Test-Case "4.1 手动触发 C7 同步校验" {
-    $r = Invoke-RestMethod -Method POST -Headers @{Authorization="Bearer $Script:ownerToken"} `
-        -ContentType "application/json" -Body '{}' `
-        "$collectAIBase/freshcheck/admin/sync-check"
-    if ($null -eq $r.cube_value) { throw "cube_value missing" }
-    if ($null -eq $r.source_value) { throw "source_value missing" }
-    if ($null -eq $r.diff_pct) { throw "diff_pct missing" }
-    Write-Host "    cube_value=$($r.cube_value) source_value=$($r.source_value) diff_pct=$($r.diff_pct)%" -ForegroundColor Gray
-}
-
-Test-Case "4.2 u_floor 触发 C7 应 403 (缺 override perm)" {
-    try {
-        Invoke-RestMethod -Method POST -Headers @{Authorization="Bearer $Script:floorToken"} `
-            -ContentType "application/json" -Body '{}' `
-            "$collectAIBase/freshcheck/admin/sync-check" | Out-Null
-        throw "u_floor 不应有 freshcheck:override perm"
-    } catch {
-        if ($_.Exception.Response.StatusCode -ne 403) {
-            throw "期望 403, 实际 $($_.Exception.Response.StatusCode)"
-        }
-    }
-}
-
-# ============== 5. 集成测试 (W1.7) ==============
-Write-Host ""
-Write-Host "=== [5] 集成测试 (需 PG 在线) ===" -ForegroundColor Yellow
-
-Test-Case "5.1 跑 12 个 store_pg_test" {
+Test-Case "4.1 跑 12 个 store_pg_test" {
     $env:FRESHCHECK_TEST_PG_DSN = "postgres://postgres:postgres@127.0.0.1:5432/collectai?sslmode=disable"
     Push-Location (Split-Path $PSScriptRoot)
     $out = go test -count=1 ./internal/freshcheck/... 2>&1 | Out-String

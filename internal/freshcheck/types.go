@@ -141,7 +141,7 @@ const (
 	ThrC6PeriodLockAquatic      = "c6_period_lock_aquatic_days"  // 水产周期锁
 	ThrC6PeriodLockMeat         = "c6_period_lock_meat_days"     // 肉类周期锁
 	ThrC6PeriodLockFrozen       = "c6_period_lock_frozen_days"   // 冻品周期锁
-	ThrC7SyncDiffPct            = "c7_sync_diff_pct"             // 同步差异告警
+	// 2026-09-09: 移除 ThrC7SyncDiffPct (零同步架构下 C7 不适用)
 	ThrC8PeriodStockCoverage    = "c8_period_stock_coverage_pct" // 盘点覆盖率
 	ThrLossCalibrateDeviation   = "loss_calibrate_deviation_pct" // 校准偏差阈值
 	ThrLowConfidenceWeight      = "low_confidence_weight"        // 低置信度分摊权重

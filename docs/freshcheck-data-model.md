@@ -115,7 +115,6 @@ CREATE TABLE IF NOT EXISTS freshcheck_threshold (
 | `c6_period_lock_aquatic_days` | 14 | 水产周期锁 |
 | `c6_period_lock_meat_days` | 14 | 肉类周期锁 |
 | `c6_period_lock_frozen_days` | 30 | 冻品周期锁 |
-| `c7_sync_diff_pct` | 0.01 | 同步差异告警 |
 | `c8_period_stock_coverage_pct` | 100.00 | 盘点覆盖率 (100% 必全) |
 | `loss_calibrate_deviation_pct` | 20.00 | 校准偏差告警 |
 | `low_confidence_weight` | 0.50 | 低置信度分摊权重 |

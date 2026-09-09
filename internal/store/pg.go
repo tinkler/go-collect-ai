@@ -707,7 +707,8 @@ func Migrate(ctx context.Context, pool *pgxpool.Pool) error {
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_fcs_snap ON freshcheck_config_snap(table_name, row_pk, changed_at DESC)`,
 
-		// ----- seed: 业务阈值 12 行默认值 -----
+		// ----- seed: 业务阈值 11 行默认值 -----
+		// 2026-09-09: 移除 c7_sync_diff_pct (零同步架构下不适用, 详情见 pr-summary.md "设计反思")
 		// 改阈值只需 UPDATE freshcheck_threshold, 不需要 build
 		`INSERT INTO freshcheck_threshold (key, value, unit, description) VALUES
 			('c1_pool_saturation_pct', 15.00, 'pct', 'C1 池内饱和度容差 (|sum_alloc - pos_qty| / pos_qty)'),
@@ -718,7 +719,6 @@ func Migrate(ctx context.Context, pool *pgxpool.Pool) error {
 			('c6_period_lock_aquatic_days', 14, 'days', 'C6 水产周期锁'),
 			('c6_period_lock_meat_days', 14, 'days', 'C6 肉类周期锁'),
 			('c6_period_lock_frozen_days', 30, 'days', 'C6 冻品周期锁'),
-			('c7_sync_diff_pct', 0.01, 'pct', 'C7 cube 同步差异告警'),
 			('c8_period_stock_coverage_pct', 100.00, 'pct', 'C8 盘点覆盖率 (生鲜 SKU 期末盘点必须 100%)'),
 			('loss_calibrate_deviation_pct', 20.00, 'pct', '损耗率校准偏差阈值 (实测 vs 预设)'),
 			('low_confidence_weight', 0.50, 'factor', '低置信度事件分摊权重 (1.0 - confidence_factor)')

@@ -23,7 +23,7 @@ import (
 // Gin 路由中间件顺序约定: 中间件在前, handler 在最后
 //   r.GET("/x", AuthMiddleware(), RequirePerm("p"), handler)
 //   → AuthMiddleware → RequirePerm → handler
-func NewRouter(h *handler.Handler, cfg *config.Config, restockSvc *restock.Service, authSvc *auth.Service, authSign *auth.Signer, rbacStore *rbac.Store, wxSvc *wxsign.Service, freshcheckStore *freshcheck.Store, freshcheckSync *freshcheck.SyncChecker) *gin.Engine {
+func NewRouter(h *handler.Handler, cfg *config.Config, restockSvc *restock.Service, authSvc *auth.Service, authSign *auth.Signer, rbacStore *rbac.Store, wxSvc *wxsign.Service, freshcheckStore *freshcheck.Store) *gin.Engine {
 	r := gin.New()
 	r.Use(gin.Recovery(), gin.Logger())
 
@@ -181,10 +181,6 @@ func NewRouter(h *handler.Handler, cfg *config.Config, restockSvc *restock.Servi
 			// 品类结算轨道
 			authed.GET("/freshcheck/config/category-tracks", auth.RequirePerm("freshcheck:settle:read"), fc.HTTPListCategoryTracks)
 			authed.PUT("/freshcheck/config/category-tracks/:fc", auth.RequirePerm("freshcheck:config:write"), fc.HTTPUpsertCategoryTrack)
-			// C7 同步校验手动触发 (W1.6)
-			if freshcheckSync != nil {
-				authed.POST("/freshcheck/admin/sync-check", auth.RequirePerm("freshcheck:override"), fc.HTTPHealthSyncCheck(freshcheckSync))
-			}
 
 			// ============== Admin 权限管理 (2026-08-30) ==============
 			rbacH := rbac.NewHandler(rbacStore)
