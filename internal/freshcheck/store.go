@@ -1377,6 +1377,58 @@ func (s *Store) ListLossCalibrateByWindow(ctx context.Context, freshCategory, tu
 	return out, rows.Err()
 }
 
+// GetAllocByKey W3.6 helper: 单 alloc 行 by (period, pool, seg, item)
+func (s *Store) GetAllocByKey(ctx context.Context, periodID int64, poolCode string, segmentStart time.Time, itemNo string) (*Alloc, error) {
+	a := &Alloc{}
+	var rate *float64
+	err := s.pool.QueryRow(ctx, `
+		SELECT id, period_id, pool_code, segment_start, segment_end, item_no,
+		       in_weight_kg, out_weight_kg, spoiled_weight_kg, weight_diff_kg,
+		       pool_pos_qty, pool_pos_amt, share_weight, confidence_factor,
+		       alloc_qty, alloc_amt, backflush_alloc_qty,
+		       deviation_qty, deviation_rate, needs_review, created_at
+		FROM freshcheck_alloc
+		WHERE period_id = $1 AND pool_code = $2 AND segment_start = $3 AND item_no = $4
+	`, periodID, poolCode, segmentStart, itemNo).Scan(
+		&a.ID, &a.PeriodID, &a.PoolCode, &a.SegmentStart, &a.SegmentEnd, &a.ItemNo,
+		&a.InWeightKg, &a.OutWeightKg, &a.SpoiledWeightKg, &a.WeightDiffKg,
+		&a.PoolPosQty, &a.PoolPosAmt, &a.ShareWeight, &a.ConfidenceFactor,
+		&a.AllocQty, &a.AllocAmt, &a.BackflushAllocQty,
+		&a.DeviationQty, &rate, &a.NeedsReview, &a.CreatedAt,
+	)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	a.DeviationRate = rate
+	return a, nil
+}
+
+// GetBoxReconByKey W3.6 helper: 单 box_recon 行 by (period, pool, seg)
+func (s *Store) GetBoxReconByKey(ctx context.Context, periodID int64, poolCode string, segmentStart time.Time) (*BoxRecon, error) {
+	br := &BoxRecon{}
+	err := s.pool.QueryRow(ctx, `
+		SELECT id, period_id, branch_no, pool_code, segment_start, segment_end,
+		       in_total_kg, out_total_kg, out_sold_out_kg, out_spoiled_kg, out_return_kg, out_downgrade_kg,
+		       pos_total_kg, box_loss_kg, box_loss_amt, responsible_user, needs_investigate, investigate_note, created_at
+		FROM freshcheck_box_recon
+		WHERE period_id = $1 AND pool_code = $2 AND segment_start = $3
+	`, periodID, poolCode, segmentStart).Scan(
+		&br.ID, &br.PeriodID, &br.BranchNo, &br.PoolCode, &br.SegmentStart, &br.SegmentEnd,
+		&br.InTotalKg, &br.OutTotalKg, &br.OutSoldOutKg, &br.OutSpoiledKg, &br.OutReturnKg, &br.OutDowngradeKg,
+		&br.PosTotalKg, &br.BoxLossKg, &br.BoxLossAmt, &br.ResponsibleUser, &br.NeedsInvestigate, &br.InvestigateNote, &br.CreatedAt,
+	)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	return br, nil
+}
+
 // ListBoxReconByPeriod 查某期所有 box_recon (R3 报表)
 func (s *Store) ListBoxReconByPeriod(ctx context.Context, branchNo string, periodID int64) ([]*BoxRecon, error) {
 	rows, err := s.pool.Query(ctx, `
