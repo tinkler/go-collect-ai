@@ -546,3 +546,48 @@ type MissingRec struct {
 	SuggestedInWeight  float64   `json:"suggested_in_weight"`
 	SuggestedInTime    time.Time `json:"suggested_in_time"`
 }
+
+// ============== W3.1 周期盘点 Request/Response ==============
+
+// PeriodStockCreateRequest 创建周期盘点行
+//   强校验:
+//     - period_id > 0
+//     - item_no 非特价码 (∉ freshcheck_pool_code.pool_code, C8)
+//     - qty >= 0
+//     - operator 非空
+//   业务:
+//     - stock_time 缺省=now
+//     - source 缺省='h5' (前端录入)
+//     - confidence 缺省='high', 补录走另一端点 (W3.4 加)
+type PeriodStockCreateRequest struct {
+	PeriodID  int64     `json:"period_id"`
+	ItemNo    string    `json:"item_no"`
+	ItemName  string    `json:"item_name"`
+	Qty       float64   `json:"qty"`
+	Unit      string    `json:"unit"`
+	StockTime time.Time `json:"stock_time"` // RFC3339, 零值=now
+	Operator  string    `json:"operator"`
+	Note      string    `json:"note"`
+}
+
+// PeriodStockUpdateRequest 更新周期盘点 (只能改这些字段, 不能改 period_id/item_no)
+//   业务: 期末盘点错了, 补录/重盘
+type PeriodStockUpdateRequest struct {
+	ItemName string  `json:"item_name"`
+	Qty      float64 `json:"qty"`
+	Unit     string  `json:"unit"`
+	Note     string  `json:"note"`
+}
+
+// PeriodStockCoverage 盘点覆盖率 (C8 校验)
+//   coverage_pct = (已盘 sku 数 / 应盘 sku 数) * 100
+//   业务: 覆盖率 < 100 触发告警 (c8_period_stock_coverage_pct 阈值, 默认 100)
+type PeriodStockCoverage struct {
+	PeriodID     int64   `json:"period_id"`
+	Counted      int     `json:"counted"`      // 已盘 SKU 数
+	Total        int     `json:"total"`        // 应盘 SKU 数 (sku_map.is_active=TRUE)
+	Missing      []string `json:"missing"`     // 未盘 SKU item_no 列表
+	CoveragePct  float64 `json:"coverage_pct"`
+	MeetsC8      bool    `json:"meets_c8"`     // coverage_pct >= 阈值
+}
+

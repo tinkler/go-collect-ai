@@ -13,6 +13,7 @@ package freshcheck
 
 import (
 	"context"
+	"errors"
 	"os"
 	"testing"
 	"time"
@@ -59,6 +60,7 @@ func teardownTestStore(t *testing.T, s *Store) {
 	_, _ = s.pool.Exec(ctx, `DELETE FROM freshcheck_loss_rate WHERE fresh_category LIKE 'TEST_%'`)
 	_, _ = s.pool.Exec(ctx, `DELETE FROM freshcheck_category_track WHERE branch_no = 'TEST'`)
 	_, _ = s.pool.Exec(ctx, `DELETE FROM freshcheck_config_snap WHERE row_pk LIKE 'TEST%' OR table_name = 'freshcheck_sku_map' AND row_pk LIKE 'TEST%'`)
+	_, _ = s.pool.Exec(ctx, `DELETE FROM freshcheck_period_stock WHERE branch_no = 'TEST'`)
 }
 
 // ============== 1. freshcheck_sku_map 测试 ==============
@@ -658,6 +660,281 @@ func TestPoolEvent_GetLastEventForItem(t *testing.T) {
 	}
 	if last.WeightKg != 0.3 {
 		t.Errorf("last.WeightKg = %f, want 0.3 (最近一次)", last.WeightKg)
+	}
+}
+
+// ============== 7. freshcheck_period_stock (W3.1 周期盘点) 测试 ==============
+
+func TestPeriodStock_Create_Success(t *testing.T) {
+	pool := setupTestPool(t)
+	s := NewStore(pool)
+	defer teardownTestStore(t, s)
+	setupSkuMapForStock(t, s) // 注册 2 个原 SKU + 1 个特价码
+
+	ps := &PeriodStock{
+		BranchNo:  "TEST",
+		PeriodID:  202609,
+		ItemNo:    "TESTSTK1", // 原 SKU, 不是特价码
+		ItemName:  "test cabbage",
+		Qty:       12.5,
+		Unit:      "kg",
+		StockTime: time.Now(),
+		Operator:  "u_floor",
+		Note:      "smoke",
+	}
+	if err := s.CreatePeriodStock(ctx(), ps); err != nil {
+		t.Fatalf("CreatePeriodStock: %v", err)
+	}
+	if ps.ID == 0 {
+		t.Error("ID should be set")
+	}
+	if ps.CreatedAt.IsZero() {
+		t.Error("CreatedAt should be set")
+	}
+	if ps.Source != "h5" {
+		t.Errorf("Source = %q, want h5 (default)", ps.Source)
+	}
+	if ps.Confidence != "high" {
+		t.Errorf("Confidence = %q, want high (default)", ps.Confidence)
+	}
+}
+
+func TestPeriodStock_Create_RejectPoolCode(t *testing.T) {
+	// C8 强校验: 特价码不能当作原 SKU 录入
+	pool := setupTestPool(t)
+	s := NewStore(pool)
+	defer teardownTestStore(t, s)
+	setupSkuMapForStock(t, s)
+
+	ps := &PeriodStock{
+		BranchNo:  "TEST",
+		PeriodID:  202609,
+		ItemNo:    "TESTPOOL1", // ← 这是特价码, 不是原 SKU
+		Qty:       5.0,
+		Unit:      "kg",
+		Operator:  "u_floor",
+	}
+	err := s.CreatePeriodStock(ctx(), ps)
+	if err == nil {
+		t.Fatal("CreatePeriodStock 应拒绝特价码 item_no, 但成功了")
+	}
+	if !errors.Is(err, ErrInvalidInput) {
+		t.Errorf("err = %v, want ErrInvalidInput", err)
+	}
+}
+
+func TestPeriodStock_Create_Duplicate(t *testing.T) {
+	pool := setupTestPool(t)
+	s := NewStore(pool)
+	defer teardownTestStore(t, s)
+	setupSkuMapForStock(t, s)
+
+	ps := &PeriodStock{
+		BranchNo:  "TEST",
+		PeriodID:  202609,
+		ItemNo:    "TESTSTK1",
+		Qty:       1.0,
+		Operator:  "u_floor",
+		StockTime: time.Now(),
+	}
+	if err := s.CreatePeriodStock(ctx(), ps); err != nil {
+		t.Fatalf("first Create: %v", err)
+	}
+	// 第二次同 (period_id, item_no) → ErrDuplicateKey
+	ps2 := &PeriodStock{
+		BranchNo:  "TEST",
+		PeriodID:  202609,
+		ItemNo:    "TESTSTK1",
+		Qty:       2.0,
+		Operator:  "u_floor",
+		StockTime: time.Now(),
+	}
+	err := s.CreatePeriodStock(ctx(), ps2)
+	if !errors.Is(err, ErrDuplicateKey) {
+		t.Errorf("err = %v, want ErrDuplicateKey", err)
+	}
+}
+
+func TestPeriodStock_Get_NotFound(t *testing.T) {
+	pool := setupTestPool(t)
+	s := NewStore(pool)
+	_, err := s.GetPeriodStock(ctx(), "TEST", 99999999)
+	if !errors.Is(err, ErrNotFound) {
+		t.Errorf("err = %v, want ErrNotFound", err)
+	}
+}
+
+func TestPeriodStock_ListByPeriod(t *testing.T) {
+	pool := setupTestPool(t)
+	s := NewStore(pool)
+	defer teardownTestStore(t, s)
+	setupSkuMapForStock(t, s)
+
+	// 录 2 行同一期
+	for _, it := range []string{"TESTSTK1", "TESTSTK2"} {
+		err := s.CreatePeriodStock(ctx(), &PeriodStock{
+			BranchNo:  "TEST",
+			PeriodID:  202609,
+			ItemNo:    it,
+			Qty:       3.0,
+			Operator:  "u_floor",
+			StockTime: time.Now(),
+		})
+		if err != nil {
+			t.Fatalf("Create %s: %v", it, err)
+		}
+	}
+	// 列查
+	items, err := s.ListPeriodStocksByPeriod(ctx(), "TEST", 202609)
+	if err != nil {
+		t.Fatalf("ListPeriodStocksByPeriod: %v", err)
+	}
+	if len(items) != 2 {
+		t.Errorf("items = %d, want 2", len(items))
+	}
+	// 按 item_no 升序
+	if items[0].ItemNo != "TESTSTK1" || items[1].ItemNo != "TESTSTK2" {
+		t.Errorf("order = [%s, %s], want [TESTSTK1, TESTSTK2]", items[0].ItemNo, items[1].ItemNo)
+	}
+}
+
+func TestPeriodStock_Update(t *testing.T) {
+	pool := setupTestPool(t)
+	s := NewStore(pool)
+	defer teardownTestStore(t, s)
+	setupSkuMapForStock(t, s)
+
+	ps := &PeriodStock{
+		BranchNo: "TEST", PeriodID: 202609, ItemNo: "TESTSTK1",
+		Qty: 5.0, Unit: "kg", Operator: "u_floor", StockTime: time.Now(),
+	}
+	if err := s.CreatePeriodStock(ctx(), ps); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	// update: 改 qty + note
+	if err := s.UpdatePeriodStock(ctx(), ps.ID, "renamed", 9.5, "kg", "corrected"); err != nil {
+		t.Fatalf("UpdatePeriodStock: %v", err)
+	}
+	got, err := s.GetPeriodStock(ctx(), "TEST", ps.ID)
+	if err != nil {
+		t.Fatalf("Get after update: %v", err)
+	}
+	if got.Qty != 9.5 {
+		t.Errorf("Qty = %f, want 9.5", got.Qty)
+	}
+	if got.ItemName != "renamed" {
+		t.Errorf("ItemName = %q, want renamed", got.ItemName)
+	}
+	if got.Note != "corrected" {
+		t.Errorf("Note = %q, want corrected", got.Note)
+	}
+	// 校验 qty < 0 拒绝
+	if err := s.UpdatePeriodStock(ctx(), ps.ID, "", -1, "", ""); !errors.Is(err, ErrInvalidInput) {
+		t.Errorf("Update qty=-1 err = %v, want ErrInvalidInput", err)
+	}
+}
+
+func TestPeriodStock_Delete(t *testing.T) {
+	pool := setupTestPool(t)
+	s := NewStore(pool)
+	defer teardownTestStore(t, s)
+	setupSkuMapForStock(t, s)
+
+	ps := &PeriodStock{
+		BranchNo: "TEST", PeriodID: 202609, ItemNo: "TESTSTK1",
+		Qty: 1.0, Operator: "u_floor", StockTime: time.Now(),
+	}
+	if err := s.CreatePeriodStock(ctx(), ps); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if err := s.DeletePeriodStock(ctx(), ps.ID); err != nil {
+		t.Fatalf("Delete: %v", err)
+	}
+	// 二次删 → ErrNotFound
+	if err := s.DeletePeriodStock(ctx(), ps.ID); !errors.Is(err, ErrNotFound) {
+		t.Errorf("二次删 err = %v, want ErrNotFound", err)
+	}
+}
+
+func TestPeriodStock_Coverage(t *testing.T) {
+	pool := setupTestPool(t)
+	s := NewStore(pool)
+	defer teardownTestStore(t, s)
+	setupSkuMapForStock(t, s) // 2 个 active SKU (TESTSTK1, TESTSTK2)
+
+	// 一开始 0% (没盘)
+	cov, err := s.CheckPeriodStockCoverage(ctx(), "TEST", 202609)
+	if err != nil {
+		t.Fatalf("CheckPeriodStockCoverage (0/2): %v", err)
+	}
+	if cov.Total != 2 || cov.Counted != 0 {
+		t.Errorf("Total=%d Counted=%d, want 2/0", cov.Total, cov.Counted)
+	}
+	if cov.CoveragePct != 0 {
+		t.Errorf("CoveragePct = %f, want 0", cov.CoveragePct)
+	}
+	if cov.MeetsC8 {
+		t.Error("MeetsC8 should be false when 0% coverage")
+	}
+	if len(cov.Missing) != 2 {
+		t.Errorf("Missing = %d items, want 2", len(cov.Missing))
+	}
+
+	// 盘 1 个 → 50%
+	if err := s.CreatePeriodStock(ctx(), &PeriodStock{
+		BranchNo: "TEST", PeriodID: 202609, ItemNo: "TESTSTK1",
+		Qty: 5, Operator: "u_floor", StockTime: time.Now(),
+	}); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	cov, _ = s.CheckPeriodStockCoverage(ctx(), "TEST", 202609)
+	if cov.Counted != 1 || cov.Total != 2 {
+		t.Errorf("Total=%d Counted=%d, want 2/1", cov.Total, cov.Counted)
+	}
+	if cov.CoveragePct != 50.0 {
+		t.Errorf("CoveragePct = %f, want 50.0", cov.CoveragePct)
+	}
+	if cov.MeetsC8 {
+		t.Error("MeetsC8 should be false at 50% (default threshold 100)")
+	}
+
+	// 盘 2 个 → 100% → meets
+	if err := s.CreatePeriodStock(ctx(), &PeriodStock{
+		BranchNo: "TEST", PeriodID: 202609, ItemNo: "TESTSTK2",
+		Qty: 5, Operator: "u_floor", StockTime: time.Now(),
+	}); err != nil {
+		t.Fatalf("Create STK2: %v", err)
+	}
+	cov, _ = s.CheckPeriodStockCoverage(ctx(), "TEST", 202609)
+	if cov.Counted != 2 {
+		t.Errorf("Counted = %d, want 2", cov.Counted)
+	}
+	if cov.CoveragePct != 100.0 {
+		t.Errorf("CoveragePct = %f, want 100", cov.CoveragePct)
+	}
+	if !cov.MeetsC8 {
+		t.Error("MeetsC8 should be true at 100%")
+	}
+}
+
+// setupSkuMapForStock: 准备 2 个 active SKU + 1 个特价码
+//   - TESTSTK1, TESTSTK2 (leaf, fast) → 应盘
+//   - TESTPOOL1 (特价码) → 强校验拒绝录入
+func setupSkuMapForStock(t *testing.T, s *Store) {
+	t.Helper()
+	for _, sku := range []SkuMap{
+		{BranchNo: "TEST", ItemNo: "TESTSTK1", ItemName: "spinach", FreshCategory: "leaf", TurnoverClass: "fast", ShelfLifeDays: 5, IsActive: true},
+		{BranchNo: "TEST", ItemNo: "TESTSTK2", ItemName: "lettuce", FreshCategory: "leaf", TurnoverClass: "fast", ShelfLifeDays: 5, IsActive: true},
+	} {
+		if err := s.UpsertSkuMap(ctx(), &sku); err != nil {
+			t.Fatalf("UpsertSkuMap %s: %v", sku.ItemNo, err)
+		}
+	}
+	if err := s.UpsertPoolCode(ctx(), &PoolCode{
+		BranchNo: "TEST", PoolCode: "TESTPOOL1", PoolName: "1元/斤",
+		PricingMode: "weight", UnitPrice: 1.0, PriorityRank: 0, IsActive: true,
+	}); err != nil {
+		t.Fatalf("UpsertPoolCode: %v", err)
 	}
 }
 

@@ -1,4 +1,4 @@
-# freshcheck W1 smoke (ASCII only, no Chinese, to avoid Windows PowerShell 5.1 encoding issues)
+﻿# freshcheck W1 smoke (ASCII only, no Chinese, to avoid Windows PowerShell 5.1 encoding issues)
 #
 # Run: env FRESHCHECK_TEST_PG_DSN=... powershell -NoProfile -ExecutionPolicy Bypass -File e2e/freshcheck_smoke.ps1
 #
@@ -251,6 +251,132 @@ Test-Case "5.7 cleanup W2 seed data" {
     if ($out -notmatch "cleanup OK") {
         throw "cleanup failed: $out"
     }
+}
+
+# ============== [6] W3.1 周期盘点端到端 ==============
+Write-Host ""
+Write-Host "=== [6] W3.1 period stock ===" -ForegroundColor Yellow
+$w3Period = 20990101
+
+Test-Case "6.0 seed W3.1 sku+pool idempotent" {
+    Push-Location (Split-Path $PSScriptRoot)
+    $out = go run ./scripts/tmp/seed_w3_smoke.go 2>&1 | Out-String
+    Pop-Location
+    if ($out -notmatch "seed OK") { throw "seed failed: $out" }
+}
+
+Test-Case "6.1 POST /period/stock 创建 (SKU 合法)" {
+    $body = @{
+        period_id = $w3Period
+        item_no   = "W3SKU1"
+        item_name = "smoke cabbage"
+        qty       = 12.5
+        unit      = "kg"
+        operator  = "u_floor"
+        note      = "w3.1 smoke"
+    } | ConvertTo-Json
+    $r = Invoke-RestMethod -Method POST -Headers @{Authorization="Bearer $Script:ownerToken"} `
+        -ContentType "application/json" -Body $body `
+        "$collectAIBase/freshcheck/period/stock"
+    if ($r.id -le 0) { throw "id should be set, got $($r.id)" }
+    if ($r.item_no -ne "W3SKU1") { throw "item_no = $($r.item_no)" }
+    if ($r.qty -ne 12.5) { throw "qty = $($r.qty)" }
+    if ($r.confidence -ne "high") { throw "confidence = $($r.confidence), want high" }
+    $Script:w3StockId = $r.id
+}
+
+Test-Case "6.1b POST /period/stock C8 reject pool_code" {
+    $body = @{
+        period_id = $w3Period
+        item_no   = "W3POOL1"
+        qty       = 1.0
+        unit      = "kg"
+        operator  = "u_floor"
+    } | ConvertTo-Json
+    try {
+        Invoke-RestMethod -Method POST -Headers @{Authorization="Bearer $Script:ownerToken"} `
+            -ContentType "application/json" -Body $body `
+            "$collectAIBase/freshcheck/period/stock" | Out-Null
+        throw "C8 校验应拒特价码 W3POOL1, 但成功录入"
+    } catch {
+        if ($_.Exception.Response.StatusCode -ne 400) {
+            throw "expect 400, got $($_.Exception.Response.StatusCode)"
+        }
+    }
+}
+
+Test-Case "6.2 GET /period/stock list by period" {
+    $r = Invoke-RestMethod -Headers @{Authorization="Bearer $Script:ownerToken"} `
+        "$collectAIBase/freshcheck/period/stock?period_id=$w3Period"
+    if ($r.count -lt 1) { throw "count = $($r.count), want >= 1" }
+    if ($r.items[0].item_no -ne "W3SKU1") { throw "first item = $($r.items[0].item_no)" }
+    $Script:w3StockId = $r.items[0].id
+}
+
+Test-Case "6.3 GET /period/stock/coverage C8 check" {
+    $r = Invoke-RestMethod -Headers @{Authorization="Bearer $Script:ownerToken"} `
+        "$collectAIBase/freshcheck/period/stock/coverage?period_id=$w3Period"
+    if ($r.period_id -ne $w3Period) { throw "period_id = $($r.period_id)" }
+    if ($r.counted -lt 1) { throw "counted = $($r.counted), want >= 1" }
+    if ($r.total -lt 1) { throw "total = $($r.total), want >= 1" }
+    if ($null -eq $r.missing) { throw "missing 字段缺失" }
+    # counted == 1 of total, 但 3.x 残留的 SMOKE0001 也算 active, 所以 total >= 2
+    # coverage_pct = counted/total*100, meets_c8 = coverage_pct >= 100 (默认阈值)
+    if ($r.counted -gt $r.total) { throw "counted > total: $($r.counted) > $($r.total)" }
+}
+
+Test-Case "6.4 GET /period/stock/:id by id" {
+    $r = Invoke-RestMethod -Headers @{Authorization="Bearer $Script:ownerToken"} `
+        "$collectAIBase/freshcheck/period/stock/$Script:w3StockId"
+    if ($r.id -ne $Script:w3StockId) { throw "id = $($r.id), want $Script:w3StockId" }
+}
+
+Test-Case "6.5 PUT /period/stock/:id update qty+note" {
+    $body = @{ item_name = "renamed"; qty = 20.0; unit = "kg"; note = "corrected" } | ConvertTo-Json
+    $r = Invoke-RestMethod -Method PUT -Headers @{Authorization="Bearer $Script:ownerToken"} `
+        -ContentType "application/json" -Body $body `
+        "$collectAIBase/freshcheck/period/stock/$Script:w3StockId"
+    if (-not $r.ok) { throw "ok=false" }
+    $g = Invoke-RestMethod -Headers @{Authorization="Bearer $Script:ownerToken"} `
+        "$collectAIBase/freshcheck/period/stock/$Script:w3StockId"
+    if ($g.qty -ne 20.0) { throw "after update qty = $($g.qty), want 20.0" }
+    if ($g.note -ne "corrected") { throw "note = $($g.note)" }
+}
+
+Test-Case "6.6 RBAC u_cashier POST 403" {
+    $body = @{ period_id = $w3Period; item_no = "W3SKU1"; qty = 1.0; unit = "kg"; operator = "u_cashier" } | ConvertTo-Json
+    try {
+        Invoke-RestMethod -Method POST -Headers @{Authorization="Bearer $Script:cashierToken"} `
+            -ContentType "application/json" -Body $body `
+            "$collectAIBase/freshcheck/period/stock" | Out-Null
+        throw "u_cashier 应 403"
+    } catch {
+        if ($_.Exception.Response.StatusCode -ne 403) {
+            throw "expect 403, got $($_.Exception.Response.StatusCode)"
+        }
+    }
+}
+
+Test-Case "6.7 DELETE /period/stock/:id cleanup" {
+    $r = Invoke-RestMethod -Method DELETE -Headers @{Authorization="Bearer $Script:ownerToken"} `
+        "$collectAIBase/freshcheck/period/stock/$Script:w3StockId"
+    if (-not $r.ok) { throw "ok=false" }
+    try {
+        Invoke-RestMethod -Headers @{Authorization="Bearer $Script:ownerToken"} `
+            "$collectAIBase/freshcheck/period/stock/$Script:w3StockId" | Out-Null
+        throw "删后 GET 应 404"
+    } catch {
+        if ($_.Exception.Response.StatusCode -ne 404) {
+            throw "expect 404, got $($_.Exception.Response.StatusCode)"
+        }
+    }
+}
+
+Test-Case "6.8 cleanup W3.1 seed data" {
+    Push-Location (Split-Path $PSScriptRoot)
+    $out = go run ./scripts/tmp/seed_w3_smoke.go -cleanup 2>&1 | Out-String
+    Pop-Location
+    if ($out -notmatch "cleanup OK") { throw "cleanup failed: $out" }
 }
 
 # Summary

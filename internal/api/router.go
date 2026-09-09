@@ -187,6 +187,13 @@ func NewRouter(h *handler.Handler, cfg *config.Config, restockSvc *restock.Servi
 			authed.GET("/freshcheck/pool/events", auth.RequirePerm("freshcheck:settle:read"), fc.HTTPListPoolEvents)
 			authed.GET("/freshcheck/pool/state", auth.RequirePerm("freshcheck:settle:read"), fc.HTTPGetPoolState)
 			authed.GET("/freshcheck/pool/diff", auth.RequirePerm("freshcheck:settle:read"), fc.HTTPGetPoolDiff)
+			// W3.1 周期盘点 CRUD (5 端点 + 1 coverage 校验)
+			authed.POST("/freshcheck/period/stock", auth.RequirePerm("freshcheck:pool:write"), fc.HTTPCreatePeriodStock)
+			authed.GET("/freshcheck/period/stock", auth.RequirePerm("freshcheck:settle:read"), fc.HTTPListPeriodStocks)
+			authed.GET("/freshcheck/period/stock/coverage", auth.RequirePerm("freshcheck:settle:read"), fc.HTTPCheckPeriodStockCoverage)
+			authed.GET("/freshcheck/period/stock/:id", auth.RequirePerm("freshcheck:settle:read"), fc.HTTPGetPeriodStock)
+			authed.PUT("/freshcheck/period/stock/:id", auth.RequirePerm("freshcheck:pool:write"), fc.HTTPUpdatePeriodStock)
+			authed.DELETE("/freshcheck/period/stock/:id", auth.RequirePerm("freshcheck:pool:write"), fc.HTTPDeletePeriodStock)
 
 			// ============== Admin 权限管理 (2026-08-30) ==============
 			rbacH := rbac.NewHandler(rbacStore)

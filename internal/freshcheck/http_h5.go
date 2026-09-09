@@ -15,6 +15,7 @@ package freshcheck
 //   pool:write (入框/出框/盘点) + settle:read (查) + 管理员/auditor
 
 import (
+	"errors"
 	"strconv"
 	"time"
 
@@ -260,4 +261,171 @@ func (s *Store) HTTPGetPoolDiff(c *gin.Context) {
 
 	r := ComputeBoxDiff(branchNo, poolCode, unitPrice, fromTime, toTime, events, posSalesKg)
 	c.JSON(200, r)
+}
+
+// ============== W3.1 周期盘点 CRUD 端点 ==============
+//
+//   POST   /freshcheck/period/stock              创建盘点行
+//   GET    /freshcheck/period/stock              列某期盘点 (query: period_id)
+//   GET    /freshcheck/period/stock/coverage     算 C8 覆盖率 (query: period_id)
+//   GET    /freshcheck/period/stock/:id          单条查
+//   PUT    /freshcheck/period/stock/:id          更新 (只改 item_name/qty/unit/note)
+//   DELETE /freshcheck/period/stock/:id          删
+//
+//   权限:
+//     - 读 (GET):  freshcheck:settle:read
+//     - 写 (POST/PUT/DELETE): freshcheck:pool:write  (实地员工录, 跟 W2 池事件一致)
+//
+//   强校验 (C8):
+//     - item_no ∉ freshcheck_pool_code.pool_code (即不是特价码)
+
+// HTTPCreatePeriodStock POST /freshcheck/period/stock
+func (s *Store) HTTPCreatePeriodStock(c *gin.Context) {
+	var req PeriodStockCreateRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(400, gin.H{"error": "bad json: " + err.Error()})
+		return
+	}
+	branchNo := c.DefaultQuery("branch_no", "0001")
+	operator := operatorFromCtx(c)
+	if operator == "" {
+		operator = req.Operator
+	}
+
+	ps := &PeriodStock{
+		BranchNo:  branchNo,
+		PeriodID:  req.PeriodID,
+		ItemNo:    req.ItemNo,
+		ItemName:  req.ItemName,
+		Qty:       req.Qty,
+		Unit:      req.Unit,
+		StockTime: req.StockTime,
+		Operator:  operator,
+		Note:      req.Note,
+	}
+	if err := s.CreatePeriodStock(c.Request.Context(), ps); err != nil {
+		status := 500
+		switch {
+		case errors.Is(err, ErrDuplicateKey):
+			status = 409
+		case errors.Is(err, ErrInvalidInput):
+			status = 400
+		case errors.Is(err, ErrNotFound):
+			status = 404
+		}
+		c.JSON(status, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(201, ps)
+}
+
+// HTTPListPeriodStocks GET /freshcheck/period/stock?period_id=...
+func (s *Store) HTTPListPeriodStocks(c *gin.Context) {
+	branchNo := c.DefaultQuery("branch_no", "0001")
+	periodIDStr := c.Query("period_id")
+	if periodIDStr == "" {
+		c.JSON(400, gin.H{"error": "period_id required"})
+		return
+	}
+	periodID, err := strconv.ParseInt(periodIDStr, 10, 64)
+	if err != nil || periodID <= 0 {
+		c.JSON(400, gin.H{"error": "period_id must be positive int"})
+		return
+	}
+	items, err := s.ListPeriodStocksByPeriod(c.Request.Context(), branchNo, periodID)
+	if err != nil {
+		c.JSON(500, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(200, gin.H{
+		"branch_no": branchNo,
+		"period_id": periodID,
+		"count":     len(items),
+		"items":     items,
+	})
+}
+
+// HTTPCheckPeriodStockCoverage GET /freshcheck/period/stock/coverage?period_id=...
+func (s *Store) HTTPCheckPeriodStockCoverage(c *gin.Context) {
+	branchNo := c.DefaultQuery("branch_no", "0001")
+	periodIDStr := c.Query("period_id")
+	if periodIDStr == "" {
+		c.JSON(400, gin.H{"error": "period_id required"})
+		return
+	}
+	periodID, err := strconv.ParseInt(periodIDStr, 10, 64)
+	if err != nil || periodID <= 0 {
+		c.JSON(400, gin.H{"error": "period_id must be positive int"})
+		return
+	}
+	cov, err := s.CheckPeriodStockCoverage(c.Request.Context(), branchNo, periodID)
+	if err != nil {
+		c.JSON(500, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(200, cov)
+}
+
+// HTTPGetPeriodStock GET /freshcheck/period/stock/:id
+func (s *Store) HTTPGetPeriodStock(c *gin.Context) {
+	branchNo := c.DefaultQuery("branch_no", "0001")
+	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil || id <= 0 {
+		c.JSON(400, gin.H{"error": "id must be positive int"})
+		return
+	}
+	ps, err := s.GetPeriodStock(c.Request.Context(), branchNo, id)
+	if err != nil {
+		if errors.Is(err, ErrNotFound) {
+			c.JSON(404, gin.H{"error": "period stock not found"})
+			return
+		}
+		c.JSON(500, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(200, ps)
+}
+
+// HTTPUpdatePeriodStock PUT /freshcheck/period/stock/:id
+func (s *Store) HTTPUpdatePeriodStock(c *gin.Context) {
+	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil || id <= 0 {
+		c.JSON(400, gin.H{"error": "id must be positive int"})
+		return
+	}
+	var req PeriodStockUpdateRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(400, gin.H{"error": "bad json: " + err.Error()})
+		return
+	}
+	if err := s.UpdatePeriodStock(c.Request.Context(), id, req.ItemName, req.Qty, req.Unit, req.Note); err != nil {
+		status := 500
+		switch {
+		case errors.Is(err, ErrInvalidInput):
+			status = 400
+		case errors.Is(err, ErrNotFound):
+			status = 404
+		}
+		c.JSON(status, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(200, gin.H{"ok": true, "id": id})
+}
+
+// HTTPDeletePeriodStock DELETE /freshcheck/period/stock/:id
+func (s *Store) HTTPDeletePeriodStock(c *gin.Context) {
+	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil || id <= 0 {
+		c.JSON(400, gin.H{"error": "id must be positive int"})
+		return
+	}
+	if err := s.DeletePeriodStock(c.Request.Context(), id); err != nil {
+		if errors.Is(err, ErrNotFound) {
+			c.JSON(404, gin.H{"error": "period stock not found"})
+			return
+		}
+		c.JSON(500, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(200, gin.H{"ok": true, "id": id})
 }

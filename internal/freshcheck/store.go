@@ -923,6 +923,246 @@ func (s *Store) GetLastEventForItem(ctx context.Context, branchNo, poolCode, ite
 	return ev, nil
 }
 
+// ============== W3.1 周期盘点 CRUD (freshcheck_period_stock) ==============
+//
+// 业务:
+//   - 每结算周期, 每生鲜 SKU 期末实物盘点一行
+//   - 是 W3.2 倒挤公式的 `end_qty` 输入
+//   - 强校验 C8: item_no 必须是非特价码的原 SKU (∉ freshcheck_pool_code.pool_code)
+//   - 不写 snap (人工录入表, 不是配置表, 不需要 snap 审计)
+//
+// 设计取舍:
+//   - Create 走 (period_id, item_no) UNIQUE 约束防重复, 冲突返 ErrDuplicateKey
+//   - Update 只允许改 (qty, item_name, unit, note), 不允许改 (period_id, item_no) —
+//     因为换周期/换 SKU 等于"录错了, 删了重录", 走 Delete + Create
+//   - Delete 是硬删 (因为这是人工录入, 没 snap, 不需要软删)
+
+func (s *Store) checkNotPoolCode(ctx context.Context, branchNo, itemNo string) error {
+	// C8 强校验: 货号不能是特价码 (否则会出现"原价跟特价混算"的逻辑错误)
+	var isPoolCode bool
+	err := s.pool.QueryRow(ctx, `
+		SELECT EXISTS(SELECT 1 FROM freshcheck_pool_code
+		              WHERE branch_no = $1 AND pool_code = $2 AND is_active = TRUE)`,
+		branchNo, itemNo).Scan(&isPoolCode)
+	if err != nil {
+		return fmt.Errorf("check pool_code: %w", err)
+	}
+	if isPoolCode {
+		return fmt.Errorf("%w: item_no %q 是特价码, 不是原 SKU (C8)", ErrInvalidInput, itemNo)
+	}
+	return nil
+}
+
+// CreatePeriodStock 创建周期盘点行
+//   业务:
+//     - stock_time 零值=now
+//     - source 缺省='h5'
+//     - confidence 缺省='high' (实时录入)
+//   错误:
+//     - (period_id, item_no) UNIQUE 冲突 → ErrDuplicateKey
+//     - item_no 是特价码 → ErrInvalidInput
+//     - period_id <= 0 → ErrInvalidInput
+//     - qty < 0 → ErrInvalidInput
+func (s *Store) CreatePeriodStock(ctx context.Context, ps *PeriodStock) error {
+	if ps.PeriodID <= 0 {
+		return fmt.Errorf("%w: period_id 必须 > 0", ErrInvalidInput)
+	}
+	if ps.ItemNo == "" {
+		return fmt.Errorf("%w: item_no required", ErrInvalidInput)
+	}
+	if ps.Operator == "" {
+		return fmt.Errorf("%w: operator required", ErrInvalidInput)
+	}
+	if ps.Qty < 0 {
+		return fmt.Errorf("%w: qty 必须 >= 0", ErrInvalidInput)
+	}
+	if err := s.checkNotPoolCode(ctx, ps.BranchNo, ps.ItemNo); err != nil {
+		return err
+	}
+	if ps.StockTime.IsZero() {
+		ps.StockTime = time.Now()
+	}
+	if ps.Source == "" {
+		ps.Source = "h5"
+	}
+	if ps.Confidence == "" {
+		ps.Confidence = "high"
+	}
+
+	var id int64
+	var createdAt time.Time
+	err := s.pool.QueryRow(ctx, `
+		INSERT INTO freshcheck_period_stock
+			(branch_no, period_id, item_no, item_name, qty, unit,
+			 stock_time, operator, confidence, source, note)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+		RETURNING id, created_at
+	`, ps.BranchNo, ps.PeriodID, ps.ItemNo, ps.ItemName, ps.Qty, ps.Unit,
+		ps.StockTime, ps.Operator, ps.Confidence, ps.Source, ps.Note).Scan(&id, &createdAt)
+	if err != nil {
+		if isUniqueViolation(err) {
+			return ErrDuplicateKey
+		}
+		return fmt.Errorf("insert period_stock: %w", err)
+	}
+	ps.ID = id
+	ps.CreatedAt = createdAt
+	return nil
+}
+
+// GetPeriodStock 单条查 by id
+func (s *Store) GetPeriodStock(ctx context.Context, branchNo string, id int64) (*PeriodStock, error) {
+	ps := &PeriodStock{}
+	err := s.pool.QueryRow(ctx, `
+		SELECT id, branch_no, period_id, item_no, item_name, qty, unit,
+		       stock_time, operator, confidence, source, note, created_at
+		FROM freshcheck_period_stock
+		WHERE branch_no = $1 AND id = $2
+	`, branchNo, id).Scan(
+		&ps.ID, &ps.BranchNo, &ps.PeriodID, &ps.ItemNo, &ps.ItemName, &ps.Qty, &ps.Unit,
+		&ps.StockTime, &ps.Operator, &ps.Confidence, &ps.Source, &ps.Note, &ps.CreatedAt,
+	)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	return ps, nil
+}
+
+// ListPeriodStocksByPeriod 列某期所有盘点行 (按 item_no 升序)
+func (s *Store) ListPeriodStocksByPeriod(ctx context.Context, branchNo string, periodID int64) ([]*PeriodStock, error) {
+	rows, err := s.pool.Query(ctx, `
+		SELECT id, branch_no, period_id, item_no, item_name, qty, unit,
+		       stock_time, operator, confidence, source, note, created_at
+		FROM freshcheck_period_stock
+		WHERE branch_no = $1 AND period_id = $2
+		ORDER BY item_no
+	`, branchNo, periodID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []*PeriodStock{}
+	for rows.Next() {
+		ps := &PeriodStock{}
+		if err := rows.Scan(
+			&ps.ID, &ps.BranchNo, &ps.PeriodID, &ps.ItemNo, &ps.ItemName, &ps.Qty, &ps.Unit,
+			&ps.StockTime, &ps.Operator, &ps.Confidence, &ps.Source, &ps.Note, &ps.CreatedAt,
+		); err != nil {
+			return nil, err
+		}
+		out = append(out, ps)
+	}
+	return out, rows.Err()
+}
+
+// UpdatePeriodStock 更新盘点 (只允许改 item_name/qty/unit/note, 不改 period_id/item_no)
+//   qty 必须 >= 0
+func (s *Store) UpdatePeriodStock(ctx context.Context, id int64, itemName string, qty float64, unit, note string) error {
+	if qty < 0 {
+		return fmt.Errorf("%w: qty 必须 >= 0", ErrInvalidInput)
+	}
+	tag, err := s.pool.Exec(ctx, `
+		UPDATE freshcheck_period_stock
+		SET item_name = $2, qty = $3, unit = $4, note = $5
+		WHERE id = $1
+	`, id, itemName, qty, unit, note)
+	if err != nil {
+		return fmt.Errorf("update period_stock: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// DeletePeriodStock 硬删盘点行
+func (s *Store) DeletePeriodStock(ctx context.Context, id int64) error {
+	tag, err := s.pool.Exec(ctx, `DELETE FROM freshcheck_period_stock WHERE id = $1`, id)
+	if err != nil {
+		return fmt.Errorf("delete period_stock: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// CheckPeriodStockCoverage 算 C8 盘点覆盖率
+//   应盘 = sku_map.is_active=TRUE
+//   已盘 = 实际录入了 period_stock 的 SKU
+//   coverage_pct = 已盘/应盘 * 100
+//   meets_c8 = coverage_pct >= threshold (default 100, 即全盘)
+func (s *Store) CheckPeriodStockCoverage(ctx context.Context, branchNo string, periodID int64) (*PeriodStockCoverage, error) {
+	// 应盘总数
+	var total int
+	err := s.pool.QueryRow(ctx, `
+		SELECT COUNT(*) FROM freshcheck_sku_map
+		WHERE branch_no = $1 AND is_active = TRUE
+	`, branchNo).Scan(&total)
+	if err != nil {
+		return nil, fmt.Errorf("count sku_map: %w", err)
+	}
+
+	// 已盘 + 缺盘 SKU 列表
+	rows, err := s.pool.Query(ctx, `
+		SELECT sm.item_no,
+		       EXISTS(SELECT 1 FROM freshcheck_period_stock ps
+		              WHERE ps.branch_no = sm.branch_no
+		                AND ps.period_id = $2
+		                AND ps.item_no = sm.item_no) AS counted
+		FROM freshcheck_sku_map sm
+		WHERE sm.branch_no = $1 AND sm.is_active = TRUE
+		ORDER BY sm.item_no
+	`, branchNo, periodID)
+	if err != nil {
+		return nil, fmt.Errorf("query missing: %w", err)
+	}
+	defer rows.Close()
+	counted := 0
+	missing := []string{}
+	for rows.Next() {
+		var itemNo string
+		var isCounted bool
+		if err := rows.Scan(&itemNo, &isCounted); err != nil {
+			return nil, err
+		}
+		if isCounted {
+			counted++
+		} else {
+			missing = append(missing, itemNo)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	// 算 coverage
+	coverage := 100.0
+	if total > 0 {
+		coverage = float64(counted) / float64(total) * 100.0
+	}
+	// 阈值
+	thr, err := s.GetThreshold(ctx, ThrC8PeriodStockCoverage)
+	if err != nil && !errors.Is(err, ErrNotFound) {
+		return nil, err
+	}
+	if thr <= 0 {
+		thr = 100.0
+	}
+
+	return &PeriodStockCoverage{
+		PeriodID:    periodID,
+		Counted:     counted,
+		Total:       total,
+		Missing:     missing,
+		CoveragePct: coverage,
+		MeetsC8:     coverage >= thr,
+	}, nil
+}
+
 // ============== helpers (W2.1) ==============
 
 func scanPoolEvents(rows pgx.Rows) ([]*PoolEvent, error) {
