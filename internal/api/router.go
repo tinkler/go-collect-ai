@@ -181,6 +181,12 @@ func NewRouter(h *handler.Handler, cfg *config.Config, restockSvc *restock.Servi
 			// 品类结算轨道
 			authed.GET("/freshcheck/config/category-tracks", auth.RequirePerm("freshcheck:settle:read"), fc.HTTPListCategoryTracks)
 			authed.PUT("/freshcheck/config/category-tracks/:fc", auth.RequirePerm("freshcheck:config:write"), fc.HTTPUpsertCategoryTrack)
+			// W2 池事件 + 池状态 + 框内差值
+			authed.POST("/freshcheck/pool/events/in", auth.RequirePerm("freshcheck:pool:write"), fc.HTTPRecordPoolEventIn)
+			authed.POST("/freshcheck/pool/events/out", auth.RequirePerm("freshcheck:pool:write"), fc.HTTPRecordPoolEventOut)
+			authed.GET("/freshcheck/pool/events", auth.RequirePerm("freshcheck:settle:read"), fc.HTTPListPoolEvents)
+			authed.GET("/freshcheck/pool/state", auth.RequirePerm("freshcheck:settle:read"), fc.HTTPGetPoolState)
+			authed.GET("/freshcheck/pool/diff", auth.RequirePerm("freshcheck:settle:read"), fc.HTTPGetPoolDiff)
 
 			// ============== Admin 权限管理 (2026-08-30) ==============
 			rbacH := rbac.NewHandler(rbacStore)

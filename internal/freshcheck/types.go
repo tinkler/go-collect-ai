@@ -432,14 +432,18 @@ type ConfigSnap struct {
 // ============== 6. 业务响应 struct (HTTP API 用) ==============
 
 // PoolStateItem 池状态重建 (GET /pool/state) 单 SKU
+//   算法用 (内部累加字段) + API response 字段
 type PoolStateItem struct {
 	ItemNo          string    `json:"item_no"`
 	ItemName        string    `json:"item_name"`
 	InWeightKg      float64   `json:"in_weight_kg"`
 	OutWeightKg     float64   `json:"out_weight_kg"`
+	SpoiledWeightKg float64   `json:"spoiled_weight_kg"` // 业务独立: 报损量不计 in/out
 	CurrentWeightKg float64   `json:"current_weight_kg"`
 	Confidence      string    `json:"confidence"`
 	LastEventTime   time.Time `json:"last_event_time"`
+	HasOpenIn       bool      `json:"has_open_in"`  // 漏录标记
+	HasOpenOut      bool      `json:"has_open_out"` // 漏录标记
 }
 
 // PoolState 池状态 (任意时刻)
@@ -450,7 +454,9 @@ type PoolState struct {
 	Items           []PoolStateItem `json:"items"`
 	InTotalKg       float64         `json:"in_total_kg"`
 	OutTotalKg      float64         `json:"out_total_kg"`
+	SpoiledTotalKg  float64         `json:"spoiled_total_kg"`
 	CurrentTotalKg  float64         `json:"current_total_kg"`
+	MissingInCount  int             `json:"missing_in_count"`
 }
 
 // SettleRequest 触发结算请求

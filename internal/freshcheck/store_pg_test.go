@@ -378,6 +378,289 @@ func TestConfigSnap_WriteOnUpdate(t *testing.T) {
 	_ = s.UpdateThreshold(ctx(), key, oldVal, "u_snap_test")
 }
 
+// ============== 7. freshcheck_pool_event (W2.1) ==============
+
+// helper: 准备一个特价码 + SKU 映射 (RecordPoolEventIn 需要校验)
+func setupPoolAndSku(t *testing.T, s *Store) {
+	t.Helper()
+	pc := &PoolCode{
+		BranchNo: "TEST", PoolCode: "TESTPOOL", PoolName: "1元/斤",
+		PricingMode: "weight", UnitPrice: 1.0, PriorityRank: 0, IsActive: true,
+	}
+	if err := s.UpsertPoolCode(ctx(), pc); err != nil {
+		t.Fatalf("seed pool: %v", err)
+	}
+	sm := &SkuMap{
+		BranchNo: "TEST", ItemNo: "TESTSKU1", ItemName: "test spinach",
+		FreshCategory: "leaf", TurnoverClass: "fast", ShelfLifeDays: 5, IsActive: true,
+	}
+	if err := s.UpsertSkuMap(ctx(), sm); err != nil {
+		t.Fatalf("seed sku: %v", err)
+	}
+}
+
+func teardownPoolEvents(t *testing.T, s *Store) {
+	t.Helper()
+	_, _ = s.pool.Exec(ctx(), `DELETE FROM freshcheck_pool_event WHERE branch_no = 'TEST'`)
+}
+
+func TestPoolEvent_RecordIn_OK(t *testing.T) {
+	pool := setupTestPool(t)
+	s := NewStore(pool)
+	defer teardownPoolEvents(t, s)
+	setupPoolAndSku(t, s)
+
+	eventTime := time.Now().Add(-1 * time.Hour)
+	ev, err := s.RecordPoolEventIn(ctx(), "TEST", "TESTPOOL", "TESTSKU1",
+		0.5, 0, "u_floor", eventTime, "high", "")
+	if err != nil {
+		t.Fatalf("RecordPoolEventIn: %v", err)
+	}
+	if ev.ID == 0 {
+		t.Error("ID should be set")
+	}
+	if ev.EventKind != PoolEventIn {
+		t.Errorf("EventKind = %s, want in", ev.EventKind)
+	}
+	if ev.WeightKg != 0.5 {
+		t.Errorf("WeightKg = %f, want 0.5", ev.WeightKg)
+	}
+	if ev.Confidence != "high" {
+		t.Errorf("Confidence = %s, want high", ev.Confidence)
+	}
+}
+
+func TestPoolEvent_RecordIn_InvalidPool(t *testing.T) {
+	pool := setupTestPool(t)
+	s := NewStore(pool)
+	defer teardownPoolEvents(t, s)
+	setupPoolAndSku(t, s)
+
+	// POOL 不存在
+	_, err := s.RecordPoolEventIn(ctx(), "TEST", "NONEXIST", "TESTSKU1",
+		0.5, 0, "u_floor", time.Now(), "high", "")
+	if err == nil {
+		t.Error("不存在的 pool_code 应返 ErrInvalidInput")
+	}
+}
+
+func TestPoolEvent_RecordIn_InvalidSku(t *testing.T) {
+	pool := setupTestPool(t)
+	s := NewStore(pool)
+	defer teardownPoolEvents(t, s)
+	setupPoolAndSku(t, s)
+
+	// SKU 不存在
+	_, err := s.RecordPoolEventIn(ctx(), "TEST", "TESTPOOL", "NONEXIST_SKU",
+		0.5, 0, "u_floor", time.Now(), "high", "")
+	if err == nil {
+		t.Error("不存在的 sku 应返 ErrInvalidInput")
+	}
+}
+
+func TestPoolEvent_RecordIn_ConfidenceLow(t *testing.T) {
+	pool := setupTestPool(t)
+	s := NewStore(pool)
+	defer teardownPoolEvents(t, s)
+	setupPoolAndSku(t, s)
+
+	ev, err := s.RecordPoolEventIn(ctx(), "TEST", "TESTPOOL", "TESTSKU1",
+		0.5, 0, "u_floor", time.Now(), "low", "补录")
+	if err != nil {
+		t.Fatalf("RecordPoolEventIn: %v", err)
+	}
+	if ev.Confidence != "low" {
+		t.Errorf("Confidence = %s, want low", ev.Confidence)
+	}
+	if ev.Note != "补录" {
+		t.Errorf("Note = %s, want 补录", ev.Note)
+	}
+}
+
+func TestPoolEvent_RecordIn_DuplicateUnique(t *testing.T) {
+	pool := setupTestPool(t)
+	s := NewStore(pool)
+	defer teardownPoolEvents(t, s)
+	setupPoolAndSku(t, s)
+
+	eventTime := time.Now().Add(-2 * time.Hour)
+	_, err := s.RecordPoolEventIn(ctx(), "TEST", "TESTPOOL", "TESTSKU1",
+		0.5, 0, "u_floor", eventTime, "high", "")
+	if err != nil {
+		t.Fatalf("first insert: %v", err)
+	}
+	// 同 (branch, pool, item, kind, time) 重复 → ErrDuplicateKey
+	_, err = s.RecordPoolEventIn(ctx(), "TEST", "TESTPOOL", "TESTSKU1",
+		0.3, 0, "u_floor", eventTime, "high", "")
+	if err != ErrDuplicateKey {
+		t.Errorf("重复应返 ErrDuplicateKey, got %v", err)
+	}
+}
+
+func TestPoolEvent_RecordOut_AllDestinations(t *testing.T) {
+	pool := setupTestPool(t)
+	s := NewStore(pool)
+	defer teardownPoolEvents(t, s)
+	setupPoolAndSku(t, s)
+
+	// 准备 4 个 SKU (对应 4 种去向)
+	for i, it := range []string{"TESTSKU1", "TESTSKU2", "TESTSKU3", "TESTSKU4"} {
+		sm := &SkuMap{
+			BranchNo: "TEST", ItemNo: it, ItemName: "test",
+			FreshCategory: "leaf", TurnoverClass: "fast", ShelfLifeDays: 5, IsActive: true,
+		}
+		_ = s.UpsertSkuMap(ctx(), sm)
+		_ = i // dummy
+	}
+	// 准备降级目标特价码
+	pc2 := &PoolCode{
+		BranchNo: "TEST", PoolCode: "TESTPOOL_LOW", PoolName: "0.5元/斤",
+		PricingMode: "weight", UnitPrice: 0.5, PriorityRank: 1, IsActive: true,
+	}
+	_ = s.UpsertPoolCode(ctx(), pc2)
+
+	// 录 4 条 in (避免漏录)
+	for _, it := range []string{"TESTSKU1", "TESTSKU2", "TESTSKU3", "TESTSKU4"} {
+		_, _ = s.RecordPoolEventIn(ctx(), "TEST", "TESTPOOL", it,
+			0.5, 0, "u_floor", time.Now().Add(-12*time.Hour), "high", "")
+	}
+
+	// 出框
+	items := []PoolOutItem{
+		{ItemNo: "TESTSKU1", WeightKg: 0, OutDestination: DestSoldOut},
+		{ItemNo: "TESTSKU2", WeightKg: 0, OutDestination: DestSpoiled, SpoiledWeightKg: 0.3},
+		{ItemNo: "TESTSKU3", WeightKg: 0.2, OutDestination: DestReturnShelf},
+		{ItemNo: "TESTSKU4", WeightKg: 0.4, OutDestination: DestDowngrade, DowngradeTo: "TESTPOOL_LOW"},
+	}
+	created, missing, err := s.RecordPoolEventOut(ctx(), "TEST", "TESTPOOL",
+		items, "u_floor", time.Now())
+	if err != nil {
+		t.Fatalf("RecordPoolEventOut: %v", err)
+	}
+	if created != 4 {
+		t.Errorf("created = %d, want 4", created)
+	}
+	if len(missing) != 0 {
+		t.Errorf("不应该有 missing, got %d", len(missing))
+	}
+}
+
+func TestPoolEvent_RecordOut_DetectMissing(t *testing.T) {
+	pool := setupTestPool(t)
+	s := NewStore(pool)
+	defer teardownPoolEvents(t, s)
+	setupPoolAndSku(t, s)
+
+	// 直接录 out, 不录 in → 应触发 missingIn
+	items := []PoolOutItem{
+		{ItemNo: "TESTSKU1", WeightKg: 0.5, OutDestination: DestSoldOut},
+	}
+	created, missing, err := s.RecordPoolEventOut(ctx(), "TEST", "TESTPOOL",
+		items, "u_floor", time.Now())
+	if err != nil {
+		t.Fatalf("RecordPoolEventOut: %v", err)
+	}
+	if created != 1 {
+		t.Errorf("created = %d, want 1", created)
+	}
+	if len(missing) != 1 {
+		t.Fatalf("missing = %d, want 1", len(missing))
+	}
+	if missing[0].ItemNo != "TESTSKU1" {
+		t.Errorf("missing item = %s, want TESTSKU1", missing[0].ItemNo)
+	}
+	if missing[0].SuggestedInWeight != 0.5 {
+		t.Errorf("suggested weight = %f, want 0.5", missing[0].SuggestedInWeight)
+	}
+}
+
+func TestPoolEvent_RecordOut_InvalidDestination(t *testing.T) {
+	pool := setupTestPool(t)
+	s := NewStore(pool)
+	defer teardownPoolEvents(t, s)
+	setupPoolAndSku(t, s)
+	_, _ = s.RecordPoolEventIn(ctx(), "TEST", "TESTPOOL", "TESTSKU1",
+		0.5, 0, "u_floor", time.Now().Add(-1*time.Hour), "high", "")
+
+	items := []PoolOutItem{
+		{ItemNo: "TESTSKU1", WeightKg: 0, OutDestination: "invalid_dest"},
+	}
+	_, _, err := s.RecordPoolEventOut(ctx(), "TEST", "TESTPOOL",
+		items, "u_floor", time.Now())
+	if err == nil {
+		t.Error("无效 out_destination 应返 ErrInvalidInput")
+	}
+}
+
+func TestPoolEvent_RecordOut_DowngradeRequiresTarget(t *testing.T) {
+	pool := setupTestPool(t)
+	s := NewStore(pool)
+	defer teardownPoolEvents(t, s)
+	setupPoolAndSku(t, s)
+	_, _ = s.RecordPoolEventIn(ctx(), "TEST", "TESTPOOL", "TESTSKU1",
+		0.5, 0, "u_floor", time.Now().Add(-1*time.Hour), "high", "")
+
+	items := []PoolOutItem{
+		{ItemNo: "TESTSKU1", WeightKg: 0.5, OutDestination: DestDowngrade}, // 缺 downgrade_to
+	}
+	_, _, err := s.RecordPoolEventOut(ctx(), "TEST", "TESTPOOL",
+		items, "u_floor", time.Now())
+	if err == nil {
+		t.Error("降级转框缺 downgrade_to 应返 ErrInvalidInput")
+	}
+}
+
+func TestPoolEvent_ListByPool(t *testing.T) {
+	pool := setupTestPool(t)
+	s := NewStore(pool)
+	defer teardownPoolEvents(t, s)
+	setupPoolAndSku(t, s)
+
+	// 录 2 in 1 out
+	now := time.Now()
+	_, _ = s.RecordPoolEventIn(ctx(), "TEST", "TESTPOOL", "TESTSKU1",
+		0.5, 0, "u_floor", now.Add(-2*time.Hour), "high", "")
+	_, _ = s.RecordPoolEventIn(ctx(), "TEST", "TESTPOOL", "TESTSKU1",
+		0.3, 0, "u_floor", now.Add(-1*time.Hour), "high", "")
+
+	events, err := s.ListPoolEventsByPool(ctx(), "TEST", "TESTPOOL",
+		now.Add(-3*time.Hour), now.Add(1*time.Hour))
+	if err != nil {
+		t.Fatalf("ListPoolEventsByPool: %v", err)
+	}
+	if len(events) != 2 {
+		t.Errorf("events = %d, want 2", len(events))
+	}
+	// 按时间序
+	if events[0].WeightKg != 0.5 {
+		t.Errorf("events[0].WeightKg = %f, want 0.5", events[0].WeightKg)
+	}
+	if events[1].WeightKg != 0.3 {
+		t.Errorf("events[1].WeightKg = %f, want 0.3", events[1].WeightKg)
+	}
+}
+
+func TestPoolEvent_GetLastEventForItem(t *testing.T) {
+	pool := setupTestPool(t)
+	s := NewStore(pool)
+	defer teardownPoolEvents(t, s)
+	setupPoolAndSku(t, s)
+
+	now := time.Now()
+	_, _ = s.RecordPoolEventIn(ctx(), "TEST", "TESTPOOL", "TESTSKU1",
+		0.5, 0, "u_floor", now.Add(-2*time.Hour), "high", "")
+	_, _ = s.RecordPoolEventIn(ctx(), "TEST", "TESTPOOL", "TESTSKU1",
+		0.3, 0, "u_floor", now.Add(-1*time.Hour), "high", "")
+
+	last, err := s.GetLastEventForItem(ctx(), "TEST", "TESTPOOL", "TESTSKU1")
+	if err != nil {
+		t.Fatalf("GetLastEventForItem: %v", err)
+	}
+	if last.WeightKg != 0.3 {
+		t.Errorf("last.WeightKg = %f, want 0.3 (最近一次)", last.WeightKg)
+	}
+}
+
 // ============== helpers ==============
 
 func ctx() context.Context {

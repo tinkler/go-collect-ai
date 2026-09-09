@@ -656,3 +656,336 @@ func (s *Store) UpdateLastSettleAt(ctx context.Context, id int64, t time.Time) e
 	`, t, id)
 	return err
 }
+
+// ============== 6. freshcheck_pool_event (W2.1) ==============
+//
+// 特价池事件: 入框 / 出框
+//   UNIQUE (branch_no, pool_code, item_no, event_kind, event_time) 防重复
+//   入框 = 打称时刻, 出框 = 早晨检查时刻
+//   兜底: 补录事件 confidence=low (由 DetectMissingIn 配合 RecordOutEvent 触发)
+
+// RecordPoolEventIn 录入一次入框事件
+//   业务:
+//     - 员工把某 SKU 放上条码秤、选特价档、打称
+//     - 入框 = 打称时刻
+//     - 计件模式: weight_kg = 0, piece_count = N
+//     - 称重模式: weight_kg = 实测, piece_count = 0
+//   入参:
+//     eventTime: 业务时刻 (打称时刻), 缺省=now
+//     confidence: 实时=high, 补录=low
+//   返回: 完整 PoolEvent (含 DB 自动生成的 id / recorded_at)
+//   错误:
+//     - 同 (branch, pool, item, kind, time) UNIQUE 冲突 → ErrDuplicateKey
+//     - pool_code 不在 freshcheck_pool_code → ErrInvalidInput
+//     - item_no 不在 freshcheck_sku_map → ErrInvalidInput
+func (s *Store) RecordPoolEventIn(
+	ctx context.Context,
+	branchNo, poolCode, itemNo string,
+	weightKg float64, pieceCount int,
+	operator string,
+	eventTime time.Time,
+	confidence string,
+	operatorName string,
+) (*PoolEvent, error) {
+	if poolCode == "" || itemNo == "" || operator == "" {
+		return nil, fmt.Errorf("%w: pool_code/item_no/operator required", ErrInvalidInput)
+	}
+	if confidence == "" {
+		confidence = ConfidenceHigh
+	}
+	if confidence != ConfidenceHigh && confidence != ConfidenceLow {
+		return nil, fmt.Errorf("%w: confidence 必须 high/low", ErrInvalidInput)
+	}
+	if eventTime.IsZero() {
+		eventTime = time.Now()
+	}
+
+	// 校验 pool_code 存在
+	var poolExists bool
+	err := s.pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM freshcheck_pool_code WHERE branch_no=$1 AND pool_code=$2)`,
+		branchNo, poolCode).Scan(&poolExists)
+	if err != nil {
+		return nil, fmt.Errorf("check pool_code: %w", err)
+	}
+	if !poolExists {
+		return nil, fmt.Errorf("%w: pool_code %q 不在 freshcheck_pool_code", ErrInvalidInput, poolCode)
+	}
+	// 校验 item_no 在 sku_map
+	var skuExists bool
+	err = s.pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM freshcheck_sku_map WHERE branch_no=$1 AND item_no=$2 AND is_active=TRUE)`,
+		branchNo, itemNo).Scan(&skuExists)
+	if err != nil {
+		return nil, fmt.Errorf("check sku_map: %w", err)
+	}
+	if !skuExists {
+		return nil, fmt.Errorf("%w: item_no %q 不在 freshcheck_sku_map", ErrInvalidInput, itemNo)
+	}
+
+	// INSERT
+	row := s.pool.QueryRow(ctx, `
+		INSERT INTO freshcheck_pool_event
+			(branch_no, pool_code, item_no, event_kind, event_time, weight_kg, piece_count,
+			 operator, confidence, source, note)
+		VALUES ($1, $2, $3, 'in', $4, $5, $6, $7, $8, 'h5', $9)
+		RETURNING id, recorded_at
+	`, branchNo, poolCode, itemNo, eventTime, weightKg, pieceCount, operator, confidence, operatorName)
+
+	ev := &PoolEvent{
+		BranchNo: branchNo, PoolCode: poolCode, ItemNo: itemNo,
+		EventKind: PoolEventIn, EventTime: eventTime,
+		WeightKg: weightKg, PieceCount: pieceCount,
+		Operator: operator, Confidence: confidence,
+		Source: SourceH5, Note: operatorName,
+	}
+	err = row.Scan(&ev.ID, &ev.RecordedAt)
+	if err != nil {
+		// UNIQUE 冲突
+		if isUniqueViolation(err) {
+			return nil, ErrDuplicateKey
+		}
+		return nil, fmt.Errorf("insert pool_event: %w", err)
+	}
+	return ev, nil
+}
+
+// RecordPoolEventOut 录入一次出框事件 (含兜底检测)
+//   业务:
+//     - 早晨员工检查特价框, 逐 SKU 填剩余量 + 去向
+//     - 出框 = 早晨检查时刻 (event_time)
+//     - 多 SKU 一起录 (在 HTTP 层循环调用本方法, 或直接 INSERT 多行)
+//   入参:
+//     items: []PoolOutItem (单 SKU)
+//     eventTime: 早晨检查时刻
+//   兜底:
+//     返回值中的 MissingInRecords: 该时间点, 池里有 out 但没 in 的 SKU 列表
+//     调用方应现场补录 in 事件 (confidence=low) 后重提
+func (s *Store) RecordPoolEventOut(
+	ctx context.Context,
+	branchNo, poolCode string,
+	items []PoolOutItem,
+	operator string,
+	eventTime time.Time,
+) (eventsCreated int, missingIn []MissingRec, err error) {
+	if poolCode == "" || operator == "" {
+		return 0, nil, fmt.Errorf("%w: pool_code/operator required", ErrInvalidInput)
+	}
+	if eventTime.IsZero() {
+		eventTime = time.Now()
+	}
+	if len(items) == 0 {
+		return 0, nil, fmt.Errorf("%w: items 必须非空", ErrInvalidInput)
+	}
+
+	// 校验 pool_code
+	var poolExists bool
+	err = s.pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM freshcheck_pool_code WHERE branch_no=$1 AND pool_code=$2)`,
+		branchNo, poolCode).Scan(&poolExists)
+	if err != nil {
+		return 0, nil, fmt.Errorf("check pool_code: %w", err)
+	}
+	if !poolExists {
+		return 0, nil, fmt.Errorf("%w: pool_code %q 不存在", ErrInvalidInput, poolCode)
+	}
+
+	// 1. 漏录检测: 查该 pool 在 event_time 之前所有 unclosed in 事件
+	//    unclosed = 没对应 out 事件 (in 在前, 后面没 out)
+	//    业务: 出框检查时, 如果池里仍有 in 没 out, 这就是漏录 (出框时间 event_time)
+	//    简化: 拉出 event_time 之前 24h 内所有 in 事件, 看哪些 item_no 在 items 里但没 in 事件
+	//    实际更严: 拉所有 in 事件 (因为 in 可能很早), 跟 items 里的 item_no 比对
+	missingIn = []MissingRec{}
+	for _, it := range items {
+		var inCount int
+		err = s.pool.QueryRow(ctx, `
+			SELECT COUNT(*) FROM freshcheck_pool_event
+			WHERE branch_no=$1 AND pool_code=$2 AND item_no=$3
+			  AND event_kind='in' AND event_time <= $4
+		`, branchNo, poolCode, it.ItemNo, eventTime).Scan(&inCount)
+		if err != nil {
+			return 0, nil, fmt.Errorf("check missing_in: %w", err)
+		}
+		if inCount == 0 {
+			// 漏录: 池里出现 out 但没对应 in
+			// 建议补录 in 时间 = 昨天傍晚 (按业务经验)
+			suggestedTime := eventTime.Add(-12 * time.Hour)
+			missingIn = append(missingIn, MissingRec{
+				ItemNo:           it.ItemNo,
+				SuggestedInWeight: it.WeightKg + it.SpoiledWeightKg,
+				SuggestedInTime:   suggestedTime,
+			})
+		}
+	}
+
+	// 2. 批量 INSERT out 事件
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return 0, missingIn, fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.Rollback(ctx)
+
+	eventsCreated = 0
+	for _, it := range items {
+		// 校验 item 在 sku_map
+		var skuExists bool
+		err = tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM freshcheck_sku_map WHERE branch_no=$1 AND item_no=$2 AND is_active=TRUE)`,
+			branchNo, it.ItemNo).Scan(&skuExists)
+		if err != nil {
+			return eventsCreated, missingIn, fmt.Errorf("check sku: %w", err)
+		}
+		if !skuExists {
+			return eventsCreated, missingIn, fmt.Errorf("%w: item_no %q 不在 sku_map", ErrInvalidInput, it.ItemNo)
+		}
+		// 校验 out_destination
+		if it.OutDestination == "" {
+			return eventsCreated, missingIn, fmt.Errorf("%w: out_destination 必填", ErrInvalidInput)
+		}
+		validDest := false
+		for _, d := range AllOutDestinations {
+			if it.OutDestination == d {
+				validDest = true
+				break
+			}
+		}
+		if !validDest {
+			return eventsCreated, missingIn, fmt.Errorf("%w: out_destination %q 无效 (允许: %v)", ErrInvalidInput, it.OutDestination, AllOutDestinations)
+		}
+		// 校验降级转框时必须填 downgrade_to
+		if it.OutDestination == DestDowngrade && it.DowngradeTo == "" {
+			return eventsCreated, missingIn, fmt.Errorf("%w: downgraded 必须填 downgrade_to", ErrInvalidInput)
+		}
+
+		// 业务 weight: 剩余 = 实际重 (转 sold_out/return/downgrade),
+		//             spoiled = 报损 (spoiled 时填)
+		// 数据库 weight_kg: 记剩余 (供框内差值算分母)
+		weightToRecord := it.WeightKg
+		_, err = tx.Exec(ctx, `
+			INSERT INTO freshcheck_pool_event
+				(branch_no, pool_code, item_no, event_kind, event_time, weight_kg, piece_count,
+				 out_destination, downgrade_to, operator, confidence, source, note)
+			VALUES ($1, $2, $3, 'out', $4, $5, 0, $6, $7, $8, 'high', 'h5', '')
+		`, branchNo, poolCode, it.ItemNo, eventTime, weightToRecord, it.OutDestination, nullableString(it.DowngradeTo), operator)
+		if err != nil {
+			if isUniqueViolation(err) {
+				return eventsCreated, missingIn, ErrDuplicateKey
+			}
+			return eventsCreated, missingIn, fmt.Errorf("insert out event: %w", err)
+		}
+		eventsCreated++
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return eventsCreated, missingIn, fmt.Errorf("commit: %w", err)
+	}
+	return eventsCreated, missingIn, nil
+}
+
+// ListPoolEventsByPool 查某框某窗口内所有事件 (按时间序)
+//   给 GET /pool/state 和框内差值用
+func (s *Store) ListPoolEventsByPool(ctx context.Context, branchNo, poolCode string, from, to time.Time) ([]*PoolEvent, error) {
+	rows, err := s.pool.Query(ctx, `
+		SELECT id, branch_no, pool_code, item_no, event_kind, event_time, recorded_at,
+		       weight_kg, piece_count, out_destination, downgrade_to,
+		       operator, confidence, source, note
+		FROM freshcheck_pool_event
+		WHERE branch_no=$1 AND pool_code=$2
+		  AND event_time >= $3 AND event_time < $4
+		ORDER BY event_time ASC, id ASC
+	`, branchNo, poolCode, from, to)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanPoolEvents(rows)
+}
+
+// GetLastEventForItem 查某 SKU 在某框最近一次事件 (任意 kind)
+func (s *Store) GetLastEventForItem(ctx context.Context, branchNo, poolCode, itemNo string) (*PoolEvent, error) {
+	row := s.pool.QueryRow(ctx, `
+		SELECT id, branch_no, pool_code, item_no, event_kind, event_time, recorded_at,
+		       weight_kg, piece_count, out_destination, downgrade_to,
+		       operator, confidence, source, note
+		FROM freshcheck_pool_event
+		WHERE branch_no=$1 AND pool_code=$2 AND item_no=$3
+		ORDER BY event_time DESC LIMIT 1
+	`, branchNo, poolCode, itemNo)
+	ev := &PoolEvent{}
+	var outDest, downgradeTo *string
+	err := row.Scan(&ev.ID, &ev.BranchNo, &ev.PoolCode, &ev.ItemNo, &ev.EventKind, &ev.EventTime, &ev.RecordedAt,
+		&ev.WeightKg, &ev.PieceCount, &outDest, &downgradeTo,
+		&ev.Operator, &ev.Confidence, &ev.Source, &ev.Note)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	ev.OutDestination = outDest
+	ev.DowngradeTo = downgradeTo
+	return ev, nil
+}
+
+// ============== helpers (W2.1) ==============
+
+func scanPoolEvents(rows pgx.Rows) ([]*PoolEvent, error) {
+	out := []*PoolEvent{}
+	for rows.Next() {
+		ev := &PoolEvent{}
+		var outDest, downgradeTo *string
+		if err := rows.Scan(&ev.ID, &ev.BranchNo, &ev.PoolCode, &ev.ItemNo, &ev.EventKind, &ev.EventTime, &ev.RecordedAt,
+			&ev.WeightKg, &ev.PieceCount, &outDest, &downgradeTo,
+			&ev.Operator, &ev.Confidence, &ev.Source, &ev.Note); err != nil {
+			return nil, err
+		}
+		ev.OutDestination = outDest
+		ev.DowngradeTo = downgradeTo
+		out = append(out, ev)
+	}
+	return out, rows.Err()
+}
+
+func nullableString(s string) any {
+	if s == "" {
+		return nil
+	}
+	return s
+}
+
+func isUniqueViolation(err error) bool {
+	// pgx 错误码 23505 = unique_violation
+	if err == nil {
+		return false
+	}
+	// pgx.PgError 类型断言
+	type pgError interface {
+		SQLState() string
+	}
+	if e, ok := err.(pgError); ok {
+		return e.SQLState() == "23505"
+	}
+	// 兜底: 字符串匹配
+	return errStringContains(err, "duplicate key", "23505")
+}
+
+func errStringContains(err error, substrs ...string) bool {
+	if err == nil {
+		return false
+	}
+	s := err.Error()
+	for _, sub := range substrs {
+		if containsSubstring(s, sub) {
+			return true
+		}
+	}
+	return false
+}
+
+func containsSubstring(s, sub string) bool {
+	if len(sub) == 0 {
+		return true
+	}
+	for i := 0; i+len(sub) <= len(s); i++ {
+		if s[i:i+len(sub)] == sub {
+			return true
+		}
+	}
+	return false
+}
