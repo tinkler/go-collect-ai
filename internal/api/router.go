@@ -196,6 +196,8 @@ func NewRouter(h *handler.Handler, cfg *config.Config, restockSvc *restock.Servi
 			authed.DELETE("/freshcheck/period/stock/:id", auth.RequirePerm("freshcheck:pool:write"), fc.HTTPDeletePeriodStock)
 			// W3.4 6 步流程编排
 			authed.POST("/freshcheck/settle/run", auth.RequirePerm("freshcheck:settle:run"), freshcheckService.HTTPRunSettlement)
+			// W3.5 R5 异常清单 (alerts 报表)
+			authed.GET("/freshcheck/settle/periods/:id/alerts", auth.RequirePerm("freshcheck:settle:read"), freshcheckService.HTTPListAlerts)
 
 			// ============== Admin 权限管理 (2026-08-30) ==============
 			rbacH := rbac.NewHandler(rbacStore)

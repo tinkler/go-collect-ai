@@ -468,3 +468,30 @@ func (s *Service) HTTPRunSettlement(c *gin.Context) {
 	c.JSON(200, res)
 }
 
+
+
+// ============== W3.5 R5 异常清单 ==============
+
+// HTTPListAlerts GET /freshcheck/settle/periods/:id/alerts (R5 报表)
+//   权限: freshcheck:settle:read
+//   响应: alerts 列表
+func (s *Service) HTTPListAlerts(c *gin.Context) {
+	branchNo := c.DefaultQuery("branch_no", "0001")
+	periodID, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil || periodID <= 0 {
+		c.JSON(400, gin.H{"error": "id must be positive int"})
+		return
+	}
+	alerts, err := s.Store.ListAlertsByPeriod(c.Request.Context(), branchNo, periodID)
+	if err != nil {
+		c.JSON(500, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(200, gin.H{
+		"branch_no": branchNo,
+		"period_id": periodID,
+		"count":     len(alerts),
+		"alerts":    alerts,
+	})
+}
+

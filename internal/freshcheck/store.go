@@ -1235,6 +1235,61 @@ func (s *Store) InsertAlloc(ctx context.Context, a *Alloc) error {
 	return nil
 }
 
+// InsertAlert 写 freshcheck_alert (R5 异常清单, C1-C8 校验结果)
+//   payload 序列化为 JSON (handler 端读为 string 存)
+func (s *Store) InsertAlert(ctx context.Context, al *Alert) error {
+	if al.Payload == "" {
+		al.Payload = "{}"
+	}
+	var id int64
+	var createdAt time.Time
+	err := s.pool.QueryRow(ctx, `
+		INSERT INTO freshcheck_alert
+			(branch_no, period_id, rule_code, severity, entity_type, entity_id,
+			 message, payload, status, override_by, override_reason, override_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+		RETURNING id, created_at
+	`, al.BranchNo, al.PeriodID, al.RuleCode, al.Severity, al.EntityType, al.EntityID,
+		al.Message, al.Payload, al.Status, al.OverrideBy, al.OverrideReason, al.OverrideAt,
+	).Scan(&id, &createdAt)
+	if err != nil {
+		return fmt.Errorf("insert alert: %w", err)
+	}
+	al.ID = id
+	al.CreatedAt = createdAt
+	return nil
+}
+
+// ListAlertsByPeriod 查某期所有 alert (R5 报表)
+func (s *Store) ListAlertsByPeriod(ctx context.Context, branchNo string, periodID int64) ([]*Alert, error) {
+	rows, err := s.pool.Query(ctx, `
+		SELECT id, branch_no, period_id, rule_code, severity, entity_type, entity_id,
+		       message, payload, status, override_by, override_reason, override_at, created_at
+		FROM freshcheck_alert
+		WHERE branch_no = $1 AND period_id = $2
+		ORDER BY created_at DESC
+	`, branchNo, periodID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []*Alert{}
+	for rows.Next() {
+		al := &Alert{}
+		var pid *int64
+		var overrideAt *time.Time
+		if err := rows.Scan(&al.ID, &al.BranchNo, &pid, &al.RuleCode, &al.Severity,
+			&al.EntityType, &al.EntityID, &al.Message, &al.Payload, &al.Status,
+			&al.OverrideBy, &al.OverrideReason, &overrideAt, &al.CreatedAt); err != nil {
+			return nil, err
+		}
+		al.PeriodID = pid
+		al.OverrideAt = overrideAt
+		out = append(out, al)
+	}
+	return out, rows.Err()
+}
+
 // ============== helpers (W2.1) ==============
 
 func scanPoolEvents(rows pgx.Rows) ([]*PoolEvent, error) {

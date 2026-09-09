@@ -97,6 +97,10 @@ func (s *Service) RunSettlement(ctx context.Context, req SettleRequest) (*Settle
 		return nil, fmt.Errorf("step 6 writeSettlements: %w", err)
 	}
 
+	// W3.5 7 校验 + 写 alert
+	vr, _ := s.RunValidation(ctx, req, allocRes, bfResult)
+	_ = vr // 即使 block 也不中断返回 (W3.4 编排)
+
 	// 汇总
 	return &SettleResult{
 		PeriodID:    req.PeriodID,
