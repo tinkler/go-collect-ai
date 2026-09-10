@@ -176,15 +176,14 @@ func TestCube_SalesWithRefundInWindow_CallsCorrectCube(t *testing.T) {
 
 func TestCube_PurchasesInWindow_ParsesRows(t *testing.T) {
 	mc := newMockCube()
+	// 2026-09-10: 走 measure 聚合后, mock 用 total_qty/total_cost (cube 端 GROUP BY item_no 结果)
 	mc.defaultRows = []map[string]any{
 		{
-			"purchases.item_no":     "6901028001234",
-			"purchases.item_name":   "菠菜",
-			"purchases.voucher_no":  "PI20260901001",
-			"purchases.real_qty":    10.0,
-			"purchases.cost_price":  2.5,
-			"purchases.total_cost":  25.0,
-			"purchases.oper_date":   "2026-09-01 08:00:00",
+			"purchases.item_no":    "6901028001234",
+			"purchases.item_name":  "菠菜",
+			"purchases.count":      3.0,   // 3 笔入库单
+			"purchases.total_qty":  10.0,  // SUM(real_qty)
+			"purchases.total_cost": 25.0,  // SUM(real_qty*cost_price)
 		},
 	}
 	q := newTestCubeQuerier(mc)
@@ -205,13 +204,18 @@ func TestCube_PurchasesInWindow_ParsesRows(t *testing.T) {
 	if r.RealQty != 10.0 {
 		t.Errorf("RealQty = %f, want 10.0", r.RealQty)
 	}
+	if r.TotalCost != 25.0 {
+		t.Errorf("TotalCost = %f, want 25.0", r.TotalCost)
+	}
+	// 派生 cost_price = total_cost / total_qty = 25/10 = 2.5
 	if r.CostPrice != 2.5 {
-		t.Errorf("CostPrice = %f, want 2.5", r.CostPrice)
+		t.Errorf("CostPrice = %f, want 2.5 (派生自 total_cost/total_qty)", r.CostPrice)
 	}
-	if r.VoucherNo != "PI20260901001" {
-		t.Errorf("VoucherNo = %s, want PI20260901001", r.VoucherNo)
+	// 聚合后 voucher_no/oper_date 留空
+	if r.VoucherNo != "" {
+		t.Errorf("VoucherNo = %q, want empty (聚合后无单据号)", r.VoucherNo)
 	}
-	if r.OperDate.IsZero() {
+	if !r.OperDate.IsZero() {
 		t.Error("OperDate 未解析")
 	}
 

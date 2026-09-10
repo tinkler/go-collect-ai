@@ -410,6 +410,12 @@ func (w *Client) readLoop() error {
 			}
 		}
 
+		// 2026-09-10: 防恶意/异常大帧导致 makeslice: len out of range
+		// server-to-client 按 WS 协议不应 mask, payload 1MiB 上限够用
+		const maxFrame = 1 << 20
+		if payloadLen < 0 || payloadLen > maxFrame {
+			return fmt.Errorf("ws frame too large: %d", payloadLen)
+		}
 		payload := make([]byte, payloadLen)
 		if payloadLen > 0 {
 			if _, err := io.ReadFull(w.conn, payload); err != nil {

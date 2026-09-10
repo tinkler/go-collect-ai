@@ -74,7 +74,7 @@ func main() {
 	// 数据源: 启动后即固定,只走 .env / cfg 配置 (2026-08-31 简化,移除 dsstate 持久化 + 切换 API)
 	initialDS := cfg.DataSource
 	log.Printf("[main] datasource: %s (from env/cfg, 启动后即固定)", initialDS)
-	agentClient := parseragent.NewClient(cfg.AgentURL, cfg.AgentToken, 30, initialDS)
+	agentClient := parseragent.NewClient(cfg.AgentURL, cfg.AgentToken, 60, initialDS) // 2026-09-10: 30→60, RunSettlement 6 步并发拉 cube + GROUP BY 慢
 	// 2026-09-02: 业务字段映射优先从 yaml 加载,失败 fallback 到 NewDefaultRegistry 硬编码
 	//   MAPPING_FILE 留空 = 用 hardcode (向后兼容)
 	//   推荐: MAPPING_FILE=configs/mappings.yaml
@@ -413,7 +413,7 @@ func main() {
 		//   handlers 内部已经用 WithoutCancel 兜底关键写库,这里只防资源泄漏
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       90 * time.Second, // > 企微 60s,给客户端 buffer 余量
-		WriteTimeout:      30 * time.Second, // 客户端收响应最长 30s
+		WriteTimeout:      90 * time.Second, // 2026-09-10: 30→90, freshcheck RunSettlement 6 步拉 cube + 校验 ~40s, 30s 会截断 body
 		IdleTimeout:       120 * time.Second,
 	}
 
