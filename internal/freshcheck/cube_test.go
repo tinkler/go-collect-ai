@@ -107,17 +107,14 @@ entities:
 
 func TestCube_SalesWithRefundInWindow_CallsCorrectCube(t *testing.T) {
 	mc := newMockCube()
+	// 2026-09-10: 走 measure 聚合后, mock 用 total_qnty/total_revenue (cube 端 GROUP BY item_no 结果, 净额)
 	mc.defaultRows = []map[string]any{
 		{
-			"sales_with_refund.row_id":   1.0,
-			"sales_with_refund.oper_date": "2026-09-01 10:23:45",
-			"sales_with_refund.branch_no": "0001",
-			"sales_with_refund.item_no":   "6901028001234",
-			"sales_with_refund.item_name": "菠菜",
-			"sales_with_refund.is_refund": 0.0,
-			"sales_with_refund.voucher_no": "",
-			"sales_with_refund.sale_qnty": 0.5,
-			"sales_with_refund.sale_money": 0.5,
+			"sales_with_refund.item_no":       "6901028001234",
+			"sales_with_refund.total_qnty":    0.5,  // 净额
+			"sales_with_refund.total_revenue": 0.5,  // 净额
+			"sales_with_refund.total_cost":    0.2,
+			"sales_with_refund.total_gross_profit": 0.3,
 		},
 	}
 	q := newTestCubeQuerier(mc)
@@ -132,43 +129,48 @@ func TestCube_SalesWithRefundInWindow_CallsCorrectCube(t *testing.T) {
 		t.Errorf("rows = %d, want 1", len(rows))
 	}
 
-	// 1) 调了 ExecuteWithTime (有 time filter)
-	if len(mc.execTimeCalls) != 1 {
-		t.Fatalf("execTimeCalls = %d, want 1", len(mc.execTimeCalls))
+	// 1) 调了 Execute (无 time filter, 走 inDateRange filter 代替)
+	if len(mc.execCalls) != 1 {
+		t.Fatalf("execCalls = %d, want 1", len(mc.execCalls))
 	}
 	// 2) cube 名是 sales_with_refund
-	if mc.execTimeCalls[0].Cube != "sales_with_refund" {
-		t.Errorf("Cube = %s, want sales_with_refund", mc.execTimeCalls[0].Cube)
+	if mc.execCalls[0].Cube != "sales_with_refund" {
+		t.Errorf("Cube = %s, want sales_with_refund", mc.execCalls[0].Cube)
 	}
-	// 3) time dim 正确
-	if len(mc.execTimeCalls[0].TimeDims) != 1 {
-		t.Fatalf("TimeDims len = %d, want 1", len(mc.execTimeCalls[0].TimeDims))
+	// 3) 验证 measure 是 cube measure (total_qnty/total_revenue/total_cost/total_gross_profit)
+	wantMeasures := map[string]bool{
+		"sales_with_refund.total_qnty":          true,
+		"sales_with_refund.total_revenue":       true,
+		"sales_with_refund.total_cost":          true,
+		"sales_with_refund.total_gross_profit":  true,
 	}
-	td := mc.execTimeCalls[0].TimeDims[0]
-	if td["dimension"] != "sales_with_refund.oper_date" {
-		t.Errorf("TimeDims dimension = %v, want sales_with_refund.oper_date", td["dimension"])
-	}
-	dr, ok := td["dateRange"].([]string)
-	if !ok || len(dr) != 2 {
-		t.Errorf("dateRange 格式错: %v", td["dateRange"])
-	} else {
-		// ⚠️ 不强校验 mssqlTimeFmt 格式 (本地时区 Format 不一定对), 只验非空
-		if dr[0] == "" || dr[1] == "" {
-			t.Errorf("dateRange 为空: %v", dr)
+	for _, m := range mc.execCalls[0].Measures {
+		if !wantMeasures[m] {
+			t.Errorf("unexpected measure: %s", m)
 		}
 	}
-	// 4) filter 含 branch_no
+	// 4) filter 含 branch_no + oper_date(inDateRange)
 	foundBranch := false
-	for _, f := range mc.execTimeCalls[0].Filters {
+	foundDate := false
+	for _, f := range mc.execCalls[0].Filters {
 		if f["member"] == "sales_with_refund.branch_no" {
 			foundBranch = true
 			if vals, ok := f["values"].([]string); !ok || len(vals) == 0 || vals[0] != "0001" {
 				t.Errorf("branch filter values = %v, want [0001]", f["values"])
 			}
 		}
+		if f["member"] == "sales_with_refund.oper_date" {
+			foundDate = true
+			if f["operator"] != "inDateRange" {
+				t.Errorf("oper_date operator = %v, want inDateRange", f["operator"])
+			}
+		}
 	}
 	if !foundBranch {
 		t.Error("filters 缺 branch_no")
+	}
+	if !foundDate {
+		t.Error("filters 缺 oper_date inDateRange")
 	}
 }
 
@@ -219,9 +221,9 @@ func TestCube_PurchasesInWindow_ParsesRows(t *testing.T) {
 		t.Error("OperDate 未解析")
 	}
 
-	// 验证 cube 名 + time dim
-	if len(mc.execTimeCalls) != 1 || mc.execTimeCalls[0].Cube != "purchases" {
-		t.Errorf("期望调 purchases cube, 实际 %v", mc.execTimeCalls)
+	// 验证 cube 名 (2026-09-10: 改用 RawQuery + inDateRange filter, 不再走 timeDim)
+	if len(mc.execCalls) != 1 || mc.execCalls[0].Cube != "purchases" {
+		t.Errorf("期望调 purchases cube, 实际 %v", mc.execCalls)
 	}
 }
 

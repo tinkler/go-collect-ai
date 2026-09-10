@@ -224,21 +224,19 @@ func BuildBackflushInput(
 		}
 	}
 
-	// 3. 拉 normal_sale (cube sales_with_refund, 过滤 is_refund=0, 按 item_no 聚合)
+	// 3. 拉 normal_sale (cube sales_with_refund 按 item_no 聚合, total_qnty 净额 = 销售 - 退货)
 	salesRows, err := cubeQuerier.SalesWithRefundInWindow(ctx, branchNo, windowFrom, windowTo)
 	if err != nil {
 		return nil, fmt.Errorf("cube sales: %w", err)
 	}
 	for _, row := range salesRows {
-		isRefund := toFloat(row[SalesWithRefundCube+".is_refund"]) != 0
-		if isRefund {
-			continue
-		}
 		itemNo := toString(row[SalesWithRefundCube+".item_no"])
 		if itemNo == "" {
 			continue
 		}
-		qnty := toFloat(row[SalesWithRefundCube+".sale_qnty"])
+		// 2026-09-10 优化: cube 端 sale_qnty 已净额化 (退货行转负, sum 自动抵消)
+		// 旧版需 is_refund 判断 + continue 退货行, 取消 (cube measure 聚合后已是净额)
+		qnty := toFloat(row[SalesWithRefundCube+".total_qnty"])
 		in.NormalSaleByItem[itemNo] += qnty
 	}
 

@@ -53,42 +53,28 @@ const (
 const mssqlTimeFmt = "2006-01-02 15:04:05"
 
 // SalesWithRefundInWindow 拉窗口内 sales_with_refund 全量
-//   - 含 is_refund 标记 (0/1) + voucher_no 原单号
-//   - 含 oper_date / branch_no / item_no / item_name / sale_qnty / sale_money 等
-//   - 调用方按 is_refund 过滤退货, 按 voucher_no 关联原单
-//
-// 性能: 1 年数据约 70 万行, 5-10s 一次
+//   - 2026-09-10 集成 A 优化: 改走 cube measure 聚合 (按 item_no GROUP BY, 净额 = 销售 - 退货)
+//     旧: 拉 13 列明细 70 万行 → cube 端 LEFT JOIN 4 表 SELECT 12s+
+//     新: measures=[total_qnty, total_revenue, total_cost, total_gross_profit]
+//         dimensions=[item_no] + filter inDateRange (不进 GROUP BY, 只做 WHERE)
+//         依赖 plugin SQL 把退货行 sale_qnty/sale_money 净额化 (sum 自动抵消)
+//   - 返回: 每 item 一行 {item_no, total_qnty (净额), total_revenue, total_cost, gross_profit}
 func (q *CubeQuerier) SalesWithRefundInWindow(ctx context.Context, branchNo string, from, to time.Time) ([]map[string]any, error) {
-	timeDims := []map[string]any{
-		{
-			"dimension": SalesWithRefundCube + ".oper_date",
-			"dateRange": []string{
-				from.Format(mssqlTimeFmt),
-				to.Format(mssqlTimeFmt),
-			},
-		},
-	}
-	rows, err := q.Gateway.RawQueryWithTime(SalesWithRefundCube,
-		[]string{SalesWithRefundCube + ".count"},
+	rows, err := q.Gateway.RawQuery(SalesWithRefundCube,
 		[]string{
-			SalesWithRefundCube + ".row_id",
-			SalesWithRefundCube + ".oper_date",
-			SalesWithRefundCube + ".branch_no",
-			SalesWithRefundCube + ".item_no",
-			SalesWithRefundCube + ".item_name",
-			SalesWithRefundCube + ".item_clsno",
-			SalesWithRefundCube + ".item_clsname",
-			SalesWithRefundCube + ".main_supcust",
-			SalesWithRefundCube + ".is_refund",
-			SalesWithRefundCube + ".sale_qnty",
-			SalesWithRefundCube + ".sale_money",
-			SalesWithRefundCube + ".total_cost",
-			SalesWithRefundCube + ".gross_profit",
+			SalesWithRefundCube + ".total_qnty",        // SUM(sale_qnty) — 净额 (退货转负)
+			SalesWithRefundCube + ".total_revenue",     // SUM(sale_money) — 净额
+			SalesWithRefundCube + ".total_cost",        // SUM(in_price * sale_qnty) — 净额
+			SalesWithRefundCube + ".total_gross_profit", // SUM(sale_money - cost) — 净额
 		},
+		[]string{SalesWithRefundCube + ".item_no"},
 		[]map[string]any{
 			{"member": SalesWithRefundCube + ".branch_no", "operator": "equals", "values": []string{branchNo}},
+			// 用 inDateRange filter 而不是 timeDimensions, 避免 cube 把 oper_date 加进 GROUP BY
+			{"member": SalesWithRefundCube + ".oper_date", "operator": "inDateRange", "values": []string{from.Format("2006-01-02"), to.Format("2006-01-02")}},
 		},
-		nil, 50000, timeDims)
+		nil,
+		5000)
 	if err != nil {
 		return nil, fmt.Errorf("cube %s SalesWithRefundInWindow: %w", SalesWithRefundCube, err)
 	}
@@ -132,79 +118,37 @@ type PoolSalesRow struct {
 //   - 按 pool_code 聚合
 // PoolSalesInWindow 拉窗口内"按特价码货号"的 POS 销量
 //   - item_no = pool_code 视为"特价码" (W1 spec: 特价码本身是货号, 进 sales 流)
-//   - is_refund=0 计销售, is_refund=1 减扣
-//   - 按 pool_code 聚合
+//   - 净额 = 销售 - 退货 (cube SQL 把退货行 sale_qnty/sale_money 转负, sum 自动抵消)
 //
-// 2026-09-10: 分两次查 (normal + refund) 走 measure 聚合
-//   - cube SQL Server 2008 R2 不支持 measure SQL 是 CASE WHEN 表达式
-//   - 走 total_qnty (sum sale_qnty) + total_revenue (sum sale_money) measure
-//   - 分两次拉, filter 区分 is_refund=0/1, GO 端相减
+// 2026-09-10 集成 A 优化: 单次查 (28s→1-2s), 不用 timeDimensions (避免 cube 加 oper_date 进 GROUP BY)
+//   旧: 分两次 is_refund=0/1 各 14s, GO 端相减
+//   新: 单次查 total_qnty + total_revenue measure + inDateRange filter, cube 端 sum 净额
 func (q *CubeQuerier) PoolSalesInWindow(ctx context.Context, branchNo string, from, to time.Time) (map[string]*PoolSalesRow, error) {
-	timeDims := []map[string]any{
-		{
-			"dimension": SalesWithRefundCube + ".oper_date",
-			"dateRange": []string{
-				from.Format(mssqlTimeFmt),
-				to.Format(mssqlTimeFmt),
-			},
-		},
-	}
-	// 查正常销售: is_refund=0
-	normalRows, err := q.Gateway.RawQueryWithTime(SalesWithRefundCube,
+	rows, err := q.Gateway.RawQuery(SalesWithRefundCube,
 		[]string{
-			SalesWithRefundCube + ".total_qnty",   // SUM(sale_qnty)
-			SalesWithRefundCube + ".total_revenue", // SUM(sale_money)
+			SalesWithRefundCube + ".total_qnty",   // SUM(sale_qnty) — 净额 (退货行转负)
+			SalesWithRefundCube + ".total_revenue", // SUM(sale_money) — 净额
 		},
 		[]string{SalesWithRefundCube + ".item_no"},
 		[]map[string]any{
 			{"member": SalesWithRefundCube + ".branch_no", "operator": "equals", "values": []string{branchNo}},
-			{"member": SalesWithRefundCube + ".is_refund", "operator": "equals", "values": []string{"0"}},
+			{"member": SalesWithRefundCube + ".oper_date", "operator": "inDateRange", "values": []string{from.Format("2006-01-02"), to.Format("2006-01-02")}},
 		},
-		nil, 5000, timeDims)
+		nil,
+		5000)
 	if err != nil {
-		return nil, fmt.Errorf("cube %s PoolSalesInWindow normal: %w", SalesWithRefundCube, err)
-	}
-	// 查退货: is_refund=1
-	refundRows, err := q.Gateway.RawQueryWithTime(SalesWithRefundCube,
-		[]string{
-			SalesWithRefundCube + ".total_qnty",   // SUM(sale_qnty) — 退的 sale_qnty 是负
-			SalesWithRefundCube + ".total_revenue", // SUM(sale_money) — 退的 sale_money 是负
-		},
-		[]string{SalesWithRefundCube + ".item_no"},
-		[]map[string]any{
-			{"member": SalesWithRefundCube + ".branch_no", "operator": "equals", "values": []string{branchNo}},
-			{"member": SalesWithRefundCube + ".is_refund", "operator": "equals", "values": []string{"1"}},
-		},
-		nil, 5000, timeDims)
-	if err != nil {
-		return nil, fmt.Errorf("cube %s PoolSalesInWindow refund: %w", SalesWithRefundCube, err)
+		return nil, fmt.Errorf("cube %s PoolSalesInWindow: %w", SalesWithRefundCube, err)
 	}
 	out := map[string]*PoolSalesRow{}
-	for _, row := range normalRows {
+	for _, row := range rows {
 		poolCode := toString(row[SalesWithRefundCube+".item_no"])
 		if poolCode == "" {
 			continue
 		}
-		qty := toFloat(row[SalesWithRefundCube+".total_qnty"])
-		amt := toFloat(row[SalesWithRefundCube+".total_revenue"])
-		out[poolCode] = &PoolSalesRow{PoolCode: poolCode, Qty: qty, Amt: amt}
-	}
-	// 减扣退货
-	for _, row := range refundRows {
-		poolCode := toString(row[SalesWithRefundCube+".item_no"])
-		if poolCode == "" {
-			continue
-		}
-		// 退货 sale_qnty/sale_money 在 cube 端已经存为负数 (siss_saleflow view 的 is_refund 行)
-		// total_qnty 已经是 sum(sale_qnty) 自动抵消 (退的为负)
-		// 正常 + 退货 = 净额
-		qty := toFloat(row[SalesWithRefundCube+".total_qnty"])
-		amt := toFloat(row[SalesWithRefundCube+".total_revenue"])
-		if r, ok := out[poolCode]; ok {
-			r.Qty += qty
-			r.Amt += amt
-		} else {
-			out[poolCode] = &PoolSalesRow{PoolCode: poolCode, Qty: qty, Amt: amt}
+		out[poolCode] = &PoolSalesRow{
+			PoolCode: poolCode,
+			Qty:      toFloat(row[SalesWithRefundCube+".total_qnty"]),
+			Amt:      toFloat(row[SalesWithRefundCube+".total_revenue"]),
 		}
 	}
 	return out, nil
@@ -212,22 +156,13 @@ func (q *CubeQuerier) PoolSalesInWindow(ctx context.Context, branchNo string, fr
 
 // PurchasesInWindow 拉窗口内采购入库 (用于 Step 3 倒挤公式的 purchase_qty)
 //
-// 2026-09-10: 改走 cube measure 聚合 (按 item_no GROUP BY)
+// 2026-09-10: 改走 cube measure 聚合 (按 item_no GROUP BY, 用 inDateRange filter 不用 timeDimensions)
 //   旧: 拉 5 万行明细 → cube 端 LEFT JOIN 商品主表慢, 25-27s timeout
 //   新: measures=count+total_qty+total_cost, dimensions=item_no+item_name
-//       cube 端 GROUP BY item_no, 行数 = SKU 数 (几百), < 1s 返回
-//   voucher_no/oper_date/cost_price 字段: 聚合后无意义, 留空 (下游 backflush 只用 RealQty)
+//       cube 端 GROUP BY item_no (不加 oper_date 进 GROUP BY), 行数 = SKU 数 (几百), 1-3s 返回
+//   voucher_no/oper_date 字段: 聚合后无意义, 留空 (下游 backflush 只用 RealQty)
 func (q *CubeQuerier) PurchasesInWindow(ctx context.Context, branchNo string, from, to time.Time) ([]*PurchaseRow, error) {
-	timeDims := []map[string]any{
-		{
-			"dimension": PurchasesCube + ".oper_date",
-			"dateRange": []string{
-				from.Format(mssqlTimeFmt),
-				to.Format(mssqlTimeFmt),
-			},
-		},
-	}
-	rows, err := q.Gateway.RawQueryWithTime(PurchasesCube,
+	rows, err := q.Gateway.RawQuery(PurchasesCube,
 		[]string{
 			PurchasesCube + ".count",      // 笔数 (参考)
 			PurchasesCube + ".total_qty",  // SUM(real_qty) — 倒挤公式核心
@@ -239,8 +174,11 @@ func (q *CubeQuerier) PurchasesInWindow(ctx context.Context, branchNo string, fr
 		},
 		[]map[string]any{
 			{"member": PurchasesCube + ".branch_no", "operator": "equals", "values": []string{branchNo}},
+			// 用 inDateRange filter 而不是 timeDimensions, 避免 cube 把 oper_date 加进 GROUP BY
+			{"member": PurchasesCube + ".oper_date", "operator": "inDateRange", "values": []string{from.Format("2006-01-02"), to.Format("2006-01-02")}},
 		},
-		nil, 5000, timeDims)
+		nil,
+		5000)
 	if err != nil {
 		return nil, fmt.Errorf("cube %s PurchasesInWindow: %w", PurchasesCube, err)
 	}
