@@ -397,7 +397,15 @@ func (w *Client) connect(ctx context.Context) error {
 		w.onConnect()
 	}
 
-	pingTicker := time.NewTicker(25 * time.Second)
+	// 2026-09-12: 服务端 keepalive 超时 ~25s
+	//   老代码: 25s 间隔第一个 ping,正好撞服务端超时,被踢
+	//   新代码: subscribe 成功后立即发一个 ping (证明连接活着, 重置服务端计时)
+	//           然后 15s 间隔 (留 10s 余量)
+	if err := w.ping(); err != nil {
+		w.closeConn()
+		return fmt.Errorf("initial ping: %w", err)
+	}
+	pingTicker := time.NewTicker(15 * time.Second)
 	defer pingTicker.Stop()
 
 	go func() {
