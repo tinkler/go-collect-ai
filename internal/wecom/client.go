@@ -363,7 +363,35 @@ func (w *Client) connect(ctx context.Context) error {
 		w.closeConn()
 		return fmt.Errorf("subscribe: %w", err)
 	}
-	log.Printf("[wecom] subscribed, bot_id=%s", w.cfg.BotID)
+	log.Printf("[wecom] subscribed, bot_id=%s (waiting up to 3s for server ack)", w.cfg.BotID)
+
+	// 2026-09-12: 主动读 subscribe 响应
+	//   背景: 之前 subscribe 完直接进 readLoop, 如果服务端收完 subscribe 立刻关连接
+	//   第一个 read 就 EOF, 看不到服务端给的真正原因
+	//   现在: 3s 内读一帧, parse JSON 打印 errcode/errmsg, 然后再进 readLoop
+	//   - 服务端给 error: 立刻 close 并 return, 不再进 readLoop
+	//   - 服务端给 ok: 继续 (跟之前一样进 readLoop)
+	//   - 3s 没响应 (服务端静默): 记 timeout, 仍然进 readLoop
+	if ack, ackErr := w.readSubscribeAck(3 * time.Second); ackErr != nil {
+		w.closeConn()
+		return fmt.Errorf("subscribe ack read: %w", ackErr)
+	} else if ack != "" {
+		// 看一眼 errcode
+		var probe map[string]any
+		if json.Unmarshal([]byte(ack), &probe) == nil {
+			if ec, ok := probe["errcode"]; ok {
+				log.Printf("[wecom] subscribe response: errcode=%v errmsg=%v", ec, probe["errmsg"])
+			} else if cmd, ok := probe["cmd"]; ok {
+				log.Printf("[wecom] subscribe response: cmd=%v (ack payload=%d bytes)", cmd, len(ack))
+			} else {
+				log.Printf("[wecom] subscribe response: %s", truncateForLog(ack, 300))
+			}
+		} else {
+			log.Printf("[wecom] subscribe response (non-json): %s", truncateForLog(ack, 300))
+		}
+	} else {
+		log.Printf("[wecom] subscribe ack timeout (3s) — server silent, falling through to readLoop")
+	}
 
 	if w.onConnect != nil {
 		w.onConnect()
@@ -524,6 +552,95 @@ func (w *Client) readLoop() error {
 	}
 }
 
+// readSubscribeAck 2026-09-12: subscribe 后主动读一帧 (带 deadline)
+//   - 命中 (有响应): 返回 payload 字符串
+//   - 超时 (3s 内没数据): 返回 "", nil
+//   - EOF (服务端 close TCP): 返回 "", err  (这样 connect() 立即 return, 不再进 readLoop)
+//   - 其它读错误: 返回 "", err
+//
+// 用途: 当服务端 subscribe 后立刻 close, 之前 readLoop 看到的是裸 EOF,
+//   现在先 read 一帧能看到 server 真正给的 errcode/errmsg
+func (w *Client) readSubscribeAck(deadline time.Duration) (string, error) {
+	conn := w.conn
+	if conn == nil {
+		return "", fmt.Errorf("conn nil")
+	}
+	type deadlineSetter interface{ SetDeadline(time.Time) error }
+	if tc, ok := conn.(deadlineSetter); ok {
+		_ = tc.SetDeadline(time.Now().Add(deadline))
+		// 读完记得清掉
+		defer tc.SetDeadline(time.Time{})
+	}
+
+	// 1) 读 2 字节 frame header
+	var hdr [2]byte
+	if _, err := io.ReadFull(conn, hdr[:]); err != nil {
+		if err == io.EOF {
+			return "", fmt.Errorf("server closed connection (EOF on first read after subscribe)")
+		}
+		return "", err
+	}
+	fin := hdr[0]&0x80 != 0
+	opcode := hdr[0] & 0x0F
+	masked := hdr[1]&0x80 != 0
+	plen := int(hdr[1] & 0x7F)
+
+	// 2) 读 ext length
+	if plen == 126 {
+		var ext [2]byte
+		if _, err := io.ReadFull(conn, ext[:]); err != nil {
+			return "", err
+		}
+		plen = int(binary.BigEndian.Uint16(ext[:]))
+	} else if plen == 127 {
+		var ext [8]byte
+		if _, err := io.ReadFull(conn, ext[:]); err != nil {
+			return "", err
+		}
+		plen = int(binary.BigEndian.Uint64(ext[:]))
+	}
+
+	// 3) 防大帧
+	if plen < 0 || plen > 1<<20 {
+		return "", fmt.Errorf("subscribe ack frame too large: %d", plen)
+	}
+
+	// 4) mask key (server 不该 mask, 但稳妥处理)
+	var maskKey [4]byte
+	if masked {
+		if _, err := io.ReadFull(conn, maskKey[:]); err != nil {
+			return "", err
+		}
+	}
+
+	// 5) payload
+	payload := make([]byte, plen)
+	if plen > 0 {
+		if _, err := io.ReadFull(conn, payload); err != nil {
+			return "", err
+		}
+		if masked {
+			for i := range payload {
+				payload[i] ^= maskKey[i%4]
+			}
+		}
+	}
+
+	// 仅关心 text/binary 帧
+	if opcode == 0x8 {
+		return "", fmt.Errorf("server sent close frame after subscribe: payload=%s", string(payload))
+	}
+	if !fin {
+		// 简单起见不处理 fragmented — aibot 协议用单帧
+		return "", fmt.Errorf("unexpected fragmented frame (opcode=%d)", opcode)
+	}
+	if opcode != 0x1 && opcode != 0x2 {
+		// ping/pong 等控制帧 — 忽略, 递归再读 (保险起见 1 次)
+		return w.readSubscribeAck(deadline)
+	}
+	return string(payload), nil
+}
+
 // writeFrame 写一帧
 func (w *Client) writeFrame(opcode byte, payload []byte) error {
 	w.writeMu.Lock()
@@ -606,6 +723,14 @@ func (w *Client) ping() error {
 
 func (w *Client) pong(payload []byte) error {
 	return w.writeFrame(0xA, payload)
+}
+
+// truncateForLog 截断字符串 (日志用)
+func truncateForLog(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n] + "..."
 }
 
 func (w *Client) closeConn() {
