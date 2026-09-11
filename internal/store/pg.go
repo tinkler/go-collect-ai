@@ -734,6 +734,28 @@ func Migrate(ctx context.Context, pool *pgxpool.Pool) error {
 			('meat',    '0001', 'meat-biweekly',   14, 'weekly',  TRUE),
 			('frozen',  '0001', 'frozen-monthly',  30, 'monthly', TRUE)
 		ON CONFLICT (branch_no, fresh_category) DO NOTHING`,
+
+		// ============================================================
+		// 企微群绑定 (2026-09-11, 任务: 群用途配置化 + LLM 推断)
+		//   替代原先 3 个 env 注入 (PROMOTION_ALERT_CHAT_ID / OWNER_CHAT_ID /
+		//   COLLECTAI_AGENT_CHAT_IDS),UI 在 admin/system.html 配
+		// ============================================================
+		// purpose 白名单: agent (智能对话) | fee (费用录入) | promo_alert (堆头费到期预警) |
+		//                owner (店主私享) | office (办公室) | floor (卖场) | log (仅记录) | other
+		`CREATE TABLE IF NOT EXISTS wecom_chat_binding (
+			chat_id      TEXT PRIMARY KEY,
+			purpose      TEXT NOT NULL DEFAULT 'log'
+			              CHECK (purpose IN ('agent','fee','promo_alert','owner','office','floor','log','other')),
+			label        TEXT NOT NULL DEFAULT '',
+			enabled      BOOLEAN NOT NULL DEFAULT TRUE,
+			note         TEXT NOT NULL DEFAULT '',
+			first_seen   TIMESTAMPTZ,                    -- 自动发现时间 (wecom 客户端上报)
+			created_by   TEXT NOT NULL DEFAULT 'system', -- 配置人 user_id
+			created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+			updated_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_wcb_purpose ON wecom_chat_binding(purpose) WHERE enabled`,
+		`CREATE INDEX IF NOT EXISTS idx_wcb_updated ON wecom_chat_binding(updated_at DESC)`,
 	}
 	for _, s := range stmts {
 		if _, err := pool.Exec(ctx, s); err != nil {

@@ -1,4 +1,4 @@
-package agent
+﻿package agent
 
 import (
 	"context"
@@ -526,5 +526,147 @@ func TestBridge_DebugCommand_ConsumesRateLimit(t *testing.T) {
 	}
 	if runner.called != 0 {
 		t.Errorf("调试路径不应触发 runner, got %d calls", runner.called)
+	}
+}
+
+// =====================================================================
+// 2026-09-11: record_promotion_fee 自动通知测试
+// =====================================================================
+
+// feeToolResultEvent 构造一个 trpc-agent-go tool result 事件,模拟 record_promotion_fee 成功返回
+func feeToolResultEvent(t *testing.T, content string) *event.Event {
+	t.Helper()
+	return &event.Event{
+		Response: &model.Response{
+			Choices: []model.Choice{
+				{
+					Message: model.Message{
+						Role:     model.RoleTool,
+						ToolID:   "call_123",
+						ToolName: "record_promotion_fee",
+						Content:  content,
+					},
+				},
+			},
+		},
+		InvocationID: "inv_test",
+	}
+}
+
+func TestExtractFeeWrite_Inserted(t *testing.T) {
+	ev := feeToolResultEvent(t, `{"fee_id":42,"supplier":"汇一","kind":"堆头","amount":800,"period_start":"2026-09-01","period_end":"2026-09-30","action":"inserted"}`)
+	got := extractFeeWrite(ev)
+	if got == nil {
+		t.Fatal("expected non-nil fee write result")
+	}
+	if got.FeeID != 42 || got.Supplier != "汇一" || got.Kind != "堆头" || got.Amount != 800 {
+		t.Errorf("got %+v", got)
+	}
+	if got.Action != "inserted" {
+		t.Errorf("action=%q want inserted", got.Action)
+	}
+}
+
+func TestExtractFeeWrite_DryRun_Skipped(t *testing.T) {
+	ev := feeToolResultEvent(t, `{"fee_id":0,"supplier":"汇一","kind":"堆头","amount":800,"period_start":"2026-09-01","period_end":"2026-09-30","action":"dry_run"}`)
+	if got := extractFeeWrite(ev); got != nil {
+		t.Errorf("dry_run 应被忽略, got %+v", got)
+	}
+}
+
+func TestExtractFeeWrite_WrongToolName_Skipped(t *testing.T) {
+	ev := &event.Event{
+		Response: &model.Response{
+			Choices: []model.Choice{
+				{Message: model.Message{Role: model.RoleTool, ToolID: "x", ToolName: "remember_supplier_policy", Content: `{"ok":true}`}},
+			},
+		},
+	}
+	if got := extractFeeWrite(ev); got != nil {
+		t.Errorf("非 record_promotion_fee 应被忽略, got %+v", got)
+	}
+}
+
+func TestExtractFeeWrite_NonToolEvent_Skipped(t *testing.T) {
+	ev := &event.Event{
+		Response: &model.Response{
+			Choices: []model.Choice{
+				{Delta: model.Message{Content: "你好"}},
+			},
+		},
+	}
+	if got := extractFeeWrite(ev); got != nil {
+		t.Errorf("text delta 不应被识别成 fee write, got %+v", got)
+	}
+}
+
+func TestExtractFeeWrite_BadJSON_Skipped(t *testing.T) {
+	ev := feeToolResultEvent(t, "not json")
+	if got := extractFeeWrite(ev); got != nil {
+		t.Errorf("坏 JSON 应被忽略 (不 crash), got %+v", got)
+	}
+}
+
+func TestFormatOneFeeConfirm(t *testing.T) {
+	w := feeWriteResult{FeeID: 42, Supplier: "汇一", Kind: "堆头", Amount: 800, PeriodStart: "2026-09-01", PeriodEnd: "2026-09-30"}
+	got := formatOneFeeConfirm(w)
+	want := "✅ 已记录费用: 汇一 堆头 ¥800 (2026-09-01-2026-09-30) #fee_id=42"
+	if got != want {
+		t.Errorf("format mismatch:\n  got:  %s\n  want: %s", got, want)
+	}
+}
+
+func TestSendFeeConfirmations_Disabled_NoSend(t *testing.T) {
+	sender := &mockSender{}
+	bridge := NewBridge(BridgeConfig{
+		ChatIDs:        []string{"c1"},
+		FeeAutoConfirm: false, // 显式关
+	}, &mockRunner{enabled: true}, sender)
+	bridge.sendFeeConfirmations(context.Background(), "c1", []feeWriteResult{
+		{FeeID: 1, Supplier: "汇一", Kind: "堆头", Amount: 100, PeriodStart: "2026-09-01", PeriodEnd: "2026-09-30", Action: "inserted"},
+	})
+	time.Sleep(50 * time.Millisecond)
+	if got := len(sender.Sent()); got != 0 {
+		t.Errorf("FeeAutoConfirm=false 不应发, got %d: %+v", got, sender.Sent())
+	}
+}
+
+func TestSendFeeConfirmations_OneFee(t *testing.T) {
+	sender := &mockSender{}
+	bridge := NewBridge(BridgeConfig{
+		ChatIDs:        []string{"c1"},
+		FeeAutoConfirm: true,
+	}, &mockRunner{enabled: true}, sender)
+	bridge.sendFeeConfirmations(context.Background(), "c1", []feeWriteResult{
+		{FeeID: 7, Supplier: "汇一", Kind: "堆头", Amount: 800, PeriodStart: "2026-09-01", PeriodEnd: "2026-09-30", Action: "inserted"},
+	})
+	if !waitFor(t, 500*time.Millisecond, func() bool { return len(sender.Sent()) == 1 }) {
+		t.Fatalf("expected 1 msg, got %d", len(sender.Sent()))
+	}
+	sent := sender.Sent()[0].Text
+	if !strings.Contains(sent, "✅ 已记录费用") || !strings.Contains(sent, "汇一") || !strings.Contains(sent, "堆头") || !strings.Contains(sent, "800") || !strings.Contains(sent, "#fee_id=7") {
+		t.Errorf("单笔确认文案不全, got: %q", sent)
+	}
+}
+
+func TestSendFeeConfirmations_MultiFees(t *testing.T) {
+	sender := &mockSender{}
+	bridge := NewBridge(BridgeConfig{
+		ChatIDs:        []string{"c1"},
+		FeeAutoConfirm: true,
+	}, &mockRunner{enabled: true}, sender)
+	bridge.sendFeeConfirmations(context.Background(), "c1", []feeWriteResult{
+		{FeeID: 7, Supplier: "汇一", Kind: "堆头", Amount: 800, PeriodStart: "2026-09-01", PeriodEnd: "2026-09-30", Action: "inserted"},
+		{FeeID: 8, Supplier: "汇二", Kind: "陈列", Amount: 500, PeriodStart: "2026-10-01", PeriodEnd: "2026-10-31", Action: "inserted"},
+	})
+	if !waitFor(t, 500*time.Millisecond, func() bool { return len(sender.Sent()) == 1 }) {
+		t.Fatalf("expected 1 combined msg, got %d", len(sender.Sent()))
+	}
+	sent := sender.Sent()[0].Text
+	if !strings.Contains(sent, "已记录 2 笔费用") {
+		t.Errorf("多笔应含 '2 笔', got: %q", sent)
+	}
+	if !strings.Contains(sent, "汇一") || !strings.Contains(sent, "汇二") || !strings.Contains(sent, "#fee_id=7") || !strings.Contains(sent, "#fee_id=8") {
+		t.Errorf("多笔应含两条 fee_id, got: %q", sent)
 	}
 }

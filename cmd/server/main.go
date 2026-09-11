@@ -32,6 +32,7 @@ import (
 	"github.com/tinkler/collect-ai/internal/store"
 	"github.com/tinkler/collect-ai/internal/supplierpayment"
 	"github.com/tinkler/collect-ai/internal/wecom"
+	"github.com/tinkler/collect-ai/internal/wecomchat"
 	"github.com/tinkler/collect-ai/internal/wxsign"
 )
 
@@ -139,8 +140,11 @@ func main() {
 	// W3.5: 季节判定分类器 (关键词快速 + LLM 慢路径 + 6h 缓存)
 	// seasonClassifier := buildSeasonClassifier(llmClient)
 	// alertSvc := purchasealert.NewServiceWithClassifier(pool, seasonClassifier)                                // W3.2+W3.5
-	promoAlertSvc := promotionalert.NewService(pool, strings.TrimSpace(os.Getenv("PROMOTION_ALERT_CHAT_ID"))) // W3.3: 堆头费到期预警 (空=禁用)
-	supplierPaySvc := supplierpayment.NewService(pool, strings.TrimSpace(os.Getenv("OWNER_CHAT_ID")))         // W4.3: 供应商结算 cron
+	// 2026-09-11: W3.3 / W4.3 的目标 chat_id 不再写死 env,统一走 wecom_chat_binding
+	//   启动时从 env seed 进 PG,后续以 PG 为准 (cron 用 ChatRouter.FirstChatByPurpose 查)
+	//   留空让 cron "有 PG 就跑,没 PG 跳过",配合 admin UI 完成配置
+	promoAlertSvc := promotionalert.NewService(pool, "")
+	supplierPaySvc := supplierpayment.NewService(pool, "")
 	// W5: cube 数据源注入 (默认 Noop, 设 COLLECTAI_CUBE_QUERIER=real 接真实 cube)
 	//   2026-09-02: 传 gateway.Client() (CubeClient interface),统一 client
 	if cq := buildCubeQuerier(gateway.Client()); cq != nil {
@@ -202,10 +206,31 @@ func main() {
 		// Phase B+ (2026-09-03): 删 DefaultOcrModel/DefaultLlmModel 字段 (VLM 内部固定)
 	}
 
-	// 注册企微消息回调 (新版 restock 不推群, 只做消息接收)
-	wecomClient.OnMessage(func(chatID, userID, text string) {
-		log.Printf("[wecom] msg from chat=%s user=%s: %s", chatID, userID, text)
-	})
+	// ============== 企微群绑定配置 (2026-09-11) ==============
+	//   替代原先 3 个 env (PROMOTION_ALERT_CHAT_ID / OWNER_CHAT_ID / COLLECTAI_AGENT_CHAT_IDS)
+	//   UI 在 admin/system.html,后端 wecom_chat_binding 表
+	//   ChatRouter 是收消息的唯一入口,按 purpose 路由到 LLM / 费用 / 仅日志
+	wecomChatStore := wecomchat.NewStore(pool)
+	wecomChatRouter := wecomchat.NewRouter(wecomChatStore, pool)
+
+	// 1) env seed: 启动时把旧 env 灌进 PG (仅当 PG 没配过, 不覆盖)
+	if err := wecomChatStore.SeedFromEnv(context.Background(), os.Getenv); err != nil {
+		log.Printf("[main] wecomchat SeedFromEnv 失败: %v (env 不会进 PG, 需手动配)", err)
+	}
+	// 2) Reload cache
+	if err := wecomChatRouter.Reload(context.Background()); err != nil {
+		log.Printf("[main] wecomchat Reload 失败: %v (后续 reload 由 admin / 自动重试)", err)
+	}
+
+	// 3) wecom.Client → wecomchat 的 adapter
+	//   不直接 import wecom.Client 类型,避免反向依赖, 接口倒置在 wecomchat
+	wecomClientLister := wecomChatListerAdapter{c: wecomClient}
+	wecomClientConn := wecomChatConnAdapter{c: wecomClient}
+	wecomChatAdmin := wecomchat.NewAdminHandler(wecomChatStore, wecomChatRouter, wecomClientLister, wecomClientConn)
+
+	// 4) 注册企微消息回调: 全部消息都进 ChatRouter, 由它按 purpose 路由
+	//   (替代原先 OnMessage(仅 log) + OnAgentMessage(env 白名单 bridge))
+	wecomClient.OnMessage(wecomChatRouter.Handle)
 
 	// ============== 智能采购 Agent 桥接 (W2, 2026-09-01) ==============
 	//   显式白名单 chat_ids 才接管(避免误接管 restock 群)
@@ -239,19 +264,29 @@ func main() {
 	}
 
 	// wecom bridge 独立判断: 接管企微群消息 → 调 agentRunner.Run
-	if agentEnabled && len(agentChatIDs) > 0 && agentRunner != nil {
-		bridge := agent.NewBridge(agent.DefaultBridgeConfig(), agentRunner, agent.NewWecomSender(wecomClient))
-		// 白名单 set 覆盖默认
-		bridge = agent.NewBridge(agent.BridgeConfig{
-			ChatIDs:       agentChatIDs,
-			MaxReplyChars: 200,
-			PerMinuteRate: 25,
-			RunTimeout:    60 * time.Second,
+	// 2026-09-11: 改成"无条件构造 bridge (chatSet 可空), 注入 ChatRouter 当 LLMExecutor"
+	//   - 老 env (COLLECTAI_AGENT_CHAT_IDS) 仍可作为白名单 (双保险)
+	//   - 新增 PG 配 purpose=agent|fee 也走 LLM (主路径)
+	//   - router 是唯一收口, bridge 只做"排队/限频/调 LLM"
+	if agentEnabled && agentRunner != nil {
+		// 2026-09-11: fee 自动通知开关 (env 可关,默认开)
+		//   关闭:  LLM 写完 promotion_fee 不再追发 ✅ 确认, 只看 LLM 自然语言回复
+		//   开启:  LLM 写完 promotion_fee 自动发一条 ✅ 已记录费用: ... 给原 chat
+		feeAutoConfirm := !strings.EqualFold(strings.TrimSpace(os.Getenv("COLLECTAI_AGENT_FEE_AUTO_CONFIRM")), "false")
+		bridge := agent.NewBridge(agent.BridgeConfig{
+			ChatIDs:        agentChatIDs, // 可空 (空时 BypassFilter=true 让 router 兜底)
+			BypassFilter:   true,          // 2026-09-11: 过滤交给上游 ChatRouter (按 purpose)
+			FeeAutoConfirm: feeAutoConfirm,
+			MaxReplyChars:  200,
+			PerMinuteRate:  25,
+			RunTimeout:     60 * time.Second,
 		}, agentRunner, agent.NewWecomSender(wecomClient))
-		wecomClient.OnAgentMessage(bridge.Handle)
-		log.Printf("[main] Agent Bridge ready: chats=%d", len(agentChatIDs))
-	} else if agentEnabled && len(agentChatIDs) > 0 {
-		log.Printf("[main] Agent Bridge 跳过 (agentRunner 未就绪, LLM key 缺失)")
+		wecomChatRouter.SetLLMExecutor(bridge)
+		// 不用 OnAgentMessage 了, OnMessage 已经走 router
+		log.Printf("[main] Agent Bridge ready (via ChatRouter): env_chats=%d, llm=%v, fee_auto_confirm=%v",
+			len(agentChatIDs), agentRunner.Enabled(), feeAutoConfirm)
+	} else {
+		log.Printf("[main] Agent Bridge 未启用 (agentEnabled=%v, agentRunner==nil)", agentEnabled)
 	}
 
 	// Phase A (2026-09-02): 注入 SkillStore + Orchestrator 到 handler
@@ -309,13 +344,23 @@ func main() {
 	}
 
 	// W3.3 堆头费到期 cron: 启动时跑一次 + 每日 21:00 跑
+	// 2026-09-11: 目标 chat_id 改读 wecom_chat_binding.purpose=promo_alert
+	//   - 启动时从 router 读 (env 已 seed 进 PG)
+	//   - 每次 tick 重新读 + 设 svc.ChatID (admin 改 binding 不需重启)
 	promoAlertCtx, promoAlertCancel := context.WithCancel(context.Background())
 	defer promoAlertCancel()
-	if strings.TrimSpace(os.Getenv("PROMOTION_ALERT_CHAT_ID")) != "" {
+	{
+		sender := agent.NewWecomSender(wecomClient)
+		runPromoAlert := func() {
+			chatID := wecomChatRouter.FirstChatByPurpose("promo_alert")
+			promoAlertSvc.ChatID = chatID // 空就跳推送 (Push 内部判)
+			if chatID == "" {
+				log.Printf("[main] W3.3 堆头费预警 tick — purpose=promo_alert 未绑定 chat, 仅算不推")
+			}
+			_ = promoAlertSvc.RunAndPush(promoAlertCtx, sender)
+		}
 		// 启动时立即跑一次 (捕获已到期的)
-		go func() {
-			_ = promoAlertSvc.RunAndPush(promoAlertCtx, agent.NewWecomSender(wecomClient))
-		}()
+		go runPromoAlert()
 		// 每日 21:00 跑
 		go func() {
 			ticker := time.NewTicker(24 * time.Hour)
@@ -333,30 +378,32 @@ func main() {
 			case <-promoAlertCtx.Done():
 				return
 			case <-first.C:
-				_ = promoAlertSvc.RunAndPush(promoAlertCtx, agent.NewWecomSender(wecomClient))
+				runPromoAlert()
 			}
 			for {
 				select {
 				case <-promoAlertCtx.Done():
 					return
 				case <-ticker.C:
-					_ = promoAlertSvc.RunAndPush(promoAlertCtx, agent.NewWecomSender(wecomClient))
+					runPromoAlert()
 				}
 			}
 		}()
-		log.Printf("[main] W3.3 堆头费到期预警: 启动时跑一次 + 每日 21:00 (chat_id=%s)", os.Getenv("PROMOTION_ALERT_CHAT_ID"))
-	} else {
-		log.Printf("[main] PROMOTION_ALERT_CHAT_ID 未配置, 堆头费到期预警禁用")
+		log.Printf("[main] W3.3 堆头费到期预警: 启动跑一次 + 每日 21:00 (chat_id=%s, 来源=wecom_chat_binding)",
+			wecomChatRouter.FirstChatByPurpose("promo_alert"))
 	}
 
 	// W4.3: 供应商结算 cron (4 任务, 独立开关)
+	// 2026-09-11: 目标 chat_id 改读 wecom_chat_binding.purpose=owner
 	supplierPayCtx, supplierPayCancel := context.WithCancel(context.Background())
 	defer supplierPayCancel()
-	if strings.TrimSpace(os.Getenv("OWNER_CHAT_ID")) != "" {
+	ownerChatID := wecomChatRouter.FirstChatByPurpose("owner")
+	supplierPaySvc.OwnerChatID = ownerChatID // 一次性设, supplierpayment cron 内部每次重新读 s.OwnerChatID
+	if ownerChatID != "" {
 		go runSupplierPayCron(supplierPayCtx, supplierPaySvc, wecomClient, agent.NewWecomSender(wecomClient))
-		log.Printf("[main] W4.3 供应商结算 cron 启动 (owner=%s)", os.Getenv("OWNER_CHAT_ID"))
+		log.Printf("[main] W4.3 供应商结算 cron 启动 (owner=%s, 来源=wecom_chat_binding)", ownerChatID)
 	} else {
-		log.Printf("[main] OWNER_CHAT_ID 未配置, 供应商结算 cron 禁用 (但 weekly/monthly 仍会写库, 只不发群)")
+		log.Printf("[main] purpose=owner 未绑定 chat, 供应商结算 cron 仅写库不推群 (admin/system.html 配置)")
 		// 仍然写库(forecast/suggestion/share), 只是不推群
 		go runSupplierPayCronNoPush(supplierPayCtx, supplierPaySvc)
 	}
@@ -396,7 +443,7 @@ func main() {
 	wxSvc := wxsign.New(cfg.WeComCorpID, cfg.WeComAgentID, cfg.WeComCorpSecret)
 	log.Printf("[main] wxsign: configured=%v (corp_id=%q agent_id=%q)", wxSvc.IsConfigured(), cfg.WeComCorpID, cfg.WeComAgentID)
 
-	r := api.NewRouter(h, cfg, restockSvc, authSvc, authSign, rbacStore, wxSvc, freshcheckStore, freshcheckService)
+	r := api.NewRouter(h, cfg, restockSvc, authSvc, authSign, rbacStore, wxSvc, freshcheckStore, freshcheckService, wecomChatAdmin)
 	log.Printf("[main] 限流: max_concurrent_parse=%d, wait_sec=%d", cfg.MaxConcurrentParse, cfg.RateLimitWaitSec)
 	log.Printf("[main] auth: dev_mode=%v, cookie_domain=%s, cookie_secure=%v, access_ttl=%ds, refresh_ttl=%ds",
 		cfg.DevMode, cfg.CookieDomain, cfg.CookieSecure, cfg.AccessTokenTTLSec, cfg.RefreshTokenTTLSec)
@@ -719,3 +766,27 @@ func maskAPIKey(key string) string {
 	}
 	return key[:4] + "***" + key[len(key)-4:]
 }
+
+// =====================================================================
+// 企微客户端 → wecomchat 接口 adapter (2026-09-11)
+//   倒置 wecomchat 定义的 ChatLister / ConnStatus 接口, 让 wecomchat 不 import wecom
+// =====================================================================
+
+type wecomChatListerAdapter struct{ c *wecom.Client }
+
+func (a wecomChatListerAdapter) DiscoveredChats() []wecomchat.DiscoveredWeComChat {
+	src := a.c.DiscoveredChats()
+	out := make([]wecomchat.DiscoveredWeComChat, 0, len(src))
+	for _, b := range src {
+		out = append(out, wecomchat.DiscoveredWeComChat{
+			ChatID:    b.ChatID,
+			FirstSeen: b.FirstSeen,
+		})
+	}
+	return out
+}
+
+type wecomChatConnAdapter struct{ c *wecom.Client }
+
+func (a wecomChatConnAdapter) Connected() bool { return a.c.Connected() }
+func (a wecomChatConnAdapter) BotID() string    { return a.c.BotID() }

@@ -110,6 +110,11 @@ func (w *Client) Connected() bool {
 	return w.connected
 }
 
+// BotID 暴露配置的 bot_id (供 admin status 接口用)
+func (w *Client) BotID() string {
+	return w.cfg.BotID
+}
+
 // DiscoveredChats 列出已发现的 chat_id
 func (w *Client) DiscoveredChats() []ChatBinding {
 	w.mu.RLock()

@@ -14,6 +14,7 @@ import (
 	"github.com/tinkler/collect-ai/internal/freshcheck"
 	"github.com/tinkler/collect-ai/internal/rbac"
 	"github.com/tinkler/collect-ai/internal/restock"
+	"github.com/tinkler/collect-ai/internal/wecomchat"
 	"github.com/tinkler/collect-ai/internal/wxsign"
 )
 
@@ -23,7 +24,7 @@ import (
 // Gin 路由中间件顺序约定: 中间件在前, handler 在最后
 //   r.GET("/x", AuthMiddleware(), RequirePerm("p"), handler)
 //   → AuthMiddleware → RequirePerm → handler
-func NewRouter(h *handler.Handler, cfg *config.Config, restockSvc *restock.Service, authSvc *auth.Service, authSign *auth.Signer, rbacStore *rbac.Store, wxSvc *wxsign.Service, freshcheckStore *freshcheck.Store, freshcheckService *freshcheck.Service) *gin.Engine {
+func NewRouter(h *handler.Handler, cfg *config.Config, restockSvc *restock.Service, authSvc *auth.Service, authSign *auth.Signer, rbacStore *rbac.Store, wxSvc *wxsign.Service, freshcheckStore *freshcheck.Store, freshcheckService *freshcheck.Service, wecomAdmin *wecomchat.AdminHandler) *gin.Engine {
 	r := gin.New()
 	r.Use(gin.Recovery(), gin.Logger())
 
@@ -227,6 +228,22 @@ func NewRouter(h *handler.Handler, cfg *config.Config, restockSvc *restock.Servi
 				admin.GET("/permissions", rbacH.ListPermissions)
 				admin.GET("/departments", rbacH.ListDepartments)
 				admin.GET("/audit", rbacH.ListAudit)
+			}
+
+			// ============== 企微群配置 (2026-09-11) ==============
+			//   跟 /admin/* 走同一 user:manage 权限
+			//   端点 8 个: list/get/upsert/delete + discovered + status + reload + purposes
+			//   文档: internal/wecomchat/http_admin.go
+			wecomAdmin_ := authed.Group("/admin/wecom", auth.RequirePerm("user:manage"))
+			{
+				wecomAdmin_.GET("/chats", wecomAdmin.ListChats)
+				wecomAdmin_.GET("/chats/:chat_id", wecomAdmin.GetChat)
+				wecomAdmin_.PUT("/chats/:chat_id", wecomAdmin.UpsertChat)
+				wecomAdmin_.DELETE("/chats/:chat_id", wecomAdmin.DeleteChat)
+				wecomAdmin_.GET("/discovered", wecomAdmin.ListDiscovered)
+				wecomAdmin_.GET("/status", wecomAdmin.GetStatus)
+				wecomAdmin_.POST("/reload", wecomAdmin.ReloadCache)
+				wecomAdmin_.GET("/purposes", wecomAdmin.ListPurposes)
 			}
 		}
 	}
