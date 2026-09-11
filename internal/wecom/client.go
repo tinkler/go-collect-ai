@@ -50,6 +50,14 @@ type Client struct {
 	writeMu   sync.Mutex
 	connected bool
 
+	// 2026-09-11: 诊断字段 (admin status 接口用)
+	//   - 用户排查 "已发现 = 0" 时一眼看出是 bot_id 错 / 进程冲突 / secret 错
+	startedAt    time.Time     // 进程启 Start 时间
+	lastAttempt  time.Time     // 上一次 connect 尝试时间
+	lastError    string        // 上一次 connect error (e.g. "read frame hdr: EOF")
+	attemptCount int           // 累计重试次数
+	pid          int           // 进程 ID, 排查多实例冲突
+
 	// 事件回调 (由 service / main 注册)
 	onMessage      func(chatID, userID, text string)
 	onAgentMessage func(chatID, userID, text string)
@@ -81,6 +89,8 @@ func New(cfg Config) *Client {
 		cfg:        cfg,
 		discovered: make(map[string]time.Time),
 		stopCh:     make(chan struct{}),
+		startedAt:  time.Now(),
+		pid:        os.Getpid(),
 	}
 	w.loadBindings()
 	return w
@@ -113,6 +123,61 @@ func (w *Client) Connected() bool {
 // BotID 暴露配置的 bot_id (供 admin status 接口用)
 func (w *Client) BotID() string {
 	return w.cfg.BotID
+}
+
+// Diagnose 2026-09-11: 返回诊断信息 (admin status 接口用)
+//
+//	排查"已发现 = 0"时一眼能看出:
+//	  - bot_id 前 8 位 (确认是这个 bot, 不是别的)
+//	  - wsurl  (确认连的是对的环境, 不是沙箱/老端点)
+//	  - secret fingerprint (sha1 前 8 hex, 确认 secret 内容对, 不回显原文)
+//	  - pid + started_at + uptime (确认进程没多份, 启动时长合理)
+//	  - attempts + last_attempt + last_error (确认有持续重试, 错误内容直观)
+type Diagnose struct {
+	BotID           string `json:"bot_id"`
+	BotIDPrefix     string `json:"bot_id_prefix"`     // 前 8 位 + "..."
+	WSURL           string `json:"wsurl"`
+	BindFile        string `json:"bind_file"`
+	SecretFP        string `json:"secret_fp"`         // sha1 前 8 hex, 脱敏
+	PID             int    `json:"pid"`
+	StartedAt       string `json:"started_at"`        // RFC3339
+	UptimeSec       int64  `json:"uptime_sec"`
+	Connected       bool   `json:"connected"`
+	Attempts        int    `json:"attempts"`          // 累计重试次数
+	LastAttemptAt   string `json:"last_attempt_at"`   // RFC3339
+	LastError       string `json:"last_error"`
+}
+
+func (w *Client) Diagnose() Diagnose {
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+	now := time.Now()
+	d := Diagnose{
+		BotID:     w.cfg.BotID,
+		WSURL:     w.cfg.WSURL,
+		BindFile:  w.cfg.BindFile,
+		Connected: w.connected,
+		Attempts:  w.attemptCount,
+		LastError: w.lastError,
+		PID:       w.pid,
+		StartedAt: w.startedAt.Format(time.RFC3339),
+	}
+	if len(w.cfg.BotID) > 8 {
+		d.BotIDPrefix = w.cfg.BotID[:8] + "..."
+	} else {
+		d.BotIDPrefix = w.cfg.BotID
+	}
+	if !w.lastAttempt.IsZero() {
+		d.LastAttemptAt = w.lastAttempt.Format(time.RFC3339)
+	}
+	if !w.startedAt.IsZero() {
+		d.UptimeSec = int64(now.Sub(w.startedAt).Seconds())
+	}
+	if w.cfg.BotSecret != "" {
+		sum := sha1.Sum([]byte(w.cfg.BotSecret))
+		d.SecretFP = fmt.Sprintf("%x", sum[:4]) // 8 hex 字符
+	}
+	return d
 }
 
 // DiscoveredChats 列出已发现的 chat_id
@@ -212,7 +277,16 @@ func (w *Client) connectLoop(ctx context.Context) {
 			return
 		default:
 		}
+		// 2026-09-11: 记录 attempt 时间 (admin status 用)
+		w.mu.Lock()
+		w.lastAttempt = time.Now()
+		w.attemptCount++
+		w.mu.Unlock()
+
 		if err := w.connect(ctx); err != nil {
+			w.mu.Lock()
+			w.lastError = err.Error()
+			w.mu.Unlock()
 			log.Printf("[wecom] connect failed: %v (retry in %s)", err, backoff)
 			select {
 			case <-w.stopCh:
@@ -225,6 +299,10 @@ func (w *Client) connectLoop(ctx context.Context) {
 			}
 			continue
 		}
+		// 连上后清掉 error
+		w.mu.Lock()
+		w.lastError = ""
+		w.mu.Unlock()
 		backoff = 2 * time.Second
 	}
 }

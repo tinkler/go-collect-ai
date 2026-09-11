@@ -82,10 +82,26 @@ type DiscoveredChat struct {
 
 // StatusResponse /admin/wecom/status 响应
 type StatusResponse struct {
-	Connected         bool   `json:"connected"`           // wecom WS 长连接是否建立
-	BotID             string `json:"bot_id,omitempty"`    // 已配置的 bot id
-	DiscoveredCount   int    `json:"discovered_count"`    // 自动发现 chat 数
-	BoundCount        int    `json:"bound_count"`         // PG 配过数
-	BoundByPurpose    map[string]int `json:"bound_by_purpose"` // 各 purpose 计数
-	LastReloadAt      time.Time `json:"last_reload_at"`
+	Connected         bool              `json:"connected"`           // wecom WS 长连接是否建立
+	BotID             string           `json:"bot_id,omitempty"`    // 已配置的 bot id (完整, 服务端用,前端脱敏展示)
+	DiscoveredCount   int              `json:"discovered_count"`    // 自动发现 chat 数
+	BoundCount        int              `json:"bound_count"`         // PG 配过数
+	BoundByPurpose    map[string]int   `json:"bound_by_purpose"`    // 各 purpose 计数
+	LastReloadAt      time.Time        `json:"last_reload_at"`
+	// 2026-09-11: 诊断面板 (红点时显示)
+	Diagnose          *DiagnoseView    `json:"diagnose,omitempty"`
+}
+
+// DiagnoseView 诊断面板 (admin/system.html 展示用)
+type DiagnoseView struct {
+	BotIDPrefix     string `json:"bot_id_prefix"`     // aib64EeZ...
+	WSURL           string `json:"wsurl"`
+	BindFile        string `json:"bind_file"`
+	SecretFP        string `json:"secret_fp"`         // 8 hex 字符, 确认 secret 内容对
+	PID             int    `json:"pid"`               // 当前进程 ID (排查多实例)
+	StartedAt       string `json:"started_at"`
+	UptimeSec       int64  `json:"uptime_sec"`
+	Attempts        int    `json:"attempts"`
+	LastAttemptAt   string `json:"last_attempt_at"`
+	LastError       string `json:"last_error"`
 }

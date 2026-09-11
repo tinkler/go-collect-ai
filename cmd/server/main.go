@@ -788,5 +788,6 @@ func (a wecomChatListerAdapter) DiscoveredChats() []wecomchat.DiscoveredWeComCha
 
 type wecomChatConnAdapter struct{ c *wecom.Client }
 
-func (a wecomChatConnAdapter) Connected() bool { return a.c.Connected() }
-func (a wecomChatConnAdapter) BotID() string    { return a.c.BotID() }
+func (a wecomChatConnAdapter) Connected() bool        { return a.c.Connected() }
+func (a wecomChatConnAdapter) BotID() string           { return a.c.BotID() }
+func (a wecomChatConnAdapter) Diagnose() wecom.Diagnose { return a.c.Diagnose() }

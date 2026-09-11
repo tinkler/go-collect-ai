@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/tinkler/collect-ai/internal/wecom"
 )
 
 // ChatLister 抽象从 wecom.Client 读已发现 chat
@@ -36,6 +37,7 @@ type DiscoveredWeComChat struct {
 type ConnStatus interface {
 	Connected() bool
 	BotID() string
+	Diagnose() wecom.Diagnose // 2026-09-11: 诊断面板
 }
 
 // AdminHandler HTTP handler
@@ -241,9 +243,13 @@ func (h *AdminHandler) ListDiscovered(c *gin.Context) {
 func (h *AdminHandler) GetStatus(c *gin.Context) {
 	connected := false
 	botID := ""
+	var diag *wecom.Diagnose
 	if h.Conn != nil {
 		connected = h.Conn.Connected()
 		botID = h.Conn.BotID()
+		// 2026-09-11: 每次拉 status 都拿最新诊断 (排查长连接问题时关键)
+		d := h.Conn.Diagnose()
+		diag = &d
 	}
 	byPurpose, _ := h.Store.CountByPurpose(c.Request.Context())
 	discoveredCount := 0
@@ -258,14 +264,29 @@ func (h *AdminHandler) GetStatus(c *gin.Context) {
 		}
 	}
 	_, lastReload := h.Router.Stats()
-	c.JSON(http.StatusOK, StatusResponse{
+	resp := StatusResponse{
 		Connected:       connected,
 		BotID:           botID,
 		DiscoveredCount: discoveredCount,
 		BoundCount:      boundCount,
 		BoundByPurpose:  byPurpose,
 		LastReloadAt:    lastReload,
-	})
+	}
+	if diag != nil {
+		resp.Diagnose = &DiagnoseView{
+			BotIDPrefix:   diag.BotIDPrefix,
+			WSURL:         diag.WSURL,
+			BindFile:      diag.BindFile,
+			SecretFP:      diag.SecretFP,
+			PID:           diag.PID,
+			StartedAt:     diag.StartedAt,
+			UptimeSec:     diag.UptimeSec,
+			Attempts:      diag.Attempts,
+			LastAttemptAt: diag.LastAttemptAt,
+			LastError:     diag.LastError,
+		}
+	}
+	c.JSON(http.StatusOK, resp)
 }
 
 // ============== 4. Reload ==============
