@@ -365,16 +365,16 @@ func (w *Client) connect(ctx context.Context) error {
 	}
 	log.Printf("[wecom] subscribed, bot_id=%s (waiting up to 3s for server ack)", w.cfg.BotID)
 
-	// 2026-09-12: 主动读 subscribe 响应
+	// 2026-09-12: 主动读 subscribe 响应 (诊断用, 不 fail-fast)
 	//   背景: 之前 subscribe 完直接进 readLoop, 如果服务端收完 subscribe 立刻关连接
 	//   第一个 read 就 EOF, 看不到服务端给的真正原因
-	//   现在: 3s 内读一帧, parse JSON 打印 errcode/errmsg, 然后再进 readLoop
-	//   - 服务端给 error: 立刻 close 并 return, 不再进 readLoop
-	//   - 服务端给 ok: 继续 (跟之前一样进 readLoop)
-	//   - 3s 没响应 (服务端静默): 记 timeout, 仍然进 readLoop
-	if ack, ackErr := w.readSubscribeAck(3 * time.Second); ackErr != nil {
-		w.closeConn()
-		return fmt.Errorf("subscribe ack read: %w", ackErr)
+	//   现在: 3s 内读一帧, parse JSON 打印 errcode/errmsg
+	//   - 拿到 ack: 打印内容, 继续 (跟之前一样进 readLoop + ping)
+	//   - 拿到 EOF / timeout: 降级成 warn, **仍然继续**进 readLoop + ping
+	//     (因为服务端某些节点不 ack 但还可能让连接活, 不应就此放弃)
+	ack, ackErr := w.readSubscribeAck(3 * time.Second)
+	if ackErr != nil {
+		log.Printf("[wecom] WARN: subscribe ack read failed (%v) — falling through to readLoop anyway (will keepalive via ping)", ackErr)
 	} else if ack != "" {
 		// 看一眼 errcode
 		var probe map[string]any
