@@ -52,11 +52,11 @@ type Client struct {
 
 	// 2026-09-11: 诊断字段 (admin status 接口用)
 	//   - 用户排查 "已发现 = 0" 时一眼看出是 bot_id 错 / 进程冲突 / secret 错
-	startedAt    time.Time     // 进程启 Start 时间
-	lastAttempt  time.Time     // 上一次 connect 尝试时间
-	lastError    string        // 上一次 connect error (e.g. "read frame hdr: EOF")
-	attemptCount int           // 累计重试次数
-	pid          int           // 进程 ID, 排查多实例冲突
+	startedAt    time.Time // 进程启 Start 时间
+	lastAttempt  time.Time // 上一次 connect 尝试时间
+	lastError    string    // 上一次 connect error (e.g. "read frame hdr: EOF")
+	attemptCount int       // 累计重试次数
+	pid          int       // 进程 ID, 排查多实例冲突
 
 	// 事件回调 (由 service / main 注册)
 	onMessage      func(chatID, userID, text string)
@@ -134,18 +134,18 @@ func (w *Client) BotID() string {
 //	  - pid + started_at + uptime (确认进程没多份, 启动时长合理)
 //	  - attempts + last_attempt + last_error (确认有持续重试, 错误内容直观)
 type Diagnose struct {
-	BotID           string `json:"bot_id"`
-	BotIDPrefix     string `json:"bot_id_prefix"`     // 前 8 位 + "..."
-	WSURL           string `json:"wsurl"`
-	BindFile        string `json:"bind_file"`
-	SecretFP        string `json:"secret_fp"`         // sha1 前 8 hex, 脱敏
-	PID             int    `json:"pid"`
-	StartedAt       string `json:"started_at"`        // RFC3339
-	UptimeSec       int64  `json:"uptime_sec"`
-	Connected       bool   `json:"connected"`
-	Attempts        int    `json:"attempts"`          // 累计重试次数
-	LastAttemptAt   string `json:"last_attempt_at"`   // RFC3339
-	LastError       string `json:"last_error"`
+	BotID         string `json:"bot_id"`
+	BotIDPrefix   string `json:"bot_id_prefix"` // 前 8 位 + "..."
+	WSURL         string `json:"wsurl"`
+	BindFile      string `json:"bind_file"`
+	SecretFP      string `json:"secret_fp"` // sha1 前 8 hex, 脱敏
+	PID           int    `json:"pid"`
+	StartedAt     string `json:"started_at"` // RFC3339
+	UptimeSec     int64  `json:"uptime_sec"`
+	Connected     bool   `json:"connected"`
+	Attempts      int    `json:"attempts"`        // 累计重试次数
+	LastAttemptAt string `json:"last_attempt_at"` // RFC3339
+	LastError     string `json:"last_error"`
 }
 
 func (w *Client) Diagnose() Diagnose {
@@ -209,8 +209,9 @@ func (w *Client) OnConnect(fn func()) { w.onConnect = fn }
 // =====================================================================
 
 // SendCard 发卡片消息到指定 chat_id
-//   chatID: 企微会话 ID
-//   body:   完整消息 JSON (msgtype + 对应字段)
+//
+//	chatID: 企微会话 ID
+//	body:   完整消息 JSON (msgtype + 对应字段)
 func (w *Client) SendCard(ctx context.Context, chatID string, body []byte) error {
 	return w.sendAibotMsg(chatID, body)
 }
@@ -344,6 +345,15 @@ func (w *Client) connect(ctx context.Context) error {
 			rawConn.Close()
 			return fmt.Errorf("tls handshake: %w", err)
 		}
+		// 2026-09-12: 打印对端 IP + 证书 issuer。
+		//   排查出口 MITM / 上网行为管理: 正常应为公认可信 CA (如 DigiCert/GlobalSign),
+		//   若看到企业自建 CA 名字 = 中间盒在解密 WebSocket, 碎帧/拦帧常发源于此。
+		issuer := "(unknown)"
+		state := tlsConn.ConnectionState()
+		if len(state.PeerCertificates) > 0 {
+			issuer = state.PeerCertificates[0].Issuer.String()
+		}
+		log.Printf("[wecom] tls ok: peer=%s issuer=%s", rawConn.RemoteAddr(), issuer)
 		wsConn = tlsConn
 	}
 
@@ -363,49 +373,48 @@ func (w *Client) connect(ctx context.Context) error {
 		w.closeConn()
 		return fmt.Errorf("subscribe: %w", err)
 	}
-	log.Printf("[wecom] subscribed, bot_id=%s (waiting up to 3s for server ack)", w.cfg.BotID)
+	log.Printf("[wecom] subscribe sent, bot_id=%s (waiting up to 10s for server ack)", w.cfg.BotID)
 
-	// 2026-09-12: 主动读 subscribe 响应 (诊断用, 不 fail-fast)
-	//   背景: 之前 subscribe 完直接进 readLoop, 如果服务端收完 subscribe 立刻关连接
-	//   第一个 read 就 EOF, 看不到服务端给的真正原因
-	//   现在: 3s 内读一帧, parse JSON 打印 errcode/errmsg
-	//   - 拿到 ack: 打印内容, 继续 (跟之前一样进 readLoop + ping)
-	//   - 拿到 EOF / timeout: 降级成 warn, **仍然继续**进 readLoop + ping
-	//     (因为服务端某些节点不 ack 但还可能让连接活, 不应就此放弃)
-	ack, ackErr := w.readSubscribeAck(3 * time.Second)
+	// 2026-09-12: 鉴权必须以服务端 ack 为准 (对齐官方 wecom-aibot SDK)。
+	//   官方流程: subscribe → 收 {"errcode":0,"errmsg":"ok"} → 之后才启动心跳。
+	//   旧实现 ack 读失败也"降级继续", 在一条未认证连接上空发 ping 45s 才被踢,
+	//   既掩盖根因 (出口中间盒没把数据帧送到企微后端 → 永远不会有 ack),
+	//   又白白触发订阅频率保护。现在: 拿不到 errcode=0 立即放弃本次连接, 走重连。
+	ack, ackErr := w.readSubscribeAck(10 * time.Second)
 	if ackErr != nil {
-		log.Printf("[wecom] WARN: subscribe ack read failed (%v) — falling through to readLoop anyway (will keepalive via ping)", ackErr)
-	} else if ack != "" {
-		// 看一眼 errcode
-		var probe map[string]any
-		if json.Unmarshal([]byte(ack), &probe) == nil {
-			if ec, ok := probe["errcode"]; ok {
-				log.Printf("[wecom] subscribe response: errcode=%v errmsg=%v", ec, probe["errmsg"])
-			} else if cmd, ok := probe["cmd"]; ok {
-				log.Printf("[wecom] subscribe response: cmd=%v (ack payload=%d bytes)", cmd, len(ack))
-			} else {
-				log.Printf("[wecom] subscribe response: %s", truncateForLog(ack, 300))
-			}
-		} else {
-			log.Printf("[wecom] subscribe response (non-json): %s", truncateForLog(ack, 300))
-		}
-	} else {
-		log.Printf("[wecom] subscribe ack timeout (3s) — server silent, falling through to readLoop")
+		w.closeConn()
+		return fmt.Errorf("subscribe ack: %w", ackErr)
 	}
+	if ack == "" {
+		w.closeConn()
+		return fmt.Errorf("subscribe ack timeout: server silent (data frame likely dropped by egress middlebox)")
+	}
+
+	var probe map[string]any
+	if err := json.Unmarshal([]byte(ack), &probe); err != nil {
+		w.closeConn()
+		return fmt.Errorf("subscribe ack non-json: %s", truncateForLog(ack, 200))
+	}
+	ecRaw, hasErrcode := probe["errcode"]
+	if !hasErrcode {
+		w.closeConn()
+		return fmt.Errorf("subscribe ack missing errcode: %s", truncateForLog(ack, 200))
+	}
+	ec, _ := ecRaw.(float64)
+	if ec != 0 {
+		w.closeConn()
+		return fmt.Errorf("subscribe rejected: errcode=%v errmsg=%v", ecRaw, probe["errmsg"])
+	}
+	log.Printf("[wecom] authenticated: errcode=0 errmsg=%v (heartbeat 30s)", probe["errmsg"])
 
 	if w.onConnect != nil {
 		w.onConnect()
 	}
 
-	// 2026-09-12: 服务端 keepalive 超时 ~25s
-	//   老代码: 25s 间隔第一个 ping,正好撞服务端超时,被踢
-	//   新代码: subscribe 成功后立即发一个 ping (证明连接活着, 重置服务端计时)
-	//           然后 15s 间隔 (留 10s 余量)
-	if err := w.ping(); err != nil {
-		w.closeConn()
-		return fmt.Errorf("initial ping: %w", err)
-	}
-	pingTicker := time.NewTicker(15 * time.Second)
+	// 心跳: 官方建议/SDK 默认 30s, 认证成功后才启动。
+	//   实测官方网关对 30s 心跳稳定 (2026-09-12 探针验证),
+	//   ping 写失败 = 连接已断, 关掉让 readLoop/connectLoop 走重连。
+	pingTicker := time.NewTicker(30 * time.Second)
 	defer pingTicker.Stop()
 
 	go func() {
@@ -423,7 +432,14 @@ func (w *Client) connect(ctx context.Context) error {
 		}
 	}()
 
-	return w.readLoop()
+	// 2026-09-12: readLoop 退出后必须完整关闭 TCP。
+	//   服务端断开只发 FIN, 客户端若不 close(), socket 永远停在 CLOSE_WAIT:
+	//   1) 每轮失败泄漏一个僵尸连接 (netstat 全是 CLOSE-WAIT)
+	//   2) 服务端视角旧连接一直"半活着", 干扰单 bot 单连接判定,
+	//      可能诱发新连接被踢 → ack 成功后秒 EOF 的死循环
+	err = w.readLoop()
+	w.closeConn()
+	return err
 }
 
 // wsHandshake WebSocket 客户端握手
@@ -560,96 +576,107 @@ func (w *Client) readLoop() error {
 	}
 }
 
-// readSubscribeAck 2026-09-12: subscribe 后主动读一帧 (带 deadline)
-//   - 命中 (有响应): 返回 payload 字符串
-//   - 超时 (3s 内没数据): 返回 "", nil
-//   - EOF (服务端 close TCP): 返回 "", err  (这样 connect() 立即 return, 不再进 readLoop)
-//   - 其它读错误: 返回 "", err
+// readSubscribeAck subscribe 后在 deadline 内读服务端鉴权响应 (text/binary 帧)。
+//   - 命中: 返回 payload 字符串
+//   - 超时 (deadline 内没数据): 返回 "", err (超时错误)
+//   - EOF (服务端 close TCP): 返回 "", err
 //
-// 用途: 当服务端 subscribe 后立刻 close, 之前 readLoop 看到的是裸 EOF,
-//   现在先 read 一帧能看到 server 真正给的 errcode/errmsg
+// 中间夹杂的 ping/pong 控制帧最多跳过 3 个。
 func (w *Client) readSubscribeAck(deadline time.Duration) (string, error) {
 	conn := w.conn
 	if conn == nil {
 		return "", fmt.Errorf("conn nil")
 	}
 	type deadlineSetter interface{ SetDeadline(time.Time) error }
-	if tc, ok := conn.(deadlineSetter); ok {
+	tc, canDeadline := conn.(deadlineSetter)
+	if canDeadline {
 		_ = tc.SetDeadline(time.Now().Add(deadline))
-		// 读完记得清掉
 		defer tc.SetDeadline(time.Time{})
 	}
 
-	// 1) 读 2 字节 frame header
-	var hdr [2]byte
-	if _, err := io.ReadFull(conn, hdr[:]); err != nil {
-		if err == io.EOF {
-			return "", fmt.Errorf("server closed connection (EOF on first read after subscribe)")
-		}
-		return "", err
-	}
-	fin := hdr[0]&0x80 != 0
-	opcode := hdr[0] & 0x0F
-	masked := hdr[1]&0x80 != 0
-	plen := int(hdr[1] & 0x7F)
-
-	// 2) 读 ext length
-	if plen == 126 {
-		var ext [2]byte
-		if _, err := io.ReadFull(conn, ext[:]); err != nil {
+	for skipped := 0; skipped < 3; skipped++ {
+		// 1) 读 2 字节 frame header
+		var hdr [2]byte
+		if _, err := io.ReadFull(conn, hdr[:]); err != nil {
+			if err == io.EOF {
+				return "", fmt.Errorf("server closed connection (EOF on first read after subscribe)")
+			}
 			return "", err
 		}
-		plen = int(binary.BigEndian.Uint16(ext[:]))
-	} else if plen == 127 {
-		var ext [8]byte
-		if _, err := io.ReadFull(conn, ext[:]); err != nil {
-			return "", err
-		}
-		plen = int(binary.BigEndian.Uint64(ext[:]))
-	}
+		fin := hdr[0]&0x80 != 0
+		opcode := hdr[0] & 0x0F
+		masked := hdr[1]&0x80 != 0
+		plen := int(hdr[1] & 0x7F)
 
-	// 3) 防大帧
-	if plen < 0 || plen > 1<<20 {
-		return "", fmt.Errorf("subscribe ack frame too large: %d", plen)
-	}
-
-	// 4) mask key (server 不该 mask, 但稳妥处理)
-	var maskKey [4]byte
-	if masked {
-		if _, err := io.ReadFull(conn, maskKey[:]); err != nil {
-			return "", err
+		// 2) 读 ext length
+		if plen == 126 {
+			var ext [2]byte
+			if _, err := io.ReadFull(conn, ext[:]); err != nil {
+				return "", err
+			}
+			plen = int(binary.BigEndian.Uint16(ext[:]))
+		} else if plen == 127 {
+			var ext [8]byte
+			if _, err := io.ReadFull(conn, ext[:]); err != nil {
+				return "", err
+			}
+			plen = int(binary.BigEndian.Uint64(ext[:]))
 		}
-	}
 
-	// 5) payload
-	payload := make([]byte, plen)
-	if plen > 0 {
-		if _, err := io.ReadFull(conn, payload); err != nil {
-			return "", err
+		// 3) 防大帧
+		if plen < 0 || plen > 1<<20 {
+			return "", fmt.Errorf("subscribe ack frame too large: %d", plen)
 		}
+
+		// 4) mask key (server 不该 mask, 但稳妥处理)
+		var maskKey [4]byte
 		if masked {
-			for i := range payload {
-				payload[i] ^= maskKey[i%4]
+			if _, err := io.ReadFull(conn, maskKey[:]); err != nil {
+				return "", err
 			}
 		}
-	}
 
-	// 仅关心 text/binary 帧
-	if opcode == 0x8 {
-		return "", fmt.Errorf("server sent close frame after subscribe: payload=%s", string(payload))
+		// 5) payload
+		payload := make([]byte, plen)
+		if plen > 0 {
+			if _, err := io.ReadFull(conn, payload); err != nil {
+				return "", err
+			}
+			if masked {
+				for i := range payload {
+					payload[i] ^= maskKey[i%4]
+				}
+			}
+		}
+
+		if opcode == 0x8 {
+			return "", fmt.Errorf("server sent close frame after subscribe: payload=%s", string(payload))
+		}
+		if !fin {
+			// aibot 协议用单帧, 不处理 fragmented
+			return "", fmt.Errorf("unexpected fragmented frame (opcode=%d)", opcode)
+		}
+		if opcode != 0x1 && opcode != 0x2 {
+			// ping/pong 等控制帧 — 回 pong 后继续等数据帧
+			if opcode == 0x9 {
+				_ = w.pong(payload)
+			}
+			continue
+		}
+		return string(payload), nil
 	}
-	if !fin {
-		// 简单起见不处理 fragmented — aibot 协议用单帧
-		return "", fmt.Errorf("unexpected fragmented frame (opcode=%d)", opcode)
-	}
-	if opcode != 0x1 && opcode != 0x2 {
-		// ping/pong 等控制帧 — 忽略, 递归再读 (保险起见 1 次)
-		return w.readSubscribeAck(deadline)
-	}
-	return string(payload), nil
+	return "", fmt.Errorf("too many control frames while waiting subscribe ack")
 }
 
 // writeFrame 写一帧
+//
+// 2026-09-12: 必须单缓冲单次 Write。
+//
+//	旧实现把帧拆成 3 次 Write (2B 头 / 4B mask / payload), 走 TLS 时可能
+//	拆成 3 个 record。企微官方网关能正常收 (RFC 6455 是字节流), 但客户出口
+//	的 DPI / 上网行为管理按 record 解析 WebSocket 时会丢掉这种"碎帧", 表现为
+//	握手 101 成功、subscribe 石沉大海、~45s 后服务端鉴权超时断连。
+//	gorilla/websocket、官方 Python SDK 均为整帧一次写。
 func (w *Client) writeFrame(opcode byte, payload []byte) error {
 	w.writeMu.Lock()
 	defer w.writeMu.Unlock()
@@ -659,42 +686,42 @@ func (w *Client) writeFrame(opcode byte, payload []byte) error {
 		return fmt.Errorf("not connected")
 	}
 
-	var header [14]byte
-	header[0] = 0x80 | opcode
-
 	plen := len(payload)
-	if plen < 126 {
-		header[1] = 0x80 | byte(plen)
-		if _, err := conn.Write(header[:2]); err != nil {
-			return err
-		}
-	} else if plen < 65536 {
-		header[1] = 0x80 | 126
-		binary.BigEndian.PutUint16(header[2:], uint16(plen))
-		if _, err := conn.Write(header[:4]); err != nil {
-			return err
-		}
-	} else {
-		header[1] = 0x80 | 127
-		binary.BigEndian.PutUint64(header[2:], uint64(plen))
-		if _, err := conn.Write(header[:10]); err != nil {
-			return err
-		}
+	var hdrLen int
+	switch {
+	case plen < 126:
+		hdrLen = 2
+	case plen < 65536:
+		hdrLen = 4
+	default:
+		hdrLen = 10
 	}
 
-	maskKey := [4]byte{}
+	frame := make([]byte, hdrLen+4+plen)
+	frame[0] = 0x80 | opcode
+	switch {
+	case plen < 126:
+		frame[1] = 0x80 | byte(plen)
+	case plen < 65536:
+		frame[1] = 0x80 | 126
+		binary.BigEndian.PutUint16(frame[2:], uint16(plen))
+	default:
+		frame[1] = 0x80 | 127
+		binary.BigEndian.PutUint64(frame[2:], uint64(plen))
+	}
+
+	var maskKey [4]byte
 	if _, err := rand.Read(maskKey[:]); err != nil {
 		return err
 	}
-	if _, err := conn.Write(maskKey[:]); err != nil {
-		return err
-	}
+	copy(frame[hdrLen:hdrLen+4], maskKey[:])
 
-	masked := make([]byte, plen)
+	masked := frame[hdrLen+4:]
 	for i := range payload {
 		masked[i] = payload[i] ^ maskKey[i%4]
 	}
-	_, err := conn.Write(masked)
+
+	_, err := conn.Write(frame)
 	return err
 }
 
@@ -786,7 +813,14 @@ func (w *Client) handleEvent(f *ChatFrame) {
 	case "enter_chat":
 		log.Printf("[wecom] user entered chat: user=%s", f.Body.From.UserID)
 	case "disconnected_event":
-		log.Printf("[wecom] disconnected event (new connection took over)")
+		// 2026-09-12 实测: 被新连接替换时, 服务端只推 disconnected_event 一帧,
+		// 之后 TCP 静默不 FIN (readLoop 不处理会永久卡死, 永远不会重连)。
+		// 此刻必须主动关连接 → readLoop 报错退出 → connectLoop 立即重连。
+		// 注意: 出现这条日志 = 有另一个持相同 bot_id 的实例在抢连接
+		// (旧进程没停 / 另一台机器 / 容器 / 别人的 go run), 必须清理重复实例,
+		// 否则双方会 60s 一轮互相踢。
+		log.Printf("[wecom] disconnected_event: 本连接已被同 bot_id 的另一个实例踢下线, 立即重连")
+		w.closeConn()
 	}
 }
 

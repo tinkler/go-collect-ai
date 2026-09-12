@@ -1447,18 +1447,31 @@ func (h *Handler) SearchProducts(c *gin.Context) {
 		})
 	}
 	// 2026-08-31: barcode / item_no 过滤 (扫码查商品, 返回 1 条精准结果)
+	// 2026-09-12: 支持后缀匹配 — 用户手动输 5+ 位时按后缀查 (超市扫码枪偶尔丢前导位)
+	//   - 13 位: 视为完整条码, equals 走索引快
+	//   - 5~12 位: endsWith 慢 (LIKE '%X' 不走索引), 但 11W 行内 limit 10 可控
+	//   - <5 位: 不查 (防全表扫, 返回空让前端提示)
 	barcodeQuery := barcode
 	if barcodeQuery == "" {
 		barcodeQuery = itemNo
 	}
 	if barcodeQuery != "" {
-		bizFilters = append(bizFilters, business.BusinessFilter{
-			Field: "barcode", Op: "equals", Values: []any{barcodeQuery},
-		})
-		// 精准查询: 限定 1 条
-		if limit > 1 {
-			limit = 1
+		if len(barcodeQuery) >= 13 {
+			// 全码: 精确匹配, 走索引
+			bizFilters = append(bizFilters, business.BusinessFilter{
+				Field: "barcode", Op: "equals", Values: []any{barcodeQuery},
+			})
+			if limit > 1 {
+				limit = 1
+			}
+		} else if len(barcodeQuery) >= 5 {
+			// 5~12 位: 后缀匹配 (cube-agent-server 翻译成 SQL: barcode LIKE '%X')
+			bizFilters = append(bizFilters, business.BusinessFilter{
+				Field: "barcode", Op: "endsWith", Values: []any{barcodeQuery},
+			})
+			// 多个匹配可能, limit 留给前端控制 (默认 100)
 		}
+		// <5 位: 不加 filter, 直接返回空 (让前端 toast "未找到该条码")
 	}
 
 	bizRows, err := h.BizExecutor.Query("products", bizFields, bizFilters, limit)

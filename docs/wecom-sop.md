@@ -165,7 +165,8 @@ Invoke-RestMethod -Method Post -Uri "http://127.0.0.1:8089/api/v1/restock/wecom/
 | 群里发消息没反应 | 1) 机器人没被 @ 2) 长连接没起 3) 飞书 SDK 占用 | @机器人 + 看日志 `NEW chat discovered` |
 | 主动发消息 200 错误 "no chat_id for role" | chat_id 没绑定 | 调 `/api/v1/restock/wecom/chats/bind` |
 | 主动发消息 200 错误 "用户没在会话发过消息" | 24h 内没人 @ 机器人 | 让人在群里 @ 机器人发句话 |
-| 长连接频繁断开 | 心跳 25s 太接近 30s 边界 / 网络抖动 | 看日志 `disconnected_event`,会自动重连 |
+| `authenticated` 后秒 EOF / 反复 `disconnected_event` | **同 bot_id 有第二个实例在互踢** (旧进程没停 / 另一台机器 / 容器 / 别人 go run; 一 bot 同时只允许一条连接) | 生产机: `ps -ef | grep collect-ai | grep -v grep` 看是否多进程; `ss -tnp | grep 443` 看谁连着 openws; 检查 systemd/docker 是否有重复单元。停掉所有实例后只保留一个 |
+| 长连接频繁断开 | 1) 心跳 30s 是官方默认值, 2026-09-12 实测稳定, 勿乱调 2) 只有 `subscribe sent` 没有 `authenticated` = 出口中间盒没把 WS 数据帧送到企微后端 | 在故障主机跑 `WECOM_PROBE_LIVE=1 WECOM_BOT_ID=... WECOM_BOT_SECRET=... ./wsprobe-linux-amd64 -test.run TestProbeLive -test.v`, 看 `tls ok: issuer=` 是否为公认可信 CA、能否收到 errcode=0、90s 内有无 disconnected_event; 找网管放行 openws.work.weixin.qq.com 的 WebSocket |
 
 ---
 
